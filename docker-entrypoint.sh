@@ -1,0 +1,97 @@
+#!/bin/bash
+set -e
+
+echo "=========================================="
+echo "🚀 ZVPN Docker 启动脚本"
+echo "=========================================="
+
+# 等待 MySQL 就绪（如果使用外部 MySQL）
+if [ -n "$DB_HOST" ] && [ "$DB_TYPE" = "mysql" ]; then
+    echo "⏳ 等待 MySQL 就绪..."
+    host="${DB_HOST:-127.0.0.1}"
+    port="${DB_PORT:-3306}"
+    until nc -z "$host" "$port" 2>/dev/null; do
+        echo "MySQL 未就绪 ($host:$port)，等待 2 秒..."
+        sleep 2
+    done
+    echo "✅ MySQL 已就绪"
+fi
+
+# 切换到工作目录
+cd /app
+
+# 生成证书（如果不存在）
+if [ ! -f ./certs/cert.pem ] || [ ! -f ./certs/key.pem ]; then
+    echo "🔐 生成 TLS 证书..."
+    if [ -f ./generate-cert.sh ]; then
+        # 使用脚本生成（会自动创建 ./certs 目录）
+        ./generate-cert.sh
+    else
+        # 手动生成
+        mkdir -p ./certs
+        openssl req -x509 -newkey rsa:4096 \
+            -keyout ./certs/key.pem \
+            -out ./certs/cert.pem \
+            -days 365 -nodes \
+            -subj "/C=CN/ST=State/L=City/O=ZVPN/CN=zvpn.local"
+    fi
+    echo "✅ 证书生成完成"
+fi
+
+# 验证证书是否存在
+if [ -f ./certs/cert.pem ] && [ -f ./certs/key.pem ]; then
+    echo "✅ 证书文件已就绪:"
+    echo "   证书: ./certs/cert.pem"
+    echo "   私钥: ./certs/key.pem"
+else
+    echo "⚠️  警告: 证书文件不存在，OpenConnect 将无法启动"
+    echo "   期望路径: ./certs/cert.pem, ./certs/key.pem"
+fi
+
+# 启用 IP 转发
+echo "🔧 配置网络..."
+if [ -w /proc/sys/net/ipv4/ip_forward ]; then
+    echo 1 > /proc/sys/net/ipv4/ip_forward
+    echo "✅ IP 转发已启用"
+elif grep -q "^1$" /proc/sys/net/ipv4/ip_forward; then
+    echo "✅ IP 转发已启用（通过 sysctl 参数）"
+else
+    echo "⚠️  警告: 无法启用 IP 转发（/proc 是只读文件系统）"
+    echo "   请使用 --sysctl net.ipv4.ip_forward=1 启动容器"
+fi
+
+# NAT 配置：优先使用 eBPF TC NAT（内核 5.19+），失败时自动回退到 iptables/nftables MASQUERADE
+# 程序启动时会自动配置，无需手动操作
+echo "🔧 NAT 配置：程序启动时自动配置（eBPF TC 或 iptables/nftables MASQUERADE）"
+
+# 显示配置信息
+echo "=========================================="
+echo "📋 配置信息:"
+echo "  管理 API: ${SERVER_HOST:-0.0.0.0}:${SERVER_PORT:-18080}"
+echo ""
+echo "  📡 VPN 配置:"
+if [ "${VPN_ENABLE_OPENCONNECT:-true}" = "true" ]; then
+    echo "    OpenConnect: 启用"
+    echo "    SSL/TLS 端口: ${VPN_OPENCONNECT_PORT:-443} (TCP)"
+    if [ "${VPN_ENABLE_DTLS:-true}" = "true" ]; then
+        echo "    DTLS 端口: ${VPN_DTLS_PORT:-443} (UDP)"
+    fi
+else
+    echo "    OpenConnect: 禁用"
+fi
+echo "    VPN 网络: ${VPN_NETWORK:-10.8.0.0/24}"
+echo "    VPN 接口: ${VPN_INTERFACE:-zvpn0}"
+echo "    MTU: ${VPN_MTU:-1400}"
+echo ""
+echo "  🗄️  数据库: ${DB_TYPE:-mysql}"
+echo ""
+echo "  ⚡ 性能加速:"
+    echo "    eBPF XDP: 启用 (接口: ${VPN_EBPF_INTERFACE:-eth0})"
+echo "=========================================="
+echo ""
+echo "🎉 启动 ZVPN 服务..."
+echo ""
+
+# 执行主命令
+exec "$@"
+

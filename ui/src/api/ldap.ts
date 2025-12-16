@@ -1,0 +1,58 @@
+import request from './request'
+
+export interface LDAPConfig {
+  id: number
+  enabled: boolean
+  host: string
+  port: number
+  use_ssl: boolean
+  bind_dn: string
+  base_dn: string
+  user_filter: string
+  admin_group: string
+  skip_tls_verify: boolean
+  created_at?: string
+  updated_at?: string
+}
+
+export interface LDAPStatus {
+  enabled: boolean
+}
+
+export interface LDAPTestResponse {
+  success: boolean
+  message?: string
+  error?: string
+}
+
+export interface UpdateLDAPConfigRequest {
+  enabled: boolean
+  host: string
+  port: number
+  use_ssl: boolean
+  bind_dn: string
+  bind_password?: string // 可选，只有修改时才传
+  base_dn: string
+  user_filter: string
+  admin_group: string
+  skip_tls_verify: boolean
+}
+
+export const ldapApi = {
+  // 获取LDAP配置状态（公开接口）
+  getStatus: (): Promise<LDAPStatus> => 
+    request.get<LDAPStatus>('/ldap/status'),
+
+  // 获取LDAP配置（需要管理员权限）
+  getConfig: (): Promise<LDAPConfig> => 
+    request.get<LDAPConfig>('/ldap/config'),
+
+  // 更新LDAP配置（需要管理员权限）
+  updateConfig: (data: UpdateLDAPConfigRequest): Promise<LDAPConfig> => 
+    request.put<LDAPConfig>('/ldap/config', data),
+
+  // 测试LDAP连接（需要管理员权限）
+  testConnection: (): Promise<LDAPTestResponse> => 
+    request.post<LDAPTestResponse>('/ldap/test'),
+}
+
