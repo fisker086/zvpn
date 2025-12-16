@@ -41,11 +41,16 @@ CREATE TABLE IF NOT EXISTS policies (
 CREATE TABLE IF NOT EXISTS users (
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     username VARCHAR(255) NOT NULL UNIQUE,
-    password_hash VARCHAR(255) NOT NULL,
+    password_hash VARCHAR(255) DEFAULT NULL,
     email VARCHAR(255),
     is_admin BOOLEAN DEFAULT FALSE,
     is_active BOOLEAN DEFAULT TRUE,
+    source VARCHAR(20) DEFAULT 'system',
+    ldap_dn VARCHAR(512),
+    full_name VARCHAR(255),
+    ldap_attributes TEXT,
     vpn_ip VARCHAR(45),
+    client_ip VARCHAR(45),
     connected BOOLEAN DEFAULT FALSE,
     last_seen DATETIME(3) NULL,
     otp_secret VARCHAR(255) DEFAULT '',
@@ -54,6 +59,7 @@ CREATE TABLE IF NOT EXISTS users (
     updated_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
     deleted_at DATETIME(3) NULL,
     INDEX idx_username (username),
+    INDEX idx_source (source),
     INDEX idx_vpn_ip (vpn_ip),
     INDEX idx_deleted_at (deleted_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
@@ -230,8 +236,8 @@ VALUES (1, 1);
 
 -- 创建默认管理员用户（密码: admin123，bcrypt哈希）
 -- 注意：这里使用的是 bcrypt 哈希值，实际部署时应该使用程序生成
-INSERT IGNORE INTO users (id, username, password_hash, email, is_admin, is_active, created_at, updated_at) 
-VALUES (1, 'admin', '$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy', 'admin@zvpn.local', TRUE, TRUE, NOW(3), NOW(3));
+INSERT IGNORE INTO users (id, username, password_hash, email, is_admin, is_active, source, created_at, updated_at) 
+VALUES (1, 'admin', '$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy', 'admin@zvpn.local', TRUE, TRUE, 'system', NOW(3), NOW(3));
 
 -- 关联管理员用户和管理员组
 INSERT IGNORE INTO user_user_groups (user_id, user_group_id) 

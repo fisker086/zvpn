@@ -265,20 +265,24 @@ const columns = [
     title: '用户组名称',
     slotName: 'name',
     width: 200,
+    align: 'center',
   },
   {
     title: '描述',
     slotName: 'description',
+    align: 'center',
   },
   {
     title: '用户',
     slotName: 'users',
     width: 250,
+    align: 'center',
   },
   {
     title: '策略',
     slotName: 'policies',
     width: 250,
+    align: 'center',
   },
   {
     title: '操作',

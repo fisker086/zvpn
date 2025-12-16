@@ -1,5 +1,12 @@
 import request from './request'
 
+export interface LDAPAttributeMapping {
+  username?: string   // 用户名属性，例如: "uid", "sAMAccountName", "cn"
+  email?: string      // 邮箱属性，例如: "mail", "email"
+  full_name?: string  // 全名属性，例如: "displayName", "cn", "name"
+  member_of?: string  // 组成员属性，例如: "memberOf", "groupMembership"
+}
+
 export interface LDAPConfig {
   id: number
   enabled: boolean
@@ -11,6 +18,7 @@ export interface LDAPConfig {
   user_filter: string
   admin_group: string
   skip_tls_verify: boolean
+  attribute_mapping?: string  // JSON格式的属性映射
   created_at?: string
   updated_at?: string
 }
@@ -65,6 +73,7 @@ export interface UpdateLDAPConfigRequest {
   user_filter: string
   admin_group: string
   skip_tls_verify: boolean
+  attribute_mapping?: string // JSON格式的属性映射，可选
 }
 
 export const ldapApi = {

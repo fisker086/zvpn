@@ -675,32 +675,38 @@ const columns = [
     title: 'Hook 名称',
     slotName: 'name',
     width: 200,
+    align: 'center',
   },
   {
     title: '类型',
     slotName: 'type',
     width: 120,
+    align: 'center',
   },
   {
     title: '优先级',
     slotName: 'priority',
     width: 100,
+    align: 'center',
   },
   {
     title: '规则数',
     dataIndex: 'rules',
     width: 100,
+    align: 'center',
     render: ({ record }: any) => record.rules?.length || 0,
   },
   {
     title: '统计',
     slotName: 'stats',
     width: 150,
+    align: 'center',
   },
   {
     title: '状态',
     slotName: 'enabled',
     width: 100,
+    align: 'center',
   },
   {
     title: '操作',

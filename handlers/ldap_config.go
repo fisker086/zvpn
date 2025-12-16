@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -65,6 +66,31 @@ func saveLDAPConfig(config *models.LDAPConfig) error {
 	return database.DB.Save(config).Error
 }
 
+// convertToAuthLDAPConfig 将models.LDAPConfig转换为auth.LDAPConfig
+func convertToAuthLDAPConfig(config *models.LDAPConfig) *auth.LDAPConfig {
+	// 获取属性映射配置
+	mapping := config.GetAttributeMapping()
+	
+	return &auth.LDAPConfig{
+		Enabled:       config.Enabled,
+		Host:          config.Host,
+		Port:          config.Port,
+		UseSSL:        config.UseSSL,
+		BindDN:        config.BindDN,
+		BindPassword:  config.BindPassword,
+		BaseDN:        config.BaseDN,
+		UserFilter:    config.UserFilter,
+		AdminGroup:    config.AdminGroup,
+		SkipTLSVerify: config.SkipTLSVerify,
+		AttributeMapping: auth.AttributeMapping{
+			UsernameAttribute: mapping.UsernameAttribute,
+			EmailAttribute:    mapping.EmailAttribute,
+			FullNameAttribute: mapping.FullNameAttribute,
+			MemberOfAttribute: mapping.MemberOfAttribute,
+		},
+	}
+}
+
 // GetLDAPConfig 获取LDAP配置
 func (h *LDAPConfigHandler) GetLDAPConfig(c *gin.Context) {
 	config, err := getLDAPConfig()
@@ -95,16 +121,17 @@ func (h *LDAPConfigHandler) GetLDAPConfig(c *gin.Context) {
 // UpdateLDAPConfig 更新LDAP配置
 func (h *LDAPConfigHandler) UpdateLDAPConfig(c *gin.Context) {
 	var req struct {
-		Enabled       bool   `json:"enabled"`
-		Host          string `json:"host"`
-		Port          int    `json:"port"`
-		UseSSL        bool   `json:"use_ssl"`
-		BindDN        string `json:"bind_dn"`
-		BindPassword  string `json:"bind_password"`
-		BaseDN        string `json:"base_dn"`
-		UserFilter    string `json:"user_filter"`
-		AdminGroup    string `json:"admin_group"`
-		SkipTLSVerify bool   `json:"skip_tls_verify"`
+		Enabled          bool   `json:"enabled"`
+		Host             string `json:"host"`
+		Port             int    `json:"port"`
+		UseSSL           bool   `json:"use_ssl"`
+		BindDN           string `json:"bind_dn"`
+		BindPassword     string `json:"bind_password"`
+		BaseDN           string `json:"base_dn"`
+		UserFilter       string `json:"user_filter"`
+		AdminGroup       string `json:"admin_group"`
+		SkipTLSVerify    bool   `json:"skip_tls_verify"`
+		AttributeMapping string `json:"attribute_mapping"` // JSON格式的属性映射
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -139,6 +166,16 @@ func (h *LDAPConfigHandler) UpdateLDAPConfig(c *gin.Context) {
 	}
 	config.AdminGroup = req.AdminGroup
 	config.SkipTLSVerify = req.SkipTLSVerify
+	// 更新属性映射配置（如果提供）
+	if req.AttributeMapping != "" {
+		// 验证JSON格式
+		var testMapping models.LDAPAttributeMapping
+		if err := json.Unmarshal([]byte(req.AttributeMapping), &testMapping); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("属性映射配置格式错误: %v", err)})
+			return
+		}
+		config.AttributeMapping = req.AttributeMapping
+	}
 
 	if err := saveLDAPConfig(config); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -147,17 +184,18 @@ func (h *LDAPConfigHandler) UpdateLDAPConfig(c *gin.Context) {
 
 	// 返回更新后的配置（不包含密码）
 	response := gin.H{
-		"id":             config.ID,
-		"enabled":        config.Enabled,
-		"host":           config.Host,
-		"port":           config.Port,
-		"use_ssl":        config.UseSSL,
-		"bind_dn":        config.BindDN,
-		"base_dn":        config.BaseDN,
-		"user_filter":    config.UserFilter,
-		"admin_group":    config.AdminGroup,
-		"skip_tls_verify": config.SkipTLSVerify,
-		"updated_at":     config.UpdatedAt,
+		"id":               config.ID,
+		"enabled":          config.Enabled,
+		"host":             config.Host,
+		"port":             config.Port,
+		"use_ssl":          config.UseSSL,
+		"bind_dn":          config.BindDN,
+		"base_dn":          config.BaseDN,
+		"user_filter":      config.UserFilter,
+		"admin_group":      config.AdminGroup,
+		"skip_tls_verify":  config.SkipTLSVerify,
+		"attribute_mapping": config.AttributeMapping,
+		"updated_at":       config.UpdatedAt,
 	}
 
 	c.JSON(http.StatusOK, response)
@@ -344,6 +382,26 @@ func (h *LDAPConfigHandler) TestLDAPAuth(c *gin.Context) {
 			return
 		}
 
+	// 获取属性映射配置
+	mapping := config.GetAttributeMapping()
+	emailAttr := mapping.EmailAttribute
+	if emailAttr == "" {
+		emailAttr = "mail"
+	}
+	fullNameAttr := mapping.FullNameAttribute
+	if fullNameAttr == "" {
+		fullNameAttr = "displayName"
+	}
+	memberOfAttr := mapping.MemberOfAttribute
+	if memberOfAttr == "" {
+		memberOfAttr = "memberOf"
+	}
+	
+	// 构建属性列表（包含配置的属性以及常见的fallback属性）
+	attributes := []string{"dn", "cn", emailAttr, fullNameAttr, memberOfAttr}
+	// 添加常见的fallback属性
+	attributes = append(attributes, "uid", "sAMAccountName")
+	
 	// 搜索用户
 	searchRequest := ldap.NewSearchRequest(
 		config.BaseDN,
@@ -353,7 +411,7 @@ func (h *LDAPConfigHandler) TestLDAPAuth(c *gin.Context) {
 		0,
 		false,
 		filter,
-		[]string{"dn", "cn", "mail", "displayName", "memberOf"},
+		attributes,
 		nil,
 	)
 
@@ -398,7 +456,7 @@ func (h *LDAPConfigHandler) TestLDAPAuth(c *gin.Context) {
 	isAdmin := false
 	adminInfo := ""
 	if config.AdminGroup != "" {
-		memberOfList := userInfo.GetAttributeValues("memberOf")
+		memberOfList := userInfo.GetAttributeValues(memberOfAttr)
 		for _, memberOf := range memberOfList {
 			if memberOf == config.AdminGroup {
 				isAdmin = true
@@ -412,9 +470,10 @@ func (h *LDAPConfigHandler) TestLDAPAuth(c *gin.Context) {
 		}
 	}
 
-	// 获取用户信息
-	email := userInfo.GetAttributeValue("mail")
-	fullName := userInfo.GetAttributeValue("displayName")
+	// 获取用户信息（使用配置的属性映射）
+	email := userInfo.GetAttributeValue(emailAttr)
+	fullName := userInfo.GetAttributeValue(fullNameAttr)
+	// 如果全名为空，尝试使用cn作为fallback
 	if fullName == "" {
 		fullName = userInfo.GetAttributeValue("cn")
 	}
@@ -460,19 +519,8 @@ func (h *LDAPConfigHandler) SyncLDAPUsers(c *gin.Context) {
 		return
 	}
 
-	// 创建 LDAP 认证器
-	authConfig := &auth.LDAPConfig{
-		Enabled:       config.Enabled,
-		Host:          config.Host,
-		Port:          config.Port,
-		UseSSL:        config.UseSSL,
-		BindDN:        config.BindDN,
-		BindPassword:  config.BindPassword,
-		BaseDN:        config.BaseDN,
-		UserFilter:    config.UserFilter,
-		AdminGroup:    config.AdminGroup,
-		SkipTLSVerify: config.SkipTLSVerify,
-	}
+	// 创建 LDAP 认证器（使用属性映射配置）
+	authConfig := convertToAuthLDAPConfig(config)
 	ldapAuth := auth.NewLDAPAuthenticator(authConfig)
 
 	// 搜索所有 LDAP 用户
@@ -541,10 +589,16 @@ func (h *LDAPConfigHandler) SyncLDAPUsers(c *gin.Context) {
 	var usersToUpdate []models.User
 	userGroupMap := make(map[string]*models.UserGroup) // 记录每个用户应该分配的用户组
 	
-	for _, ldapUser := range ldapUsers {
+		for _, ldapUser := range ldapUsers {
 		if existingUser, exists := existingUserMap[ldapUser.Username]; exists {
 			// 用户已存在，检查是否需要更新
 			needsUpdate := false
+			// 确保Source字段正确设置为LDAP
+			if existingUser.Source != models.UserSourceLDAP {
+				existingUser.Source = models.UserSourceLDAP
+				existingUser.PasswordHash = "" // 清空密码（LDAP用户不需要密码）
+				needsUpdate = true
+			}
 			if existingUser.Email != ldapUser.Email && ldapUser.Email != "" {
 				existingUser.Email = ldapUser.Email
 				needsUpdate = true
@@ -552,6 +606,24 @@ func (h *LDAPConfigHandler) SyncLDAPUsers(c *gin.Context) {
 			if existingUser.IsAdmin != ldapUser.IsAdmin {
 				existingUser.IsAdmin = ldapUser.IsAdmin
 				needsUpdate = true
+			}
+			// 更新LDAP属性
+			if existingUser.LDAPDN != ldapUser.DN && ldapUser.DN != "" {
+				existingUser.LDAPDN = ldapUser.DN
+				needsUpdate = true
+			}
+			if existingUser.FullName != ldapUser.FullName && ldapUser.FullName != "" {
+				existingUser.FullName = ldapUser.FullName
+				needsUpdate = true
+			}
+			// 更新LDAP原始属性JSON（用于扩展）
+			if len(ldapUser.Attributes) > 0 {
+				if attrsJSON, err := json.Marshal(ldapUser.Attributes); err == nil {
+					if existingUser.LDAPAttributes != string(attrsJSON) {
+						existingUser.LDAPAttributes = string(attrsJSON)
+						needsUpdate = true
+					}
+				}
 			}
 			if needsUpdate {
 				usersToUpdate = append(usersToUpdate, *existingUser)
@@ -566,15 +638,20 @@ func (h *LDAPConfigHandler) SyncLDAPUsers(c *gin.Context) {
 		} else {
 			// 用户不存在，准备创建
 			user := models.User{
-				Username: ldapUser.Username,
-				Email:    ldapUser.Email,
-				IsAdmin:  ldapUser.IsAdmin,
-				IsActive: true,
+				Username:  ldapUser.Username,
+				Email:     ldapUser.Email,
+				IsAdmin:   ldapUser.IsAdmin,
+				IsActive:  true,
+				Source:    models.UserSourceLDAP, // 标记为LDAP用户
+				LDAPDN:    ldapUser.DN,
+				FullName:  ldapUser.FullName,
+				// PasswordHash 留空，LDAP用户不需要存储密码（认证由LDAP服务器完成）
 			}
-			// LDAP 用户设置随机密码（不使用本地密码认证）
-			if err := user.SetPassword("ldap-user-no-local-password-" + ldapUser.Username); err != nil {
-				log.Printf("Warning: Failed to set password for user %s: %v", ldapUser.Username, err)
-				continue
+			// 序列化LDAP原始属性为JSON（用于扩展）
+			if len(ldapUser.Attributes) > 0 {
+				if attrsJSON, err := json.Marshal(ldapUser.Attributes); err == nil {
+					user.LDAPAttributes = string(attrsJSON)
+				}
 			}
 			usersToCreate = append(usersToCreate, user)
 			

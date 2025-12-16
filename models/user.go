@@ -1,25 +1,38 @@
 package models
 
 import (
+	"encoding/json"
 	"log"
 	"time"
 
 	"github.com/fisker/zvpn/auth"
 	"golang.org/x/crypto/bcrypt"
-	"gorm.io/gorm"
+)
+
+// 用户来源常量
+const (
+	UserSourceSystem = "system" // 系统账户
+	UserSourceLDAP   = "ldap"   // LDAP用户
 )
 
 type User struct {
-	ID        uint           `gorm:"primarykey" json:"id"`
-	CreatedAt time.Time      `json:"created_at"`
-	UpdatedAt time.Time      `json:"updated_at"`
-	DeletedAt gorm.DeletedAt `gorm:"index" json:"-"`
+	ID        uint      `gorm:"primarykey" json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
 
 	Username     string `gorm:"uniqueIndex;not null;size:255" json:"username"`
-	PasswordHash string `gorm:"not null" json:"-"`
+	PasswordHash string `gorm:"size:255" json:"-"` // LDAP用户可以为空（认证由LDAP服务器完成），系统用户必须设置
 	Email        string `gorm:"uniqueIndex;size:255" json:"email"`
 	IsAdmin      bool   `gorm:"default:false" json:"is_admin"`
 	IsActive     bool   `gorm:"default:true" json:"is_active"`
+
+	// 用户来源：system（系统账户）或 ldap（LDAP用户）
+	Source string `gorm:"default:'system';size:20;index" json:"source"` // system 或 ldap
+
+	// LDAP related fields
+	LDAPDN         string `gorm:"size:512" json:"ldap_dn"`   // LDAP Distinguished Name
+	FullName       string `gorm:"size:255" json:"full_name"` // 全名/中文名 (displayName/cn)
+	LDAPAttributes string `gorm:"type:text" json:"-"`        // LDAP原始属性JSON（不返回给API，用于扩展）
 
 	// VPN related
 	VPNIP     string     `json:"vpn_ip"`    // Assigned VPN IP
@@ -28,7 +41,7 @@ type User struct {
 	LastSeen  *time.Time `json:"last_seen"`
 
 	// OTP related
-	OTPSecret  string `gorm:"size:255" json:"-"`        // OTP密钥（不返回给API）
+	OTPSecret  string `gorm:"size:255" json:"-"`                // OTP密钥（不返回给API）
 	OTPEnabled bool   `gorm:"default:false" json:"otp_enabled"` // OTP是否启用
 
 	// Relations - 用户必须属于至少一个用户组
@@ -110,7 +123,12 @@ func (u *User) GetPolicyID() uint {
 	return 0
 }
 
+// SetPassword 设置密码（仅系统账户需要）
 func (u *User) SetPassword(password string) error {
+	// LDAP用户不需要设置密码（认证由LDAP服务器完成）
+	if u.Source == UserSourceLDAP {
+		return nil
+	}
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
 	if err != nil {
 		return err
@@ -119,9 +137,45 @@ func (u *User) SetPassword(password string) error {
 	return nil
 }
 
+// CheckPassword 检查密码（仅系统账户需要）
 func (u *User) CheckPassword(password string) bool {
+	// LDAP用户不需要检查密码（认证由LDAP服务器完成）
+	if u.Source == UserSourceLDAP {
+		return false
+	}
+	// 系统账户必须设置密码
+	if u.PasswordHash == "" {
+		return false
+	}
 	err := bcrypt.CompareHashAndPassword([]byte(u.PasswordHash), []byte(password))
 	return err == nil
+}
+
+// SetLDAPAttributes 设置LDAP原始属性（从map序列化为JSON字符串）
+func (u *User) SetLDAPAttributes(attributes map[string][]string) error {
+	if len(attributes) == 0 {
+		u.LDAPAttributes = ""
+		return nil
+	}
+	attrsJSON, err := json.Marshal(attributes)
+	if err != nil {
+		return err
+	}
+	u.LDAPAttributes = string(attrsJSON)
+	return nil
+}
+
+// GetLDAPAttributes 获取LDAP原始属性（从JSON字符串反序列化为map）
+func (u *User) GetLDAPAttributes() (map[string][]string, error) {
+	if u.LDAPAttributes == "" {
+		return nil, nil
+	}
+	var attributes map[string][]string
+	err := json.Unmarshal([]byte(u.LDAPAttributes), &attributes)
+	if err != nil {
+		return nil, err
+	}
+	return attributes, nil
 }
 
 // CheckPasswordWithOTP 检查密码和OTP（如果启用了OTP）

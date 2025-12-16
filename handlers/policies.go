@@ -205,7 +205,8 @@ func (h *PolicyHandler) UpdatePolicy(c *gin.Context) {
 
 func (h *PolicyHandler) DeletePolicy(c *gin.Context) {
 	id := c.Param("id")
-	if err := database.DB.Delete(&models.Policy{}, id).Error; err != nil {
+	// 使用 Unscoped().Delete() 进行硬删除，直接删除记录而不是软删除
+	if err := database.DB.Unscoped().Delete(&models.Policy{}, id).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}

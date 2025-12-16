@@ -12,6 +12,7 @@ export interface VPNStatus {
 export interface ConnectedUser {
   id: number
   username: string
+  full_name?: string  // 中文名/全名（LDAP用户有，系统账户可选）
   vpn_ip: string
   connected: boolean
   connected_at?: string

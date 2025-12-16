@@ -114,7 +114,8 @@ func (h *GroupHandler) UpdateGroup(c *gin.Context) {
 // DeleteGroup 删除用户组
 func (h *GroupHandler) DeleteGroup(c *gin.Context) {
 	id := c.Param("id")
-	if err := database.DB.Delete(&models.UserGroup{}, id).Error; err != nil {
+	// 使用 Unscoped().Delete() 进行硬删除，直接删除记录而不是软删除
+	if err := database.DB.Unscoped().Delete(&models.UserGroup{}, id).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}

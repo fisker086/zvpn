@@ -473,6 +473,69 @@
                 </a-typography-text>
               </template>
             </a-form-item>
+
+            <a-divider orientation="left">LDAP 属性映射（高级配置）</a-divider>
+            <a-typography-text type="secondary" style="font-size: 12px; margin-bottom: 16px; display: block">
+              不同公司的LDAP服务器属性名可能不同，可以在此配置属性映射。留空则使用默认值或从UserFilter自动推断。
+            </a-typography-text>
+
+            <a-row :gutter="16">
+              <a-col :span="12">
+                <a-form-item label="用户名属性">
+                  <a-input
+                    v-model="attributeMapping.username"
+                    placeholder="例如: uid, sAMAccountName, cn"
+                  />
+                  <template #extra>
+                    <a-typography-text type="secondary" style="font-size: 12px">
+                      留空则从UserFilter自动推断
+                    </a-typography-text>
+                  </template>
+                </a-form-item>
+              </a-col>
+              <a-col :span="12">
+                <a-form-item label="邮箱属性">
+                  <a-input
+                    v-model="attributeMapping.email"
+                    placeholder="默认: mail"
+                  />
+                  <template #extra>
+                    <a-typography-text type="secondary" style="font-size: 12px">
+                      默认值: mail
+                    </a-typography-text>
+                  </template>
+                </a-form-item>
+              </a-col>
+            </a-row>
+
+            <a-row :gutter="16">
+              <a-col :span="12">
+                <a-form-item label="全名属性">
+                  <a-input
+                    v-model="attributeMapping.full_name"
+                    placeholder="默认: displayName"
+                  />
+                  <template #extra>
+                    <a-typography-text type="secondary" style="font-size: 12px">
+                      默认值: displayName（如果为空则使用cn）
+                    </a-typography-text>
+                  </template>
+                </a-form-item>
+              </a-col>
+              <a-col :span="12">
+                <a-form-item label="组成员属性">
+                  <a-input
+                    v-model="attributeMapping.member_of"
+                    placeholder="默认: memberOf"
+                  />
+                  <template #extra>
+                    <a-typography-text type="secondary" style="font-size: 12px">
+                      默认值: memberOf
+                    </a-typography-text>
+                  </template>
+                </a-form-item>
+              </a-col>
+            </a-row>
           </template>
 
           <a-form-item>
@@ -542,13 +605,53 @@
           </a-space>
         </template>
       </a-modal>
+
+      <!-- LDAP 认证测试成功弹窗 -->
+      <a-modal
+        v-model:visible="showAuthTestResultModal"
+        title="认证测试成功"
+        :width="500"
+      >
+        <div style="line-height: 1.8;">
+          <p><strong>用户信息：</strong></p>
+          <p>用户名: {{ authTestResult.user?.username }} {{ authTestResult.user?.is_admin ? '（管理员）' : '（普通用户）' }}</p>
+          <p>DN: {{ authTestResult.user?.dn || '-' }}</p>
+          <p v-if="authTestResult.user?.email">邮箱: {{ authTestResult.user.email }}</p>
+          <p v-if="authTestResult.user?.full_name">姓名: {{ authTestResult.user.full_name }}</p>
+          <p style="margin-top: 10px; color: #52c41a;">{{ authTestResult.message }}</p>
+        </div>
+        <template #footer>
+          <a-button type="primary" @click="showAuthTestResultModal = false">确定</a-button>
+        </template>
+      </a-modal>
+
+      <!-- LDAP 用户同步结果弹窗 -->
+      <a-modal
+        v-model:visible="showSyncResultModal"
+        title="用户同步完成"
+        :width="500"
+      >
+        <div style="line-height: 1.8;">
+          <p style="color: #52c41a; font-weight: bold;">{{ syncResult.message }}</p>
+          <p v-if="syncResultDetails.length > 0">{{ syncResultDetails.join('，') }}</p>
+          <div v-if="syncResult.error_details && syncResult.error_details.length > 0" style="margin-top: 10px;">
+            <p style="color: #ff4d4f;"><strong>错误详情：</strong></p>
+            <ul style="margin: 5px 0; padding-left: 20px;">
+              <li v-for="(err, index) in syncResult.error_details" :key="index" style="margin: 3px 0;">{{ err }}</li>
+            </ul>
+          </div>
+        </div>
+        <template #footer>
+          <a-button type="primary" @click="showSyncResultModal = false">确定</a-button>
+        </template>
+      </a-modal>
     </a-space>
   </div>
 </template>
 
 <script setup lang="ts">
 import { ref, reactive, onMounted } from 'vue'
-import { ldapApi, type UpdateLDAPConfigRequest, type LDAPAuthTestRequest, type LDAPSyncResponse } from '@/api/ldap'
+import { ldapApi, type UpdateLDAPConfigRequest, type LDAPAuthTestRequest, type LDAPSyncResponse, type LDAPAttributeMapping } from '@/api/ldap'
 import { Message, Modal } from '@arco-design/web-vue'
 import request from '@/api/request'
 import { useForm } from '@/composables/useForm'
@@ -557,7 +660,33 @@ import { validatePort, validateIP } from '@/utils/validators'
 const submitLoading = ref(false)
 const testLoading = ref(false)
 const authTestLoading = ref(false)
+const syncLoading = ref(false)
 const showAuthTestModal = ref(false)
+const showAuthTestResultModal = ref(false)
+const showSyncResultModal = ref(false)
+const authTestResult = reactive<{
+  user?: {
+    username?: string
+    dn?: string
+    email?: string
+    full_name?: string
+    is_admin?: boolean
+  }
+  message?: string
+}>({
+  user: undefined,
+  message: '',
+})
+const syncResult = reactive<LDAPSyncResponse>({
+  success: false,
+  message: '',
+  total: undefined,
+  created: undefined,
+  updated: undefined,
+  errors: undefined,
+  error_details: [],
+})
+const syncResultDetails = ref<string[]>([])
 const authTestForm = reactive<LDAPAuthTestRequest>({
   username: '',
   password: '',
@@ -616,6 +745,15 @@ const formData = reactive<UpdateLDAPConfigRequest>({
   user_filter: '(uid=%s)',
   admin_group: '',
   skip_tls_verify: false,
+  attribute_mapping: '',
+})
+
+// LDAP属性映射配置
+const attributeMapping = reactive<LDAPAttributeMapping>({
+  username: '',
+  email: '',
+  full_name: '',
+  member_of: '',
 })
 
 const fetchConfig = async () => {
@@ -632,6 +770,25 @@ const fetchConfig = async () => {
     formData.skip_tls_verify = config.skip_tls_verify || false
     // 密码不返回，保持为空
     formData.bind_password = ''
+    
+    // 解析属性映射配置
+    if (config.attribute_mapping) {
+      try {
+        const mapping = JSON.parse(config.attribute_mapping) as LDAPAttributeMapping
+        attributeMapping.username = mapping.username || ''
+        attributeMapping.email = mapping.email || ''
+        attributeMapping.full_name = mapping.full_name || ''
+        attributeMapping.member_of = mapping.member_of || ''
+      } catch (e) {
+        console.error('Failed to parse attribute mapping:', e)
+      }
+    } else {
+      // 重置为默认值
+      attributeMapping.username = ''
+      attributeMapping.email = ''
+      attributeMapping.full_name = ''
+      attributeMapping.member_of = ''
+    }
     
     // 获取性能优化配置（完全依赖后端返回值）
     try {
@@ -709,6 +866,20 @@ const handleSubmit = async () => {
 
   submitLoading.value = true
   try {
+    // 构建属性映射JSON（只包含非空字段）
+    const mapping: LDAPAttributeMapping = {}
+    if (attributeMapping.username) mapping.username = attributeMapping.username
+    if (attributeMapping.email) mapping.email = attributeMapping.email
+    if (attributeMapping.full_name) mapping.full_name = attributeMapping.full_name
+    if (attributeMapping.member_of) mapping.member_of = attributeMapping.member_of
+    
+    // 如果有任何属性映射配置，转换为JSON字符串
+    if (Object.keys(mapping).length > 0) {
+      formData.attribute_mapping = JSON.stringify(mapping)
+    } else {
+      formData.attribute_mapping = ''
+    }
+    
     await ldapApi.updateConfig(formData)
     Message.success('配置保存成功')
     // 重新加载配置
@@ -769,21 +940,13 @@ const handleAuthTest = async () => {
     // 然后测试用户认证
     const result = await ldapApi.testAuth(authTestForm)
     if (result.success) {
-      const userInfo = result.user
-      const adminInfo = userInfo?.is_admin ? '（管理员）' : '（普通用户）'
-      Modal.success({
-        title: '认证测试成功',
-        content: `
-          <div style="line-height: 1.8;">
-            <p><strong>用户信息：</strong></p>
-            <p>用户名: ${userInfo?.username} ${adminInfo}</p>
-            <p>DN: ${userInfo?.dn}</p>
-            ${userInfo?.email ? `<p>邮箱: ${userInfo.email}</p>` : ''}
-            ${userInfo?.full_name ? `<p>姓名: ${userInfo.full_name}</p>` : ''}
-            <p style="margin-top: 10px; color: #52c41a;">${result.message}</p>
-          </div>
-        `,
-      })
+      // 存储结果数据
+      authTestResult.user = result.user
+      authTestResult.message = result.message
+      // 显示结果弹窗
+      showAuthTestResultModal.value = true
+      // 关闭测试输入弹窗
+      showAuthTestModal.value = false
       // 清空密码字段
       authTestForm.password = ''
     }
@@ -813,39 +976,32 @@ const handleSyncUsers = async () => {
     // 然后同步用户
     const result = await ldapApi.syncUsers()
     if (result.success) {
-      const details = []
+      // 存储同步结果
+      syncResult.success = result.success
+      syncResult.message = result.message || ''
+      syncResult.total = result.total
+      syncResult.created = result.created
+      syncResult.updated = result.updated
+      syncResult.errors = result.errors
+      syncResult.error_details = result.error_details || []
+      
+      // 构建详情数组
+      syncResultDetails.value = []
       if (result.total !== undefined) {
-        details.push(`共找到 ${result.total} 个用户`)
+        syncResultDetails.value.push(`共找到 ${result.total} 个用户`)
       }
       if (result.created !== undefined && result.created > 0) {
-        details.push(`创建 ${result.created} 个`)
+        syncResultDetails.value.push(`创建 ${result.created} 个`)
       }
       if (result.updated !== undefined && result.updated > 0) {
-        details.push(`更新 ${result.updated} 个`)
+        syncResultDetails.value.push(`更新 ${result.updated} 个`)
       }
       if (result.errors !== undefined && result.errors > 0) {
-        details.push(`失败 ${result.errors} 个`)
+        syncResultDetails.value.push(`失败 ${result.errors} 个`)
       }
       
-      const content = `
-        <div style="line-height: 1.8;">
-          <p style="color: #52c41a; font-weight: bold;">${result.message}</p>
-          ${details.length > 0 ? `<p>${details.join('，')}</p>` : ''}
-          ${result.error_details && result.error_details.length > 0 ? `
-            <div style="margin-top: 10px;">
-              <p style="color: #ff4d4f;"><strong>错误详情：</strong></p>
-              <ul style="margin: 5px 0; padding-left: 20px;">
-                ${result.error_details.map((err: string) => `<li style="margin: 3px 0;">${err}</li>`).join('')}
-              </ul>
-            </div>
-          ` : ''}
-        </div>
-      `
-      
-      Modal.success({
-        title: '用户同步完成',
-        content,
-      })
+      // 显示结果弹窗
+      showSyncResultModal.value = true
     }
   } catch (error: any) {
     const errorMsg = error.response?.data?.error || error.response?.data?.message || '用户同步失败'

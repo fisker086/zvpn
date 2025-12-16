@@ -160,6 +160,18 @@ func Init(cfg *config.Config) error {
 		return err
 	}
 
+	// 数据迁移：确保已存在的用户都有 Source 字段
+	// 对于已部署的系统，AutoMigrate 会添加新字段，但已存在用户的 Source 可能为空
+	// 这里将所有 Source 为空或 NULL 的用户设置为 'system'（系统账户）
+	result := DB.Model(&models.User{}).
+		Where("source IS NULL OR source = ''").
+		Update("source", models.UserSourceSystem)
+	if result.Error != nil {
+		log.Printf("Warning: Failed to migrate user source field: %v", result.Error)
+	} else if result.RowsAffected > 0 {
+		log.Printf("Migrated %d existing users to source='system'", result.RowsAffected)
+	}
+
 	// Create default policy if not exists (must be created before admin user due to foreign key)
 	var defaultPolicy models.Policy
 	var policyCount int64
@@ -212,6 +224,7 @@ func Init(cfg *config.Config) error {
 			Email:    "admin@zvpn.local",
 			IsAdmin:  true,
 			IsActive: true,
+			Source:   models.UserSourceSystem, // 明确设置为系统账户
 		}
 		admin.SetPassword("admin123")
 		if err := DB.Create(admin).Error; err != nil {

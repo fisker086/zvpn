@@ -278,42 +278,50 @@ const columns = [
     slotName: 'time', 
     width: 160,
     fixed: 'left',
+    align: 'center',
   },
   { 
     title: '类型', 
     slotName: 'type', 
     width: 100,
+    align: 'center',
   },
   { 
     title: '动作', 
     slotName: 'action', 
     width: 100,
+    align: 'center',
   },
   { 
     title: '用户', 
     slotName: 'user', 
     width: 120,
+    align: 'center',
   },
   { 
     title: '网络信息', 
     slotName: 'network', 
     width: 320,
+    align: 'center',
   },
   { 
     title: '协议', 
     slotName: 'protocol', 
     width: 80,
+    align: 'center',
   },
   { 
     title: '结果', 
     slotName: 'result', 
     width: 100,
+    align: 'center',
   },
   { 
     title: '操作', 
     slotName: 'operations', 
     width: 80,
     fixed: 'right',
+    align: 'center',
   },
 ]
 

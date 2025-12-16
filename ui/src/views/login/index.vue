@@ -28,6 +28,11 @@
               <icon-user />
             </template>
           </a-input>
+          <template v-if="ldapEnabled" #extra>
+            <a-typography-text type="secondary" style="font-size: 12px">
+              LDAP用户请输入uid（英文账户名），系统账户请输入账户名。系统会自动识别账户类型。
+            </a-typography-text>
+          </template>
         </a-form-item>
 
         <a-form-item
@@ -37,7 +42,7 @@
         >
           <a-input-password
             v-model="formData.password"
-            :placeholder="ldapEnabled ? '请输入 LDAP 密码' : '请输入密码'"
+            :placeholder="ldapEnabled ? '请输入 LDAP 密码或系统账户密码' : '请输入密码'"
             size="large"
             allow-clear
             @press-enter="handleSubmit"

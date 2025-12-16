@@ -5,6 +5,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"image"
@@ -226,6 +227,8 @@ func (h *Handler) Authenticate(c *gin.Context) {
 	// 如果LDAP启用，创建LDAP认证器
 	var ldapAuth *auth.LDAPAuthenticator
 	if ldapConfig.Enabled {
+		// 获取属性映射配置
+		mapping := ldapConfig.GetAttributeMapping()
 		authConfig := &auth.LDAPConfig{
 			Enabled:       ldapConfig.Enabled,
 			Host:          ldapConfig.Host,
@@ -237,6 +240,12 @@ func (h *Handler) Authenticate(c *gin.Context) {
 			UserFilter:    ldapConfig.UserFilter,
 			AdminGroup:    ldapConfig.AdminGroup,
 			SkipTLSVerify: ldapConfig.SkipTLSVerify,
+			AttributeMapping: auth.AttributeMapping{
+				UsernameAttribute: mapping.UsernameAttribute,
+				EmailAttribute:    mapping.EmailAttribute,
+				FullNameAttribute: mapping.FullNameAttribute,
+				MemberOfAttribute: mapping.MemberOfAttribute,
+			},
 		}
 		ldapAuth = auth.NewLDAPAuthenticator(authConfig)
 		log.Printf("OpenConnect: LDAP authenticator created: Host=%s, Port=%d, UseSSL=%v, SkipTLSVerify=%v",
@@ -244,190 +253,285 @@ func (h *Handler) Authenticate(c *gin.Context) {
 	}
 
 	// 尝试 LDAP 认证（如果启用）
+	// 兼容性说明：
+	// 1. LDAP用户：Source字段为'ldap'，登录时使用LDAP服务器认证，数据库不存储密码
+	// 2. 系统账户：Source字段为'system'，登录时使用数据库认证（bcrypt哈希）
+	// 3. 系统根据Source字段自动识别账户类型，无需密码格式判断
+	// 4. LDAP用户登录使用uid（英文账户名），系统账户可以使用任意用户名
 	if ldapAuth != nil && ldapConfig.Enabled {
-		// 先检查用户是否已存在且启用了OTP（如果存在）
+		// 先检查用户是否存在于数据库中
 		var existingUser models.User
-		userExists := database.DB.Where("username = ?", username).First(&existingUser).Error == nil
-		var ldapPassword = password
+		userExistsInDB := database.DB.Where("username = ?", username).First(&existingUser).Error == nil
 
-		// 如果用户存在且启用了OTP，需要从password中提取密码部分用于LDAP认证
-		if userExists && existingUser.OTPEnabled && existingUser.OTPSecret != "" {
-			if len(password) >= 7 {
-				// 提取最后6位作为OTP代码，前面部分作为密码
-				otpCode := password[len(password)-6:]
-				// 验证OTP代码格式（应该是6位数字）
-				isValidOTPFormat := true
-				for _, c := range otpCode {
-					if c < '0' || c > '9' {
-						isValidOTPFormat = false
-						break
+		// 如果用户存在，检查是LDAP用户还是系统账户
+		if userExistsInDB {
+			// 根据Source字段判断用户类型
+			if existingUser.Source == models.UserSourceLDAP {
+				// LDAP用户，使用LDAP认证
+			} else {
+				// 系统账户，跳过LDAP认证，直接使用数据库认证
+				log.Printf("OpenConnect: User %s is a system account (source: %s), using database authentication", username, existingUser.Source)
+				// 不设置 isLDAPAuth，让后续代码使用数据库认证
+			}
+
+			// 如果是LDAP用户，尝试LDAP认证
+			if existingUser.Source == models.UserSourceLDAP {
+				// 是LDAP用户，尝试LDAP认证
+				var ldapPassword = password
+
+				// 如果用户启用了OTP，需要从password中提取密码部分用于LDAP认证
+				if existingUser.OTPEnabled && existingUser.OTPSecret != "" {
+					if len(password) >= 7 {
+						// 提取最后6位作为OTP代码，前面部分作为密码
+						otpCode := password[len(password)-6:]
+						// 验证OTP代码格式（应该是6位数字）
+						isValidOTPFormat := true
+						for _, c := range otpCode {
+							if c < '0' || c > '9' {
+								isValidOTPFormat = false
+								break
+							}
+						}
+						if isValidOTPFormat {
+							ldapPassword = password[:len(password)-6]
+							log.Printf("OpenConnect: Extracted password for LDAP auth (user %s has OTP enabled)", username)
+						}
 					}
 				}
-				if isValidOTPFormat {
-					ldapPassword = password[:len(password)-6]
-					log.Printf("OpenConnect: Extracted password for LDAP auth (user %s has OTP enabled)", username)
+
+				ldapUser, err := ldapAuth.Authenticate(username, ldapPassword)
+				if err == nil {
+					// LDAP 认证成功，同步用户到本地数据库
+					if err := database.DB.Preload("Groups").Preload("Groups.Policies").Preload("Groups.Policies.Routes").
+						Where("username = ?", username).First(&user).Error; err != nil {
+						// 用户不存在，创建新用户
+						user = models.User{
+							Username: username,
+							Email:    ldapUser.Email,
+							IsAdmin:  ldapUser.IsAdmin,
+							IsActive: true,
+							Source:   models.UserSourceLDAP, // 标记为LDAP用户
+							LDAPDN:   ldapUser.DN,
+							FullName: ldapUser.FullName,
+							// PasswordHash 留空，LDAP用户不需要存储密码（认证由LDAP服务器完成）
+						}
+						// 序列化LDAP原始属性为JSON（用于扩展）
+						if len(ldapUser.Attributes) > 0 {
+							if attrsJSON, err := json.Marshal(ldapUser.Attributes); err == nil {
+								user.LDAPAttributes = string(attrsJSON)
+							}
+						}
+						if err := database.DB.Create(&user).Error; err != nil {
+							log.Printf("OpenConnect: Failed to create LDAP user %s: %v", username, err)
+							h.sendAuthError(c, "Failed to create user")
+							return
+						}
+
+						// 为新创建的 LDAP 用户分配默认用户组
+						// 管理员用户分配到 admin 组，普通用户分配到 default 组（如果不存在则创建）
+						var defaultGroup models.UserGroup
+						groupName := "default"
+						if ldapUser.IsAdmin {
+							groupName = "admin"
+						}
+
+						// 查找或创建默认用户组
+						if err := database.DB.Where("name = ?", groupName).First(&defaultGroup).Error; err != nil {
+							// 组不存在，尝试创建（仅对 default 组）
+							if groupName == "default" {
+								// 查找默认策略
+								var defaultPolicy models.Policy
+								if err := database.DB.Where("name = ?", "default").First(&defaultPolicy).Error; err == nil {
+									defaultGroup = models.UserGroup{
+										Name:        "default",
+										Description: "默认用户组",
+									}
+									if err := database.DB.Create(&defaultGroup).Error; err != nil {
+										log.Printf("OpenConnect: Warning: Failed to create default user group: %v", err)
+									} else {
+										// 关联默认策略
+										if err := database.DB.Model(&defaultGroup).Association("Policies").Append(&defaultPolicy); err != nil {
+											log.Printf("OpenConnect: Warning: Failed to assign default policy to default group: %v", err)
+										}
+										log.Printf("OpenConnect: ✓ Created default user group")
+									}
+								}
+							}
+						}
+
+						// 分配用户组
+						if defaultGroup.ID > 0 {
+							if err := database.DB.Model(&user).Association("Groups").Append(&defaultGroup); err != nil {
+								log.Printf("OpenConnect: Warning: Failed to assign group '%s' to LDAP user %s: %v", groupName, username, err)
+							} else {
+								log.Printf("OpenConnect: ✓ LDAP user %s assigned to group '%s'", username, groupName)
+							}
+						} else {
+							log.Printf("OpenConnect: Warning: User group '%s' not found, LDAP user %s has no groups (may affect VPN access)", groupName, username)
+						}
+
+						log.Printf("OpenConnect: ✓ LDAP user created: %s (email: %s, fullname: %s, admin: %v)",
+							username, ldapUser.Email, ldapUser.FullName, ldapUser.IsAdmin)
+
+						// 重新加载用户（包含用户组和策略）
+						database.DB.Preload("Groups").Preload("Groups.Policies").Preload("Groups.Policies.Routes").
+							Where("username = ?", username).First(&user)
+						// 计算用户的策略（从用户组获取）
+						if policy := user.GetPolicy(); policy != nil {
+							user.PolicyID = policy.ID
+							user.Policy = *policy
+						}
+					} else {
+						// 用户已存在，检查是否被禁用
+						if !user.IsActive {
+							log.Printf("OpenConnect: User %s is disabled, rejecting LDAP authentication", username)
+							h.sendAuthError(c, "User account is disabled")
+							return
+						}
+
+						// 同步最新信息
+						updated := false
+						if user.Email != ldapUser.Email && ldapUser.Email != "" {
+							user.Email = ldapUser.Email
+							updated = true
+						}
+						if user.IsAdmin != ldapUser.IsAdmin {
+							user.IsAdmin = ldapUser.IsAdmin
+							updated = true
+						}
+						// 更新LDAP属性
+						if user.LDAPDN != ldapUser.DN && ldapUser.DN != "" {
+							user.LDAPDN = ldapUser.DN
+							updated = true
+						}
+						if user.FullName != ldapUser.FullName && ldapUser.FullName != "" {
+							user.FullName = ldapUser.FullName
+							updated = true
+						}
+						// 更新LDAP原始属性JSON（用于扩展）
+						if len(ldapUser.Attributes) > 0 {
+							if attrsJSON, err := json.Marshal(ldapUser.Attributes); err == nil {
+								if user.LDAPAttributes != string(attrsJSON) {
+									user.LDAPAttributes = string(attrsJSON)
+									updated = true
+								}
+							}
+						}
+						if updated {
+							if err := database.DB.Save(&user).Error; err != nil {
+								log.Printf("OpenConnect: Failed to update LDAP user %s: %v", username, err)
+							} else {
+								log.Printf("OpenConnect: ✓ LDAP user synced: %s (email: %s, fullname: %s, admin: %v)",
+									username, ldapUser.Email, ldapUser.FullName, ldapUser.IsAdmin)
+							}
+							// 重新加载用户（包含用户组和策略）
+							database.DB.Preload("Groups").Preload("Groups.Policies").Preload("Groups.Policies.Routes").
+								Where("username = ?", username).First(&user)
+							// 计算用户的策略（从用户组获取）
+							if policy := user.GetPolicy(); policy != nil {
+								user.PolicyID = policy.ID
+								user.Policy = *policy
+							}
+						}
+					}
+
+					isLDAPAuth = true
+					log.Printf("OpenConnect: ✓ User %s authenticated via LDAP", username)
+
+					// LDAP认证成功后，如果用户启用了OTP，需要验证OTP
+					if user.OTPEnabled && user.OTPSecret != "" {
+						if !user.CheckPasswordWithOTP(password) {
+							log.Printf("OpenConnect: LDAP auth succeeded but OTP verification failed for user %s", username)
+							auditLogger := policy.GetAuditLogger()
+							if auditLogger != nil {
+								auditLogger.LogAuthWithIP(user.ID, username, models.AuditLogActionLogin, "failed",
+									fmt.Sprintf("LDAP auth succeeded but OTP verification failed. Source IP: %s", clientIP), clientIP, 0)
+							}
+							if h.bruteforceProtection != nil {
+								blocked, _, blockedUntil := h.bruteforceProtection.RecordFailedAttempt(clientIP)
+								if blocked {
+									h.sendAuthError(c, fmt.Sprintf("Too many failed login attempts. IP address blocked until %v", blockedUntil.Format(time.RFC3339)))
+									return
+								}
+							}
+							h.sendAuthError(c, "Invalid OTP code")
+							return
+						}
+						log.Printf("OpenConnect: User %s authenticated via LDAP with OTP", username)
+					}
+				} else {
+					// LDAP 认证失败，记录失败尝试并 fallback 到本地认证
+					auditLogger := policy.GetAuditLogger()
+					if auditLogger != nil {
+						auditLogger.LogAuthWithIP(0, username, models.AuditLogActionLogin, "failed",
+							fmt.Sprintf("LDAP authentication failed: %v. Source IP: %s", err, clientIP), clientIP, 0)
+					}
+					if h.bruteforceProtection != nil {
+						blocked, _, blockedUntil := h.bruteforceProtection.RecordFailedAttempt(clientIP)
+						if blocked {
+							h.sendAuthError(c, fmt.Sprintf("Too many failed login attempts. IP address blocked until %v", blockedUntil.Format(time.RFC3339)))
+							return
+						}
+					}
+					log.Printf("OpenConnect: ✗ LDAP authentication failed for %s: %v, trying local auth", username, err)
 				}
 			}
-		}
-
-		ldapUser, err := ldapAuth.Authenticate(username, ldapPassword)
-		if err == nil {
-			// LDAP 认证成功，同步用户到本地数据库
-			if err := database.DB.Preload("Groups").Preload("Groups.Policies").Preload("Groups.Policies.Routes").
-				Where("username = ?", username).First(&user).Error; err != nil {
-				// 用户不存在，创建新用户
+		} else {
+			// 用户不存在于数据库中，尝试LDAP认证
+			var ldapPassword = password
+			ldapUser, err := ldapAuth.Authenticate(username, ldapPassword)
+			if err == nil {
+				// LDAP 认证成功，创建新用户
 				user = models.User{
 					Username: username,
 					Email:    ldapUser.Email,
 					IsAdmin:  ldapUser.IsAdmin,
 					IsActive: true,
+					Source:   models.UserSourceLDAP, // 标记为LDAP用户
+					LDAPDN:   ldapUser.DN,
+					FullName: ldapUser.FullName,
+					// PasswordHash 留空，LDAP用户不需要存储密码（认证由LDAP服务器完成）
 				}
-				// LDAP 用户设置随机密码（不使用本地密码认证）
-				if err := user.SetPassword("ldap-user-no-local-password-" + username); err != nil {
-					log.Printf("OpenConnect: Failed to set password for LDAP user %s: %v", username, err)
-					h.sendAuthError(c, "Failed to create user")
-					return
+				// 序列化LDAP原始属性为JSON（用于扩展）
+				if len(ldapUser.Attributes) > 0 {
+					if attrsJSON, err := json.Marshal(ldapUser.Attributes); err == nil {
+						user.LDAPAttributes = string(attrsJSON)
+					}
 				}
 				if err := database.DB.Create(&user).Error; err != nil {
 					log.Printf("OpenConnect: Failed to create LDAP user %s: %v", username, err)
 					h.sendAuthError(c, "Failed to create user")
 					return
 				}
-				
+
 				// 为新创建的 LDAP 用户分配默认用户组
-				// 管理员用户分配到 admin 组，普通用户分配到 default 组（如果不存在则创建）
 				var defaultGroup models.UserGroup
 				groupName := "default"
 				if ldapUser.IsAdmin {
 					groupName = "admin"
 				}
-				
-				// 查找或创建默认用户组
-				if err := database.DB.Where("name = ?", groupName).First(&defaultGroup).Error; err != nil {
-					// 组不存在，尝试创建（仅对 default 组）
-					if groupName == "default" {
-						// 查找默认策略
-						var defaultPolicy models.Policy
-						if err := database.DB.Where("name = ?", "default").First(&defaultPolicy).Error; err == nil {
-							defaultGroup = models.UserGroup{
-								Name:        "default",
-								Description: "默认用户组",
-							}
-							if err := database.DB.Create(&defaultGroup).Error; err != nil {
-								log.Printf("OpenConnect: Warning: Failed to create default user group: %v", err)
-							} else {
-								// 关联默认策略
-								if err := database.DB.Model(&defaultGroup).Association("Policies").Append(&defaultPolicy); err != nil {
-									log.Printf("OpenConnect: Warning: Failed to assign default policy to default group: %v", err)
-								}
-								log.Printf("OpenConnect: ✓ Created default user group")
-							}
-						}
-					}
+				if err := database.DB.Where("name = ?", groupName).First(&defaultGroup).Error; err == nil {
+					database.DB.Model(&user).Association("Groups").Append(&defaultGroup)
 				}
-				
-				// 分配用户组
-				if defaultGroup.ID > 0 {
-					if err := database.DB.Model(&user).Association("Groups").Append(&defaultGroup); err != nil {
-						log.Printf("OpenConnect: Warning: Failed to assign group '%s' to LDAP user %s: %v", groupName, username, err)
-					} else {
-						log.Printf("OpenConnect: ✓ LDAP user %s assigned to group '%s'", username, groupName)
-					}
-				} else {
-					log.Printf("OpenConnect: Warning: User group '%s' not found, LDAP user %s has no groups (may affect VPN access)", groupName, username)
-				}
-				
-				log.Printf("OpenConnect: ✓ LDAP user created: %s (email: %s, fullname: %s, admin: %v)",
-					username, ldapUser.Email, ldapUser.FullName, ldapUser.IsAdmin)
 
-				// 重新加载用户（包含用户组和策略）
-				database.DB.Preload("Groups").Preload("Groups.Policies").Preload("Groups.Policies.Routes").
-					Where("username = ?", username).First(&user)
-				// 计算用户的策略（从用户组获取）
-				if policy := user.GetPolicy(); policy != nil {
-					user.PolicyID = policy.ID
-					user.Policy = *policy
-				}
+				isLDAPAuth = true
+				log.Printf("OpenConnect: ✓ LDAP user created and authenticated: %s", username)
 			} else {
-				// 用户已存在，检查是否被禁用
-				if !user.IsActive {
-					log.Printf("OpenConnect: User %s is disabled, rejecting LDAP authentication", username)
-					h.sendAuthError(c, "User account is disabled")
-					return
+				// LDAP 认证失败，记录失败尝试并 fallback 到本地认证
+				auditLogger := policy.GetAuditLogger()
+				if auditLogger != nil {
+					auditLogger.LogAuthWithIP(0, username, models.AuditLogActionLogin, "failed",
+						fmt.Sprintf("LDAP authentication failed: %v. Source IP: %s", err, clientIP), clientIP, 0)
 				}
-
-				// 同步最新信息
-				updated := false
-				if user.Email != ldapUser.Email && ldapUser.Email != "" {
-					user.Email = ldapUser.Email
-					updated = true
-				}
-				if user.IsAdmin != ldapUser.IsAdmin {
-					user.IsAdmin = ldapUser.IsAdmin
-					updated = true
-				}
-				if updated {
-					if err := database.DB.Save(&user).Error; err != nil {
-						log.Printf("OpenConnect: Failed to update LDAP user %s: %v", username, err)
-					} else {
-						log.Printf("OpenConnect: ✓ LDAP user synced: %s (email: %s, fullname: %s, admin: %v)",
-							username, ldapUser.Email, ldapUser.FullName, ldapUser.IsAdmin)
-					}
-					// 重新加载用户（包含用户组和策略）
-					database.DB.Preload("Groups").Preload("Groups.Policies").Preload("Groups.Policies.Routes").
-						Where("username = ?", username).First(&user)
-					// 计算用户的策略（从用户组获取）
-					if policy := user.GetPolicy(); policy != nil {
-						user.PolicyID = policy.ID
-						user.Policy = *policy
+				if h.bruteforceProtection != nil {
+					blocked, _, blockedUntil := h.bruteforceProtection.RecordFailedAttempt(clientIP)
+					if blocked {
+						h.sendAuthError(c, fmt.Sprintf("Too many failed login attempts. IP address blocked until %v", blockedUntil.Format(time.RFC3339)))
+						return
 					}
 				}
+				log.Printf("OpenConnect: ✗ LDAP authentication failed for %s: %v, trying local auth", username, err)
 			}
-			isLDAPAuth = true
-			log.Printf("OpenConnect: ✓ User %s authenticated via LDAP", username)
-
-			// LDAP认证成功后，如果用户启用了OTP，需要验证OTP
-			if user.OTPEnabled && user.OTPSecret != "" {
-				if !user.CheckPasswordWithOTP(password) {
-					log.Printf("OpenConnect: LDAP auth succeeded but OTP verification failed for user %s", username)
-					// 记录OTP验证失败审计日志
-					auditLogger := policy.GetAuditLogger()
-					if auditLogger != nil {
-						auditLogger.LogAuthWithIP(user.ID, username, models.AuditLogActionLogin, "failed",
-							fmt.Sprintf("LDAP auth succeeded but OTP verification failed. Source IP: %s", clientIP), clientIP, 0)
-					}
-
-					// 记录密码爆破尝试（OTP 验证失败也算一次失败）
-					if h.bruteforceProtection != nil {
-						blocked, remaining, blockedUntil := h.bruteforceProtection.RecordFailedAttempt(clientIP)
-						if blocked {
-							h.sendAuthError(c, fmt.Sprintf("Too many failed login attempts. IP address blocked until %v", blockedUntil.Format(time.RFC3339)))
-							return
-						}
-						_ = remaining
-					}
-					h.sendAuthError(c, "Invalid OTP code")
-					return
-				}
-				log.Printf("OpenConnect: User %s authenticated via LDAP with OTP", username)
-			}
-		} else {
-			// LDAP 认证失败，记录失败尝试并 fallback 到本地认证
-			auditLogger := policy.GetAuditLogger()
-			if auditLogger != nil {
-				auditLogger.LogAuthWithIP(0, username, models.AuditLogActionLogin, "failed",
-					fmt.Sprintf("LDAP authentication failed: %v. Source IP: %s", err, clientIP), clientIP, 0)
-			}
-
-			// 记录密码爆破尝试
-			if h.bruteforceProtection != nil {
-				blocked, _, blockedUntil := h.bruteforceProtection.RecordFailedAttempt(clientIP)
-				if blocked {
-					h.sendAuthError(c, fmt.Sprintf("Too many failed login attempts. IP address blocked until %v", blockedUntil.Format(time.RFC3339)))
-					return
-				}
-			}
-			log.Printf("OpenConnect: ✗ LDAP authentication failed for %s: %v, trying local auth", username, err)
 		}
 	}
 

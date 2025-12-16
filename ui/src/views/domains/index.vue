@@ -268,30 +268,36 @@ const columns = [
     title: '域名',
     dataIndex: 'domain',
     slotName: 'domain',
+    align: 'center',
   },
   {
     title: '解析IP',
     dataIndex: 'ips',
     slotName: 'ips',
+    align: 'center',
   },
   {
     title: '状态',
     dataIndex: 'status',
     slotName: 'status',
+    align: 'center',
   },
   {
     title: '关联策略',
     dataIndex: 'policy_name',
     slotName: 'policy',
+    align: 'center',
   },
   {
     title: '访问次数',
     dataIndex: 'access_count',
+    align: 'center',
   },
   {
     title: '最后使用',
     dataIndex: 'last_used',
     slotName: 'last_used',
+    align: 'center',
   },
   {
     title: '操作',

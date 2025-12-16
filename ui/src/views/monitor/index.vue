@@ -35,8 +35,8 @@
                 <icon-user />
               </a-avatar>
               <div>
-                <div class="username">{{ record.username }}</div>
-                <div class="user-id">ID: {{ record.id }}</div>
+                <div class="username">{{ record.full_name || record.username }}</div>
+                <div class="user-id">{{ record.full_name ? record.username : `ID: ${record.id}` }}</div>
               </div>
             </a-space>
           </template>
@@ -120,43 +120,51 @@ const columns = [
     slotName: 'username',
     width: 220,
     fixed: 'left',
+    align: 'center',
   },
   {
     title: '客户端',
     slotName: 'user_agent',
     width: 280,
+    align: 'center',
   },
   {
     title: '操作系统',
     slotName: 'client_os',
     width: 140,
+    align: 'center',
   },
   {
     title: '客户端版本',
     slotName: 'client_ver',
     width: 140,
+    align: 'center',
   },
   {
     title: 'VPN IP',
     slotName: 'vpn_ip',
     width: 150,
+    align: 'center',
   },
   {
     title: '用户组',
     slotName: 'groups',
     width: 200,
+    align: 'center',
   },
   {
     title: '连接时间',
     slotName: 'connected_at',
     width: 200,
     fixed: 'right',
+    align: 'center',
   },
   {
     title: '状态',
     slotName: 'status',
     width: 120,
     fixed: 'right',
+    align: 'center',
   },
 ]
 

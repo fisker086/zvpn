@@ -28,12 +28,14 @@ type CreateUserRequest struct {
 	Username string `json:"username" binding:"required"`
 	Password string `json:"password" binding:"required"`
 	Email    string `json:"email"`
+	FullName string `json:"full_name"` // 中文名/全名（可选）
 	IsAdmin  bool   `json:"is_admin"`
 	GroupIDs []uint `json:"group_ids" binding:"required"` // 必须指定用户组
 }
 
 type UpdateUserRequest struct {
 	Email    string `json:"email"`
+	FullName string `json:"full_name"` // 中文名/全名（可选）
 	IsActive bool   `json:"is_active"`
 	GroupIDs []uint `json:"group_ids"` // 更新用户组
 }
@@ -88,8 +90,10 @@ func (h *UserHandler) CreateUser(c *gin.Context) {
 	user := &models.User{
 		Username: req.Username,
 		Email:    req.Email,
+		FullName: req.FullName,
 		IsAdmin:  req.IsAdmin,
 		IsActive: true,
+		Source:   models.UserSourceSystem, // 系统账户
 		Groups:   groups,
 	}
 
@@ -147,6 +151,11 @@ func (h *UserHandler) UpdateUser(c *gin.Context) {
 
 	if req.Email != "" {
 		user.Email = req.Email
+	}
+	// 更新FullName（如果提供了非空值则更新）
+	// 注意：空字符串不会更新，保持原值（如果需要清空，前端需要明确传递空字符串）
+	if req.FullName != "" {
+		user.FullName = req.FullName
 	}
 	user.IsActive = req.IsActive
 
@@ -229,7 +238,8 @@ func (h *UserHandler) DeleteUser(c *gin.Context) {
 		}
 	}
 	
-	if err := database.DB.Delete(&models.User{}, id).Error; err != nil {
+	// 使用 Unscoped().Delete() 进行硬删除，直接删除记录而不是软删除
+	if err := database.DB.Unscoped().Delete(&models.User{}, id).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}

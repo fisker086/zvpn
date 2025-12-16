@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
@@ -129,9 +130,11 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		ldapConfig = models.LDAPConfig{Enabled: false}
 	}
 
-	// 如果LDAP启用，创建LDAP认证器
+	// 如果LDAP启用，创建LDAP认证器（使用属性映射配置）
 	var ldapAuth *auth.LDAPAuthenticator
 	if ldapConfig.Enabled {
+		// 获取属性映射配置
+		mapping := ldapConfig.GetAttributeMapping()
 		authConfig := &auth.LDAPConfig{
 			Enabled:       ldapConfig.Enabled,
 			Host:          ldapConfig.Host,
@@ -143,6 +146,12 @@ func (h *AuthHandler) Login(c *gin.Context) {
 			UserFilter:    ldapConfig.UserFilter,
 			AdminGroup:    ldapConfig.AdminGroup,
 			SkipTLSVerify: ldapConfig.SkipTLSVerify,
+			AttributeMapping: auth.AttributeMapping{
+				UsernameAttribute: mapping.UsernameAttribute,
+				EmailAttribute:    mapping.EmailAttribute,
+				FullNameAttribute: mapping.FullNameAttribute,
+				MemberOfAttribute: mapping.MemberOfAttribute,
+			},
 		}
 		ldapAuth = auth.NewLDAPAuthenticator(authConfig)
 		log.Printf("LDAP authenticator created: Host=%s, Port=%d, UseSSL=%v, SkipTLSVerify=%v",
@@ -150,23 +159,29 @@ func (h *AuthHandler) Login(c *gin.Context) {
 	}
 
 	// 尝试 LDAP 认证（如果启用）
-	// 注意：如果用户是数据库原生用户（密码不是LDAP格式），优先使用数据库认证
+	// 兼容性说明：
+	// 1. LDAP用户：Source字段为'ldap'，登录时使用LDAP服务器认证，数据库不存储密码
+	// 2. 系统账户：Source字段为'system'，登录时使用数据库认证（bcrypt哈希）
+	// 3. 系统根据Source字段自动识别账户类型，无需密码格式判断
+	// 4. LDAP用户登录使用uid（英文账户名），系统账户可以使用任意用户名
 	if ldapAuth != nil && ldapConfig.Enabled {
 		// 先检查用户是否存在于数据库中
 		var existingUser models.User
 		userExistsInDB := database.DB.Where("username = ?", req.Username).First(&existingUser).Error == nil
 
-		// 如果用户存在且密码不是LDAP格式（即数据库原生用户），跳过LDAP认证，直接使用数据库认证
+		// 如果用户存在，检查是LDAP用户还是系统账户
 		if userExistsInDB {
-			// 检查密码是否是LDAP格式（LDAP用户的密码是 "ldap-user-no-local-password-" + username）
-			// 直接尝试用LDAP格式密码验证，如果成功说明是LDAP用户
-			isLDAPUser := existingUser.CheckPassword("ldap-user-no-local-password-" + req.Username)
-
-			// 如果不是LDAP用户，跳过LDAP认证，直接使用数据库认证
-			if !isLDAPUser {
-				log.Printf("User %s is a database user (not LDAP), skipping LDAP authentication", req.Username)
-				// 不设置 isLDAPAuth，让后续代码使用数据库认证
+			// 根据Source字段判断用户类型
+			if existingUser.Source == models.UserSourceLDAP {
+				// LDAP用户，使用LDAP认证
 			} else {
+				// 系统账户，跳过LDAP认证，直接使用数据库认证
+				log.Printf("User %s is a system account (source: %s), using database authentication", req.Username, existingUser.Source)
+				// 不设置 isLDAPAuth，让后续代码使用数据库认证
+			}
+
+			// 如果是LDAP用户，尝试LDAP认证
+			if existingUser.Source == models.UserSourceLDAP {
 				// 是LDAP用户，尝试LDAP认证
 				ldapUser, err := ldapAuth.Authenticate(req.Username, req.Password)
 				if err == nil {
@@ -178,12 +193,16 @@ func (h *AuthHandler) Login(c *gin.Context) {
 							Email:    ldapUser.Email,
 							IsAdmin:  ldapUser.IsAdmin,
 							IsActive: true,
+							Source:   models.UserSourceLDAP, // 标记为LDAP用户
+							LDAPDN:   ldapUser.DN,
+							FullName: ldapUser.FullName,
+							// PasswordHash 留空，LDAP用户不需要存储密码
 						}
-						// LDAP 用户设置随机密码（不使用本地密码认证）
-						if err := user.SetPassword("ldap-user-no-local-password-" + req.Username); err != nil {
-							log.Printf("Failed to set password for LDAP user %s: %v", req.Username, err)
-							c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create user"})
-							return
+						// 序列化LDAP原始属性为JSON（用于扩展）
+						if len(ldapUser.Attributes) > 0 {
+							if attrsJSON, err := json.Marshal(ldapUser.Attributes); err == nil {
+								user.LDAPAttributes = string(attrsJSON)
+							}
 						}
 						if err := database.DB.Create(&user).Error; err != nil {
 							log.Printf("Failed to create LDAP user %s: %v", req.Username, err)
@@ -257,6 +276,24 @@ func (h *AuthHandler) Login(c *gin.Context) {
 							user.IsAdmin = ldapUser.IsAdmin
 							updated = true
 						}
+						// 更新LDAP属性
+						if user.LDAPDN != ldapUser.DN && ldapUser.DN != "" {
+							user.LDAPDN = ldapUser.DN
+							updated = true
+						}
+						if user.FullName != ldapUser.FullName && ldapUser.FullName != "" {
+							user.FullName = ldapUser.FullName
+							updated = true
+						}
+						// 更新LDAP原始属性JSON（用于扩展）
+						if len(ldapUser.Attributes) > 0 {
+							if attrsJSON, err := json.Marshal(ldapUser.Attributes); err == nil {
+								if user.LDAPAttributes != string(attrsJSON) {
+									user.LDAPAttributes = string(attrsJSON)
+									updated = true
+								}
+							}
+						}
 						if updated {
 							if err := database.DB.Save(&user).Error; err != nil {
 								log.Printf("Failed to update LDAP user %s: %v", req.Username, err)
@@ -297,12 +334,16 @@ func (h *AuthHandler) Login(c *gin.Context) {
 					Email:    ldapUser.Email,
 					IsAdmin:  ldapUser.IsAdmin,
 					IsActive: true,
+					Source:   models.UserSourceLDAP, // 标记为LDAP用户
+					LDAPDN:   ldapUser.DN,
+					FullName: ldapUser.FullName,
+					// PasswordHash 留空，LDAP用户不需要存储密码
 				}
-				// LDAP 用户设置随机密码（不使用本地密码认证）
-				if err := user.SetPassword("ldap-user-no-local-password-" + req.Username); err != nil {
-					log.Printf("Failed to set password for LDAP user %s: %v", req.Username, err)
-					c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create user"})
-					return
+				// 序列化LDAP原始属性为JSON（用于扩展）
+				if len(ldapUser.Attributes) > 0 {
+					if attrsJSON, err := json.Marshal(ldapUser.Attributes); err == nil {
+						user.LDAPAttributes = string(attrsJSON)
+					}
 				}
 				if err := database.DB.Create(&user).Error; err != nil {
 					log.Printf("Failed to create LDAP user %s: %v", req.Username, err)

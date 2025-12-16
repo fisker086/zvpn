@@ -440,11 +440,13 @@ const columns = [
     title: '策略名称',
     slotName: 'name',
     width: 160,
+    align: 'center',
   },
   {
     title: '描述',
     slotName: 'description',
     width: 200,
+    align: 'center',
     ellipsis: {
       tooltip: true,
     },
@@ -453,22 +455,26 @@ const columns = [
     title: '路由规则',
     slotName: 'routes',
     width: 220,
+    align: 'center',
   },
   {
     title: '绑定用户组',
     slotName: 'groups',
     width: 160,
+    align: 'center',
     tooltip: '策略必须绑定至少一个用户组',
   },
   {
     title: '最大带宽',
     slotName: 'max_bandwidth',
     width: 120,
+    align: 'center',
   },
   {
     title: 'DNS服务器',
     slotName: 'dns_servers',
     width: 180,
+    align: 'center',
   },
   {
     title: '操作',
@@ -483,14 +489,17 @@ const routeColumns = [
   {
     title: '网络',
     slotName: 'network',
+    align: 'center',
   },
   {
     title: '网关',
     slotName: 'gateway',
+    align: 'center',
   },
   {
     title: '优先级',
     dataIndex: 'metric',
+    align: 'center',
   },
   {
     title: '操作',

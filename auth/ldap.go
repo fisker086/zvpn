@@ -3,6 +3,7 @@ package auth
 import (
 	"crypto/tls"
 	"fmt"
+	"log"
 	"strings"
 
 	"github.com/go-ldap/ldap/v3"
@@ -20,6 +21,17 @@ type LDAPConfig struct {
 	UserFilter    string // 例如: (uid=%s) 或 (sAMAccountName=%s)
 	AdminGroup    string // 管理员组 DN
 	SkipTLSVerify bool
+
+	// LDAP属性映射配置
+	AttributeMapping AttributeMapping
+}
+
+// AttributeMapping LDAP属性映射配置
+type AttributeMapping struct {
+	UsernameAttribute string // 用户名属性，例如: "uid", "sAMAccountName", "cn"
+	EmailAttribute    string // 邮箱属性，例如: "mail", "email"
+	FullNameAttribute string // 全名属性，例如: "displayName", "cn", "name"
+	MemberOfAttribute string // 组成员属性，例如: "memberOf", "groupMembership"
 }
 
 // LDAPAuthenticator LDAP 认证器
@@ -87,16 +99,45 @@ func (l *LDAPAuthenticator) Authenticate(username, password string) (*LDAPUser, 
 		isAdmin, err = l.isUserInGroup(conn, userDN, l.config.AdminGroup)
 		if err != nil {
 			// 管理员组检查失败不影响登录，只记录日志
-			fmt.Printf("Warning: Failed to check admin group: %v\n", err)
+			log.Printf("Warning: Failed to check admin group: %v", err)
+		}
+	}
+
+	// 获取属性映射配置
+	_, emailAttr, fullNameAttr, memberOfAttr := l.getAttributeMapping()
+
+	// 重新搜索用户以获取完整属性（用于同步和存储）
+	searchRequest2 := ldap.NewSearchRequest(
+		userDN,
+		ldap.ScopeBaseObject,
+		ldap.NeverDerefAliases,
+		0,
+		0,
+		false,
+		"(objectClass=*)",
+		[]string{"dn", "cn", emailAttr, fullNameAttr, memberOfAttr},
+		nil,
+	)
+
+	result2, err := conn.Search(searchRequest2)
+	var attributes map[string][]string
+
+	if err == nil && len(result2.Entries) > 0 {
+		entry2 := result2.Entries[0]
+		// 收集所有LDAP属性（用于存储到数据库，便于扩展）
+		attributes = make(map[string][]string)
+		for _, attr := range entry2.Attributes {
+			attributes[attr.Name] = attr.Values
 		}
 	}
 
 	return &LDAPUser{
-		DN:       userDN,
-		Username: username,
-		Email:    userInfo.Email,
-		FullName: userInfo.FullName,
-		IsAdmin:  isAdmin,
+		DN:         userDN,
+		Username:   username,
+		Email:      userInfo.Email,
+		FullName:   userInfo.FullName,
+		IsAdmin:    isAdmin,
+		Attributes: attributes,
 	}, nil
 }
 
@@ -132,7 +173,10 @@ func (l *LDAPAuthenticator) searchUser(conn *ldap.Conn, username string) (string
 		return "", nil, fmt.Errorf("user_filter format error: must contain %%s or {0} placeholder, got: %s", filter)
 	}
 
-	// 搜索请求
+	// 获取属性映射配置
+	_, emailAttr, fullNameAttr, memberOfAttr := l.getAttributeMapping()
+
+	// 搜索请求（查询所有需要的属性）
 	searchRequest := ldap.NewSearchRequest(
 		l.config.BaseDN,
 		ldap.ScopeWholeSubtree,
@@ -141,7 +185,7 @@ func (l *LDAPAuthenticator) searchUser(conn *ldap.Conn, username string) (string
 		0,
 		false,
 		filter,
-		[]string{"dn", "cn", "mail", "displayName", "memberOf"},
+		[]string{"dn", "cn", emailAttr, fullNameAttr, memberOfAttr},
 		nil,
 	)
 
@@ -159,14 +203,18 @@ func (l *LDAPAuthenticator) searchUser(conn *ldap.Conn, username string) (string
 	}
 
 	entry := result.Entries[0]
-	userInfo := &LDAPUserInfo{
-		Email:    entry.GetAttributeValue("mail"),
-		FullName: entry.GetAttributeValue("displayName"),
+
+	// 使用配置的属性映射获取属性值（变量已在上面定义）
+	email := entry.GetAttributeValue(emailAttr)
+	fullName := entry.GetAttributeValue(fullNameAttr)
+	// 如果全名为空，尝试使用cn作为fallback
+	if fullName == "" {
+		fullName = entry.GetAttributeValue("cn")
 	}
 
-	// 如果 displayName 为空，使用 cn
-	if userInfo.FullName == "" {
-		userInfo.FullName = entry.GetAttributeValue("cn")
+	userInfo := &LDAPUserInfo{
+		Email:    email,
+		FullName: fullName,
 	}
 
 	return entry.DN, userInfo, nil
@@ -179,7 +227,10 @@ func (l *LDAPAuthenticator) isUserInGroup(conn *ldap.Conn, userDN, groupDN strin
 		return false, err
 	}
 
-	// 搜索用户的 memberOf 属性
+	// 获取属性映射配置
+	_, _, _, memberOfAttr := l.getAttributeMapping()
+
+	// 搜索用户的组成员属性
 	searchRequest := ldap.NewSearchRequest(
 		userDN,
 		ldap.ScopeBaseObject,
@@ -188,7 +239,7 @@ func (l *LDAPAuthenticator) isUserInGroup(conn *ldap.Conn, userDN, groupDN strin
 		0,
 		false,
 		"(objectClass=*)",
-		[]string{"memberOf"},
+		[]string{memberOfAttr},
 		nil,
 	)
 
@@ -201,8 +252,8 @@ func (l *LDAPAuthenticator) isUserInGroup(conn *ldap.Conn, userDN, groupDN strin
 		return false, nil
 	}
 
-	// 检查 memberOf 属性
-	memberOfList := result.Entries[0].GetAttributeValues("memberOf")
+	// 检查组成员属性
+	memberOfList := result.Entries[0].GetAttributeValues(memberOfAttr)
 	for _, memberOf := range memberOfList {
 		if memberOf == groupDN {
 			return true, nil
@@ -212,13 +263,100 @@ func (l *LDAPAuthenticator) isUserInGroup(conn *ldap.Conn, userDN, groupDN strin
 	return false, nil
 }
 
+// inferUsernameAttributeFromFilter 从UserFilter推断用户名属性
+func (l *LDAPAuthenticator) inferUsernameAttributeFromFilter() string {
+	filter := l.config.UserFilter
+	if strings.Contains(filter, "uid=") {
+		return "uid"
+	}
+	if strings.Contains(filter, "sAMAccountName=") {
+		return "sAMAccountName"
+	}
+	if strings.Contains(filter, "cn=") {
+		return "cn"
+	}
+	// 默认返回空，让调用方使用fallback逻辑
+	return ""
+}
+
+// getAttributeMapping 获取属性映射配置（带默认值）
+func (l *LDAPAuthenticator) getAttributeMapping() (usernameAttr, emailAttr, fullNameAttr, memberOfAttr string) {
+	// 用户名属性（从配置或从UserFilter推断）
+	usernameAttr = l.config.AttributeMapping.UsernameAttribute
+	if usernameAttr == "" {
+		usernameAttr = l.inferUsernameAttributeFromFilter()
+	}
+
+	// 其他属性映射（带默认值）
+	emailAttr = l.config.AttributeMapping.EmailAttribute
+	if emailAttr == "" {
+		emailAttr = "mail"
+	}
+	fullNameAttr = l.config.AttributeMapping.FullNameAttribute
+	if fullNameAttr == "" {
+		fullNameAttr = "displayName"
+	}
+	memberOfAttr = l.config.AttributeMapping.MemberOfAttribute
+	if memberOfAttr == "" {
+		memberOfAttr = "memberOf"
+	}
+	return
+}
+
+// extractUsernameFromEntry 从LDAP entry中提取用户名（支持多种fallback策略）
+func (l *LDAPAuthenticator) extractUsernameFromEntry(entry *ldap.Entry, usernameAttr string) string {
+	// 优先使用配置的属性
+	if usernameAttr != "" {
+		if username := entry.GetAttributeValue(usernameAttr); username != "" {
+			return username
+		}
+	}
+
+	// 如果配置的属性没有值，尝试从UserFilter推断
+	if strings.Contains(l.config.UserFilter, "uid=") {
+		if username := entry.GetAttributeValue("uid"); username != "" {
+			return username
+		}
+	} else if strings.Contains(l.config.UserFilter, "sAMAccountName=") {
+		if username := entry.GetAttributeValue("sAMAccountName"); username != "" {
+			return username
+		}
+	} else if strings.Contains(l.config.UserFilter, "cn=") {
+		if username := entry.GetAttributeValue("cn"); username != "" {
+			return username
+		}
+	}
+
+	// 如果还是没有，尝试从常见属性获取（按优先级）
+	commonAttrs := []string{"uid", "sAMAccountName", "cn"}
+	for _, attr := range commonAttrs {
+		if username := entry.GetAttributeValue(attr); username != "" {
+			return username
+		}
+	}
+
+	// 如果还是没有，从 DN 中提取（例如：cn=username,ou=users,dc=example,dc=com）
+	dnParts := strings.Split(entry.DN, ",")
+	if len(dnParts) > 0 {
+		cnPart := strings.TrimSpace(dnParts[0])
+		if strings.HasPrefix(cnPart, "cn=") {
+			return strings.TrimPrefix(cnPart, "cn=")
+		} else if strings.HasPrefix(cnPart, "uid=") {
+			return strings.TrimPrefix(cnPart, "uid=")
+		}
+	}
+
+	return ""
+}
+
 // LDAPUser LDAP 用户信息
 type LDAPUser struct {
-	DN       string
-	Username string
-	Email    string
-	FullName string
-	IsAdmin  bool
+	DN         string              // Distinguished Name
+	Username   string              // 用户名 (uid/sAMAccountName/cn)
+	Email      string              // 邮箱 (mail)
+	FullName   string              // 全名/中文名 (displayName/cn)
+	IsAdmin    bool                // 是否是管理员
+	Attributes map[string][]string // LDAP原始属性（用于存储所有属性，便于扩展）
 }
 
 // LDAPUserInfo LDAP 用户详细信息
@@ -266,6 +404,17 @@ func (l *LDAPAuthenticator) SearchAllUsers() ([]*LDAPUser, error) {
 		// 但这种情况不太可能，因为 UserFilter 应该包含占位符
 	}
 
+	// 获取属性映射配置
+	usernameAttr, emailAttr, fullNameAttr, memberOfAttr := l.getAttributeMapping()
+
+	// 构建属性列表（包含配置的属性以及常见的fallback属性）
+	attributes := []string{"dn", "cn", emailAttr, fullNameAttr, memberOfAttr}
+	if usernameAttr != "" {
+		attributes = append(attributes, usernameAttr)
+	}
+	// 添加常见的fallback属性
+	attributes = append(attributes, "uid", "sAMAccountName")
+
 	// 搜索请求
 	searchRequest := ldap.NewSearchRequest(
 		l.config.BaseDN,
@@ -275,7 +424,7 @@ func (l *LDAPAuthenticator) SearchAllUsers() ([]*LDAPUser, error) {
 		0,
 		false,
 		baseFilter,
-		[]string{"dn", "cn", "mail", "displayName", "memberOf", "uid", "sAMAccountName"},
+		attributes,
 		nil,
 	)
 
@@ -286,47 +435,8 @@ func (l *LDAPAuthenticator) SearchAllUsers() ([]*LDAPUser, error) {
 
 	var users []*LDAPUser
 	for _, entry := range result.Entries {
-		// 提取用户名（从 UserFilter 对应的属性或 DN 中）
-		username := ""
-
-		// 根据 UserFilter 类型提取用户名
-		// 如果 UserFilter 包含 uid=，尝试从 uid 属性获取
-		if strings.Contains(l.config.UserFilter, "uid=") {
-			username = entry.GetAttributeValue("uid")
-		}
-		// 如果 UserFilter 包含 sAMAccountName=，尝试从 sAMAccountName 属性获取
-		if username == "" && strings.Contains(l.config.UserFilter, "sAMAccountName=") {
-			username = entry.GetAttributeValue("sAMAccountName")
-		}
-		// 如果 UserFilter 包含 cn=，尝试从 cn 属性获取
-		if username == "" && strings.Contains(l.config.UserFilter, "cn=") {
-			username = entry.GetAttributeValue("cn")
-		}
-
-		// 如果还是没有，尝试从常见属性获取
-		if username == "" {
-			username = entry.GetAttributeValue("uid")
-		}
-		if username == "" {
-			username = entry.GetAttributeValue("sAMAccountName")
-		}
-		if username == "" {
-			username = entry.GetAttributeValue("cn")
-		}
-
-		// 如果还是没有，从 DN 中提取（例如：cn=username,ou=users,dc=example,dc=com）
-		if username == "" {
-			dnParts := strings.Split(entry.DN, ",")
-			if len(dnParts) > 0 {
-				cnPart := strings.TrimSpace(dnParts[0])
-				if strings.HasPrefix(cnPart, "cn=") {
-					username = strings.TrimPrefix(cnPart, "cn=")
-				} else if strings.HasPrefix(cnPart, "uid=") {
-					username = strings.TrimPrefix(cnPart, "uid=")
-				}
-			}
-		}
-
+		// 提取用户名（使用优化的提取函数）
+		username := l.extractUsernameFromEntry(entry, usernameAttr)
 		if username == "" {
 			// 跳过无法提取用户名的条目
 			continue
@@ -335,7 +445,7 @@ func (l *LDAPAuthenticator) SearchAllUsers() ([]*LDAPUser, error) {
 		// 检查用户是否是管理员
 		isAdmin := false
 		if l.config.AdminGroup != "" {
-			memberOfList := entry.GetAttributeValues("memberOf")
+			memberOfList := entry.GetAttributeValues(memberOfAttr)
 			for _, memberOf := range memberOfList {
 				if memberOf == l.config.AdminGroup {
 					isAdmin = true
@@ -344,18 +454,27 @@ func (l *LDAPAuthenticator) SearchAllUsers() ([]*LDAPUser, error) {
 			}
 		}
 
-		email := entry.GetAttributeValue("mail")
-		fullName := entry.GetAttributeValue("displayName")
+		// 提取LDAP属性（使用配置的属性映射）
+		email := entry.GetAttributeValue(emailAttr)
+		fullName := entry.GetAttributeValue(fullNameAttr)
+		// 如果全名为空，尝试使用cn作为fallback
 		if fullName == "" {
 			fullName = entry.GetAttributeValue("cn")
 		}
 
+		// 收集所有LDAP属性（用于存储到数据库，便于扩展）
+		attributes := make(map[string][]string)
+		for _, attr := range entry.Attributes {
+			attributes[attr.Name] = attr.Values
+		}
+
 		users = append(users, &LDAPUser{
-			DN:       entry.DN,
-			Username: username,
-			Email:    email,
-			FullName: fullName,
-			IsAdmin:  isAdmin,
+			DN:         entry.DN,
+			Username:   username,
+			Email:      email,
+			FullName:   fullName,
+			IsAdmin:    isAdmin,
+			Attributes: attributes,
 		})
 	}
 

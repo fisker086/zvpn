@@ -4,6 +4,7 @@ export interface User {
   id: number
   username: string
   email: string
+  full_name?: string  // 中文名/全名（LDAP用户有，系统账户可选）
   is_admin: boolean
   is_active: boolean
   vpn_ip?: string
@@ -20,12 +21,14 @@ export interface CreateUserRequest {
   username: string
   password: string
   email?: string
+  full_name?: string  // 中文名/全名（可选）
   is_admin?: boolean
   group_ids: number[] // 必须指定用户组
 }
 
 export interface UpdateUserRequest {
   email?: string
+  full_name?: string  // 中文名/全名（可选）
   is_admin?: boolean
   is_active?: boolean
   group_ids?: number[] // 更新用户组（必须至少一个）

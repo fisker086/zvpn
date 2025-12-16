@@ -503,6 +503,7 @@ func (h *VPNHandler) GetStatus(c *gin.Context) {
 type ConnectedUserResponse struct {
 	ID          uint       `json:"id"`
 	Username    string     `json:"username"`
+	FullName    string     `json:"full_name,omitempty"` // 中文名/全名（LDAP用户有，系统账户可选）
 	VPNIP       string     `json:"vpn_ip"`
 	Connected   bool       `json:"connected"`
 	ConnectedAt *time.Time `json:"connected_at,omitempty"`
@@ -538,6 +539,7 @@ func (h *VPNHandler) GetConnectedUsers(c *gin.Context) {
 		response[i] = ConnectedUserResponse{
 			ID:          user.ID,
 			Username:    user.Username,
+			FullName:    user.FullName,
 			VPNIP:       user.VPNIP,
 			Connected:   user.Connected,
 			ConnectedAt: connectedAt,

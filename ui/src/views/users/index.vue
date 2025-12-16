@@ -33,7 +33,14 @@
               <a-avatar :size="32">
                 <icon-user />
               </a-avatar>
-              <span class="username">{{ record.username }}</span>
+              <div class="user-info">
+                <div class="user-name">
+                  {{ record.full_name || record.username }}
+                </div>
+                <div v-if="record.full_name" class="user-username">
+                  {{ record.username }}
+                </div>
+              </div>
             </a-space>
           </template>
 
@@ -137,6 +144,18 @@
             v-model="formData.email"
             placeholder="请输入邮箱"
           />
+        </a-form-item>
+
+        <a-form-item label="中文名">
+          <a-input
+            v-model="formData.full_name"
+            placeholder="请输入中文名（可选）"
+          />
+          <template #extra>
+            <a-typography-text type="secondary" style="font-size: 12px">
+              可选，用于显示用户的中文名称。LDAP用户会自动同步此字段。
+            </a-typography-text>
+          </template>
         </a-form-item>
 
         <a-form-item label="用户组" required>
@@ -302,6 +321,7 @@ const formData = reactive<CreateUserRequest & UpdateUserRequest & { group_ids?: 
   username: '',
   password: '',
   email: '',
+  full_name: '',
   is_admin: false,
   is_active: true,
   group_ids: [],
@@ -309,39 +329,46 @@ const formData = reactive<CreateUserRequest & UpdateUserRequest & { group_ids?: 
 
 const columns = [
   {
-    title: '用户名',
+    title: '用户',
     slotName: 'username',
     width: 200,
+    align: 'center',
   },
   {
     title: '邮箱',
     slotName: 'email',
     width: 220,
+    align: 'center',
   },
   {
     title: '角色',
     slotName: 'is_admin',
     width: 100,
+    align: 'center',
   },
   {
     title: '状态',
     slotName: 'is_active',
     width: 100,
+    align: 'center',
   },
   {
     title: '连接',
     slotName: 'connected',
     width: 100,
+    align: 'center',
   },
   {
     title: 'VPN IP',
     slotName: 'vpn_ip',
     width: 150,
+    align: 'center',
   },
   {
     title: '用户组',
     slotName: 'groups',
     width: 200,
+    align: 'center',
     tooltip: '用户所属的用户组，策略通过用户组分配',
   },
   {
@@ -391,6 +418,7 @@ const handleEdit = async (record: User) => {
   currentUser.value = record
   formData.username = record.username
   formData.email = record.email || ''
+  formData.full_name = record.full_name || ''
   formData.is_admin = record.is_admin
   formData.is_active = record.is_active
   formData.group_ids = record.groups?.map(g => g.id) || []
@@ -445,6 +473,7 @@ const handleSubmit = async () => {
       // 更新用户基本信息（包括用户组）
       await usersApi.update(currentUser.value.id, {
         email: formData.email,
+        full_name: formData.full_name || undefined,
         is_admin: formData.is_admin,
         is_active: formData.is_active,
         group_ids: formData.group_ids,
@@ -457,6 +486,7 @@ const handleSubmit = async () => {
         username: formData.username,
         password: formData.password,
         email: formData.email,
+        full_name: formData.full_name || undefined,
         is_admin: formData.is_admin,
         group_ids: formData.group_ids,
       })
@@ -482,6 +512,7 @@ const resetForm = () => {
     username: '',
     password: '',
     email: '',
+    full_name: '',
     is_admin: false,
     is_active: true,
     group_ids: [],
@@ -626,8 +657,20 @@ onMounted(() => {
   padding-top: 0;
 }
 
-.username {
+.user-info {
+  display: flex;
+  flex-direction: column;
+}
+
+.user-name {
   font-weight: 500;
+  color: var(--color-text-1);
+}
+
+.user-username {
+  font-size: 12px;
+  color: var(--color-text-3);
+  margin-top: 2px;
 }
 
 .text-secondary {
