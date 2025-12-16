@@ -111,10 +111,11 @@ cert: ## 生成 TLS 证书
 		chmod +x generate-cert.sh && ./generate-cert.sh; \
 	else \
 		echo "使用 openssl 生成证书..."; \
-		openssl req -x509 -newkey rsa:4096 -keyout key.pem -out cert.pem -days 365 -nodes \
+		mkdir -p certs; \
+		openssl req -x509 -newkey rsa:4096 -keyout certs/server.key -out certs/server.crt -days 365 -nodes \
 			-subj "/C=CN/ST=State/L=City/O=ZVPN/CN=zvpn.local"; \
 	fi
-	@echo "证书生成完成: cert.pem, key.pem"
+	@echo "证书生成完成: certs/server.crt, certs/server.key"
 
 .PHONY: clean
 clean: ## 清理构建文件

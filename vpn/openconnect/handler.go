@@ -26,6 +26,7 @@ import (
 type DTLSClientInfo struct {
 	Client   *TunnelClient
 	UDPAddr  *net.UDPAddr // 客户端的 UDP 地址
+	DTLSConn net.Conn     // DTLS 连接（用于发送数据）
 	LastSeen time.Time    // 最后活动时间
 }
 
@@ -35,7 +36,8 @@ type Handler struct {
 	vpnServer            *vpn.VPNServer
 	ldapAuthenticator    *auth.LDAPAuthenticator
 	tunDevice            *vpn.TUNDevice
-	dtlsConn             *net.UDPConn               // DTLS UDP 连接
+	dtlsListener         net.Listener               // DTLS 监听器
+	dtlsRawUDPConn       *net.UDPConn               // 原始 UDP 连接（用于调试）
 	dtlsClients          map[string]*DTLSClientInfo // VPN IP -> DTLSClientInfo 映射，用于 DTLS
 	dtlsLock             sync.RWMutex
 	bruteforceProtection *security.BruteforceProtection
@@ -318,10 +320,16 @@ func (h *Handler) handleConnect(c *gin.Context) {
 	}
 
 	// 获取DNS服务器配置（从策略中获取，如果没有则使用默认DNS）
-	dnsServers := getDNSServers(user.GetPolicy())
+	userDNSServers := getDNSServers(user.GetPolicy())
 
-	// DNS拦截器始终启用，优先使用DNS拦截器（VPN服务器地址）作为DNS服务器
-	// 这样域名管理功能才能正常工作（拦截DNS查询并动态添加路由）
+	// 构建DNS服务器列表，顺序为：
+	// 1. DNS拦截器（用于域名管理功能，走VPN）
+	// 2. 用户配置的DNS（从策略中获取）
+	// 注意：不通过CSTP下发公网DNS，让客户端使用系统默认DNS（不走VPN）
+	// 这样可以避免OpenConnect客户端为公网DNS IP自动添加路由到VPN
+	var dnsServers []string
+
+	// 只添加DNS拦截器作为DNS服务器（用于域名管理功能）
 	if h.vpnServer != nil && h.vpnServer.GetDNSInterceptor() != nil {
 		// 获取VPN服务器IP地址（用于DNS拦截器）
 		// 优先使用TUN设备的实际IP地址（支持多服务器横向扩容）
@@ -329,7 +337,7 @@ func (h *Handler) handleConnect(c *gin.Context) {
 		if tunDevice := h.vpnServer.GetTUNDevice(); tunDevice != nil {
 			if tunIP, err := tunDevice.GetIP(); err == nil {
 				dnsInterceptorIP = tunIP.String()
-				log.Printf("OpenConnect: DNS interceptor enabled, using TUN device IP %s as primary DNS (multi-server support)", dnsInterceptorIP)
+				log.Printf("OpenConnect: DNS interceptor enabled, using TUN device IP %s as fallback DNS (multi-server support)", dnsInterceptorIP)
 			}
 		}
 
@@ -341,21 +349,24 @@ func (h *Handler) handleConnect(c *gin.Context) {
 				copy(gatewayIP, ipNet.IP)
 				gatewayIP[len(gatewayIP)-1] = 1 // VPN网关IP（通常是.1）
 				dnsInterceptorIP = gatewayIP.String()
-				log.Printf("OpenConnect: DNS interceptor enabled, using VPN gateway %s as primary DNS (fallback)", dnsInterceptorIP)
+				log.Printf("OpenConnect: DNS interceptor enabled, using VPN gateway %s as fallback DNS", dnsInterceptorIP)
 			}
 		}
 
 		if dnsInterceptorIP != "" {
-			// 将DNS拦截器地址添加到DNS服务器列表的最前面
-			// 这样客户端会优先使用DNS拦截器，域名管理功能才能工作
-			dnsServers = append([]string{dnsInterceptorIP}, dnsServers...)
-			log.Printf("OpenConnect: DNS interceptor enabled, using %s as primary DNS for domain-based split tunneling", dnsInterceptorIP)
+			// 将DNS拦截器地址添加到DNS服务器列表（用于域名管理功能）
+			// 注意：不通过CSTP下发公网DNS，让客户端使用系统默认DNS（不走VPN）
+			// 这样可以避免OpenConnect客户端为公网DNS IP自动添加路由到VPN
+			dnsServers = append(dnsServers, dnsInterceptorIP)
+			log.Printf("OpenConnect: DNS interceptor enabled, using %s as DNS server for domain-based split tunneling", dnsInterceptorIP)
+			log.Printf("OpenConnect: Public DNS (114.114.114.114) not configured in CSTP - client will use system default DNS (no VPN route)")
 		}
 	}
 
-	// 如果没有配置DNS服务器，使用默认的公共DNS
-	if len(dnsServers) == 0 {
-		dnsServers = []string{"8.8.8.8", "8.8.4.4"} // Google DNS
+	// 添加用户配置的DNS（从策略中获取）
+	if len(userDNSServers) > 0 {
+		dnsServers = append(dnsServers, userDNSServers...)
+		log.Printf("OpenConnect: Added user-configured DNS servers: %v", userDNSServers)
 	}
 
 	// 发送CSTP配置响应（包含HTTP响应头）
@@ -415,7 +426,8 @@ func (h *Handler) handleConnect(c *gin.Context) {
 		h.dtlsLock.Lock()
 		h.dtlsClients[user.VPNIP] = &DTLSClientInfo{
 			Client:   tunnelClient,
-			UDPAddr:  nil, // 将在收到第一个 DTLS 数据包时设置
+			UDPAddr:  nil, // 将在建立 DTLS 连接时设置
+			DTLSConn: nil, // 将在建立 DTLS 连接时设置
 			LastSeen: time.Now(),
 		}
 		h.dtlsLock.Unlock()
@@ -618,39 +630,13 @@ func (h *Handler) TunnelHandler(c *gin.Context) {
 }
 
 // StartDTLSServer 启动 DTLS UDP 服务器
+// 现在使用真正的 DTLS 实现（基于 pion/dtls，参考 anylink）
 func (h *Handler) StartDTLSServer() error {
-	log.Printf("StartDTLSServer called: EnableDTLS=%v", h.config.VPN.EnableDTLS)
-	if !h.config.VPN.EnableDTLS {
-		log.Printf("DTLS is disabled in config, skipping DTLS server startup")
-		return nil
-	}
-
-	// 使用与 TCP 相同的端口
-	dtlsPort := h.config.VPN.OpenConnectPort
-	addr := fmt.Sprintf("%s:%s", h.config.Server.Host, dtlsPort)
-
-	udpAddr, err := net.ResolveUDPAddr("udp", addr)
-	if err != nil {
-		return fmt.Errorf("failed to resolve DTLS UDP address: %w", err)
-	}
-
-	conn, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		log.Printf("DTLS: Failed to listen on UDP port %s: %v", dtlsPort, err)
-		return fmt.Errorf("failed to listen on DTLS UDP port %s: %w", dtlsPort, err)
-	}
-
-	h.dtlsConn = conn
-	log.Printf("DTLS UDP server started successfully on %s (UDP port %s)", addr, dtlsPort)
-	log.Printf("DTLS: Server is ready to accept DTLS connections on UDP port %s", dtlsPort)
-
-	// 启动处理 goroutine
-	go h.handleDTLSPackets(conn)
-
-	return nil
+	return h.startRealDTLSServer()
 }
 
-// handleDTLSPackets 处理 DTLS UDP 数据包
+// handleDTLSPackets 处理 DTLS UDP 数据包（已废弃，使用真正的 DTLS 实现）
+// 此函数保留用于向后兼容，但不会被调用
 func (h *Handler) handleDTLSPackets(conn *net.UDPConn) {
 	buf := make([]byte, 65535)
 	log.Printf("DTLS: Packet handler started, waiting for UDP packets...")
@@ -803,10 +789,10 @@ func (h *Handler) handleDTLSPackets(conn *net.UDPConn) {
 	}
 }
 
-// SendDTLSPacket 通过 DTLS 通道发送数据包
+// SendDTLSPacket 通过 DTLS 通道发送数据包（使用真正的 DTLS 连接）
 func (h *Handler) SendDTLSPacket(vpnIP string, packetType byte, data []byte) error {
-	if !h.config.VPN.EnableDTLS || h.dtlsConn == nil {
-		return fmt.Errorf("DTLS not enabled or not started")
+	if !h.config.VPN.EnableDTLS {
+		return fmt.Errorf("DTLS not enabled")
 	}
 
 	h.dtlsLock.RLock()
@@ -817,20 +803,35 @@ func (h *Handler) SendDTLSPacket(vpnIP string, packetType byte, data []byte) err
 		return fmt.Errorf("DTLS client not found for VPN IP: %s", vpnIP)
 	}
 
-	if clientInfo.UDPAddr == nil {
-		return fmt.Errorf("DTLS client UDP address not known for VPN IP: %s", vpnIP)
+	if clientInfo.DTLSConn == nil {
+		return fmt.Errorf("DTLS connection not established for VPN IP: %s", vpnIP)
 	}
 
-	// 构建 DTLS 数据包：version(1) + length(2) + type(1) + reserved(1) + payload
-	packet := make([]byte, 5+len(data))
-	packet[0] = 0x01 // Version
-	binary.BigEndian.PutUint16(packet[1:3], uint16(len(data)))
-	packet[3] = packetType
-	packet[4] = 0x00 // Reserved
-	copy(packet[5:], data)
+	// 构建 CSTP 数据包（带 STF 前缀，与 TCP 连接保持一致）
+	// STF(3) + Version(1) + Length(2) + Type(1) + Reserved(1) + Payload
+	stfLen := 3
+	headerLen := 5
+	payloadLen := uint16(len(data))
+	fullPacket := make([]byte, stfLen+headerLen+len(data))
 
-	// 发送到客户端
-	_, err := h.dtlsConn.WriteToUDP(packet, clientInfo.UDPAddr)
+	// STF 前缀
+	fullPacket[0] = 'S'
+	fullPacket[1] = 'T'
+	fullPacket[2] = 'F'
+
+	// CSTP header
+	fullPacket[3] = 0x01 // Version
+	binary.BigEndian.PutUint16(fullPacket[4:6], payloadLen)
+	fullPacket[6] = packetType
+	fullPacket[7] = 0x00 // Reserved
+
+	// Payload
+	if len(data) > 0 {
+		copy(fullPacket[8:], data)
+	}
+
+	// 通过 DTLS 连接发送
+	_, err := clientInfo.DTLSConn.Write(fullPacket)
 	if err != nil {
 		return fmt.Errorf("failed to send DTLS packet: %w", err)
 	}

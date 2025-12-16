@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -205,13 +206,64 @@ func (h *PolicyHandler) UpdatePolicy(c *gin.Context) {
 
 func (h *PolicyHandler) DeletePolicy(c *gin.Context) {
 	id := c.Param("id")
-	// 使用 Unscoped().Delete() 进行硬删除，直接删除记录而不是软删除
-	if err := database.DB.Unscoped().Delete(&models.Policy{}, id).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	
+	// 先获取策略信息
+	var policy models.Policy
+	if err := database.DB.First(&policy, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Policy not found"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "Policy deleted"})
+	// 开始事务，确保所有删除操作原子性
+	tx := database.DB.Begin()
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+		}
+	}()
+
+	// 1. 删除策略与用户组的关联关系（user_group_policies 中间表）
+	if err := tx.Model(&policy).Association("Groups").Clear(); err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to remove groups from policy: %v", err)})
+		return
+	}
+
+	// 2. 删除策略的路由（Routes 表，PolicyID 外键）
+	if err := tx.Where("policy_id = ?", policy.ID).Unscoped().Delete(&models.Route{}).Error; err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to delete policy routes: %v", err)})
+		return
+	}
+
+	// 3. 删除策略的允许网络（AllowedNetworks 表，PolicyID 外键）
+	if err := tx.Where("policy_id = ?", policy.ID).Unscoped().Delete(&models.AllowedNetwork{}).Error; err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to delete policy allowed networks: %v", err)})
+		return
+	}
+
+	// 4. 删除策略的时间限制（TimeRestrictions 表，PolicyID 外键）
+	if err := tx.Where("policy_id = ?", policy.ID).Unscoped().Delete(&models.TimeRestriction{}).Error; err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to delete policy time restrictions: %v", err)})
+		return
+	}
+
+	// 5. 删除策略本身
+	if err := tx.Unscoped().Delete(&policy).Error; err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to delete policy: %v", err)})
+		return
+	}
+
+	// 提交事务
+	if err := tx.Commit().Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to commit transaction: %v", err)})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Policy deleted successfully"})
 }
 
 func (h *PolicyHandler) AddRoute(c *gin.Context) {

@@ -907,10 +907,16 @@ func (h *Handler) Authenticate(c *gin.Context) {
 	}
 
 	// 获取DNS服务器配置（从策略中获取，如果没有则使用默认DNS）
-	dnsServers := getDNSServers(&user.Policy)
+	userDNSServers := getDNSServers(&user.Policy)
 
-	// DNS拦截器始终启用，优先使用DNS拦截器（VPN服务器地址）作为DNS服务器
-	// 这样域名管理功能才能正常工作（拦截DNS查询并动态添加路由）
+	// 构建DNS服务器列表，顺序为：
+	// 1. DNS拦截器（用于域名管理功能，走VPN）
+	// 2. 用户配置的DNS（从策略中获取）
+	// 注意：不通过CSTP下发公网DNS，让客户端使用系统默认DNS（不走VPN）
+	// 这样可以避免OpenConnect客户端为公网DNS IP自动添加路由到VPN
+	var dnsServers []string
+
+	// 只添加DNS拦截器作为DNS服务器（用于域名管理功能）
 	if h.vpnServer != nil && h.vpnServer.GetDNSInterceptor() != nil {
 		// 获取VPN服务器IP地址（用于DNS拦截器）
 		// 优先使用TUN设备的实际IP地址（支持多服务器横向扩容）
@@ -918,7 +924,7 @@ func (h *Handler) Authenticate(c *gin.Context) {
 		if tunDevice := h.vpnServer.GetTUNDevice(); tunDevice != nil {
 			if tunIP, err := tunDevice.GetIP(); err == nil {
 				dnsInterceptorIP = tunIP.String()
-				log.Printf("OpenConnect: DNS interceptor enabled, using TUN device IP %s as primary DNS (multi-server support)", dnsInterceptorIP)
+				log.Printf("OpenConnect: DNS interceptor enabled, using TUN device IP %s as fallback DNS (multi-server support)", dnsInterceptorIP)
 			}
 		}
 
@@ -930,21 +936,24 @@ func (h *Handler) Authenticate(c *gin.Context) {
 				copy(gatewayIP, ipNet.IP)
 				gatewayIP[len(gatewayIP)-1] = 1 // VPN网关IP（通常是.1）
 				dnsInterceptorIP = gatewayIP.String()
-				log.Printf("OpenConnect: DNS interceptor enabled, using VPN gateway %s as primary DNS (fallback)", dnsInterceptorIP)
+				log.Printf("OpenConnect: DNS interceptor enabled, using VPN gateway %s as fallback DNS", dnsInterceptorIP)
 			}
 		}
 
 		if dnsInterceptorIP != "" {
-			// 将DNS拦截器地址添加到DNS服务器列表的最前面
-			// 这样客户端会优先使用DNS拦截器，域名管理功能才能工作
-			dnsServers = append([]string{dnsInterceptorIP}, dnsServers...)
-			log.Printf("OpenConnect: DNS interceptor enabled, using %s as primary DNS for domain-based split tunneling", dnsInterceptorIP)
+			// 将DNS拦截器地址添加到DNS服务器列表（用于域名管理功能）
+			// 注意：不通过CSTP下发公网DNS，让客户端使用系统默认DNS（不走VPN）
+			// 这样可以避免OpenConnect客户端为公网DNS IP自动添加路由到VPN
+			dnsServers = append(dnsServers, dnsInterceptorIP)
+			log.Printf("OpenConnect: DNS interceptor enabled, using %s as DNS server for domain-based split tunneling", dnsInterceptorIP)
+			log.Printf("OpenConnect: Public DNS (114.114.114.114) not configured in CSTP - client will use system default DNS (no VPN route)")
 		}
 	}
 
-	// 如果没有配置DNS服务器，使用默认的公共DNS
-	if len(dnsServers) == 0 {
-		dnsServers = []string{"8.8.8.8", "8.8.4.4"} // Google DNS
+	// 添加用户配置的DNS（从策略中获取）
+	if len(userDNSServers) > 0 {
+		dnsServers = append(dnsServers, userDNSServers...)
+		log.Printf("OpenConnect: Added user-configured DNS servers: %v", userDNSServers)
 	}
 	dnsXML := ""
 	for _, dns := range dnsServers {

@@ -45,8 +45,8 @@ services:
       VPN_OPENCONNECT_PORT: ${VPN_OPENCONNECT_PORT:-443}
       VPN_ENABLE_DTLS: ${VPN_ENABLE_DTLS:-true}
       VPN_DTLS_PORT: ${VPN_DTLS_PORT:-443}
-      VPN_CERT: ${VPN_CERT:-/app/certs/cert.pem}
-      VPN_KEY: ${VPN_KEY:-/app/certs/key.pem}
+      VPN_CERT: ${VPN_CERT:-/app/certs/server.crt}
+      VPN_KEY: ${VPN_KEY:-/app/certs/server.key}
       VPN_EBPF_INTERFACE: ${VPN_EBPF_INTERFACE:-eth0}
 
       JWT_SECRET: ${JWT_SECRET:-your-secret-key-change-this-in-production}

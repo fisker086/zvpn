@@ -177,7 +177,7 @@ iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o eth0 -j MASQUERADE
 
 - 检查端口是否开放：`netstat -tlnp | grep 443`
 - 检查防火墙规则
-- 检查证书是否正确：`openssl x509 -in certs/cert.pem -text -noout`
+- 检查证书是否正确：`openssl x509 -in certs/server.crt -text -noout`
 
 ## 许可证
 

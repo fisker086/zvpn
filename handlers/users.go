@@ -119,7 +119,7 @@ func (h *UserHandler) CreateUser(c *gin.Context) {
 			UserID:       operatorIDUint,
 			Type:         models.AuditLogTypeConfig,
 			Action:       models.AuditLogActionAllow, // 使用allow表示创建操作
-			Protocol:     "https", // 配置操作通过Web界面，使用HTTPS
+			Protocol:     "https",                    // 配置操作通过Web界面，使用HTTPS
 			ResourceType: "user",
 			ResourcePath: fmt.Sprintf("user:%s", user.Username),
 			Result:       "success",
@@ -213,38 +213,70 @@ func (h *UserHandler) UpdateUser(c *gin.Context) {
 
 func (h *UserHandler) DeleteUser(c *gin.Context) {
 	id := c.Param("id")
-	
+
 	// 先获取用户信息用于审计日志
 	var user models.User
-	if err := database.DB.First(&user, id).Error; err == nil {
-		// 记录配置变更审计日志
-		auditLogger := policy.GetAuditLogger()
-		if auditLogger != nil {
-			operatorID, _ := c.Get("user_id")
-			operatorIDUint := uint(0)
-			if id, ok := operatorID.(uint); ok {
-				operatorIDUint = id
-			}
-			auditLogger.WriteLogDirectly(models.AuditLog{
-				UserID:       operatorIDUint,
-				Type:         models.AuditLogTypeConfig,
-				Action:       models.AuditLogActionDeny, // 使用deny表示删除操作
-				Protocol:     "https", // 配置操作通过Web界面，使用HTTPS
-				ResourceType: "user",
-				ResourcePath: fmt.Sprintf("user:%s", user.Username),
-				Result:       "success",
-				Reason:       fmt.Sprintf("User deleted: %s (ID: %d)", user.Username, user.ID),
-			})
-		}
-	}
-	
-	// 使用 Unscoped().Delete() 进行硬删除，直接删除记录而不是软删除
-	if err := database.DB.Unscoped().Delete(&models.User{}, id).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	if err := database.DB.First(&user, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "User deleted"})
+	// 记录配置变更审计日志
+	auditLogger := policy.GetAuditLogger()
+	if auditLogger != nil {
+		operatorID, _ := c.Get("user_id")
+		operatorIDUint := uint(0)
+		if id, ok := operatorID.(uint); ok {
+			operatorIDUint = id
+		}
+		auditLogger.WriteLogDirectly(models.AuditLog{
+			UserID:       operatorIDUint,
+			Type:         models.AuditLogTypeConfig,
+			Action:       models.AuditLogActionDeny, // 使用deny表示删除操作
+			Protocol:     "https",                   // 配置操作通过Web界面，使用HTTPS
+			ResourceType: "user",
+			ResourcePath: fmt.Sprintf("user:%s", user.Username),
+			Result:       "success",
+			Reason:       fmt.Sprintf("User deleted: %s (ID: %d)", user.Username, user.ID),
+		})
+	}
+
+	// 开始事务，确保所有删除操作原子性
+	tx := database.DB.Begin()
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+		}
+	}()
+
+	// 1. 删除用户组关联关系（user_group_users 中间表）
+	if err := tx.Model(&user).Association("Groups").Clear(); err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to remove user from groups: %v", err)})
+		return
+	}
+
+	// 2. 删除用户的所有会话（sessions 表）
+	if err := tx.Where("user_id = ?", user.ID).Unscoped().Delete(&models.Session{}).Error; err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to delete user sessions: %v", err)})
+		return
+	}
+
+	// 3. 删除用户本身
+	if err := tx.Unscoped().Delete(&user).Error; err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to delete user: %v", err)})
+		return
+	}
+
+	// 提交事务
+	if err := tx.Commit().Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to commit transaction: %v", err)})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "User deleted successfully"})
 }
 
 func (h *UserHandler) ChangePassword(c *gin.Context) {
@@ -359,11 +391,11 @@ func (h *UserHandler) GenerateOTP(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"secret":   secret,
-		"qr_code":  qrCode,
-		"url":      url,
-		"enabled":  true,
-		"message":  "OTP密钥生成成功，请妥善保管",
+		"secret":  secret,
+		"qr_code": qrCode,
+		"url":     url,
+		"enabled": true,
+		"message": "OTP密钥生成成功，请妥善保管",
 	})
 }
 

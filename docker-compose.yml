@@ -95,8 +95,8 @@ services:
       VPN_DTLS_PORT: ${VPN_DTLS_PORT:-443}
       
       # 证书配置
-      VPN_CERT: ${VPN_CERT:-/app/certs/cert.pem}
-      VPN_KEY: ${VPN_KEY:-/app/certs/key.pem}
+      VPN_CERT: ${VPN_CERT:-/app/certs/server.crt}
+      VPN_KEY: ${VPN_KEY:-/app/certs/server.key}
       
       # eBPF 配置（必需）
       VPN_EBPF_INTERFACE: ${VPN_EBPF_INTERFACE:-eth0}

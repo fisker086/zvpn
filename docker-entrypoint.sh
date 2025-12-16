@@ -21,7 +21,7 @@ fi
 cd /app
 
 # 生成证书（如果不存在）
-if [ ! -f ./certs/cert.pem ] || [ ! -f ./certs/key.pem ]; then
+if [ ! -f ./certs/server.crt ] || [ ! -f ./certs/server.key ]; then
     echo "🔐 生成 TLS 证书..."
     if [ -f ./generate-cert.sh ]; then
         # 使用脚本生成（会自动创建 ./certs 目录）
@@ -30,8 +30,8 @@ if [ ! -f ./certs/cert.pem ] || [ ! -f ./certs/key.pem ]; then
         # 手动生成
         mkdir -p ./certs
         openssl req -x509 -newkey rsa:4096 \
-            -keyout ./certs/key.pem \
-            -out ./certs/cert.pem \
+            -keyout ./certs/server.key \
+            -out ./certs/server.crt \
             -days 365 -nodes \
             -subj "/C=CN/ST=State/L=City/O=ZVPN/CN=zvpn.local"
     fi
@@ -39,13 +39,13 @@ if [ ! -f ./certs/cert.pem ] || [ ! -f ./certs/key.pem ]; then
 fi
 
 # 验证证书是否存在
-if [ -f ./certs/cert.pem ] && [ -f ./certs/key.pem ]; then
+if [ -f ./certs/server.crt ] && [ -f ./certs/server.key ]; then
     echo "✅ 证书文件已就绪:"
-    echo "   证书: ./certs/cert.pem"
-    echo "   私钥: ./certs/key.pem"
+    echo "   证书: ./certs/server.crt"
+    echo "   私钥: ./certs/server.key"
 else
     echo "⚠️  警告: 证书文件不存在，OpenConnect 将无法启动"
-    echo "   期望路径: ./certs/cert.pem, ./certs/key.pem"
+    echo "   期望路径: ./certs/server.crt, ./certs/server.key"
 fi
 
 # 启用 IP 转发

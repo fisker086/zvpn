@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"fmt"
 	"net/http"
 
 	"github.com/fisker/zvpn/config"
@@ -114,13 +115,50 @@ func (h *GroupHandler) UpdateGroup(c *gin.Context) {
 // DeleteGroup 删除用户组
 func (h *GroupHandler) DeleteGroup(c *gin.Context) {
 	id := c.Param("id")
-	// 使用 Unscoped().Delete() 进行硬删除，直接删除记录而不是软删除
-	if err := database.DB.Unscoped().Delete(&models.UserGroup{}, id).Error; err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+	
+	// 先获取用户组信息
+	var group models.UserGroup
+	if err := database.DB.First(&group, id).Error; err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Group not found"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "Group deleted"})
+	// 开始事务，确保所有删除操作原子性
+	tx := database.DB.Begin()
+	defer func() {
+		if r := recover(); r != nil {
+			tx.Rollback()
+		}
+	}()
+
+	// 1. 删除用户组与用户的关联关系（user_group_users 中间表）
+	if err := tx.Model(&group).Association("Users").Clear(); err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to remove users from group: %v", err)})
+		return
+	}
+
+	// 2. 删除用户组与策略的关联关系（user_group_policies 中间表）
+	if err := tx.Model(&group).Association("Policies").Clear(); err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to remove policies from group: %v", err)})
+		return
+	}
+
+	// 3. 删除用户组本身
+	if err := tx.Unscoped().Delete(&group).Error; err != nil {
+		tx.Rollback()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to delete group: %v", err)})
+		return
+	}
+
+	// 提交事务
+	if err := tx.Commit().Error; err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to commit transaction: %v", err)})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "Group deleted successfully"})
 }
 
 // AssignUsers 给用户组分配用户

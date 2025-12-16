@@ -27,8 +27,8 @@ vpn:
   # SSL 证书配置
   # Docker: 使用环境变量 VPN_CERT 和 VPN_KEY 覆盖
   # 本地: 使用相对路径或设置环境变量
-  certfile: "./certs/cert.pem"
-  keyfile: "./certs/key.pem"
+  certfile: "./certs/server.crt"
+  keyfile: "./certs/server.key"
   
   # OpenConnect 协议配置（推荐）
   enableopenconnect: true        # 是否启用 OpenConnect
