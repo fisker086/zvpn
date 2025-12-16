@@ -150,12 +150,148 @@ func (h *AuthHandler) Login(c *gin.Context) {
 	}
 
 	// 尝试 LDAP 认证（如果启用）
+	// 注意：如果用户是数据库原生用户（密码不是LDAP格式），优先使用数据库认证
 	if ldapAuth != nil && ldapConfig.Enabled {
-		ldapUser, err := ldapAuth.Authenticate(req.Username, req.Password)
-		if err == nil {
-			// LDAP 认证成功，同步用户到本地数据库
-			if err := database.DB.Where("username = ?", req.Username).First(&user).Error; err != nil {
-				// 用户不存在，创建新用户
+		// 先检查用户是否存在于数据库中
+		var existingUser models.User
+		userExistsInDB := database.DB.Where("username = ?", req.Username).First(&existingUser).Error == nil
+
+		// 如果用户存在且密码不是LDAP格式（即数据库原生用户），跳过LDAP认证，直接使用数据库认证
+		if userExistsInDB {
+			// 检查密码是否是LDAP格式（LDAP用户的密码是 "ldap-user-no-local-password-" + username）
+			// 直接尝试用LDAP格式密码验证，如果成功说明是LDAP用户
+			isLDAPUser := existingUser.CheckPassword("ldap-user-no-local-password-" + req.Username)
+
+			// 如果不是LDAP用户，跳过LDAP认证，直接使用数据库认证
+			if !isLDAPUser {
+				log.Printf("User %s is a database user (not LDAP), skipping LDAP authentication", req.Username)
+				// 不设置 isLDAPAuth，让后续代码使用数据库认证
+			} else {
+				// 是LDAP用户，尝试LDAP认证
+				ldapUser, err := ldapAuth.Authenticate(req.Username, req.Password)
+				if err == nil {
+					// LDAP 认证成功，同步用户到本地数据库
+					if err := database.DB.Where("username = ?", req.Username).First(&user).Error; err != nil {
+						// 用户不存在，创建新用户
+						user = models.User{
+							Username: req.Username,
+							Email:    ldapUser.Email,
+							IsAdmin:  ldapUser.IsAdmin,
+							IsActive: true,
+						}
+						// LDAP 用户设置随机密码（不使用本地密码认证）
+						if err := user.SetPassword("ldap-user-no-local-password-" + req.Username); err != nil {
+							log.Printf("Failed to set password for LDAP user %s: %v", req.Username, err)
+							c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create user"})
+							return
+						}
+						if err := database.DB.Create(&user).Error; err != nil {
+							log.Printf("Failed to create LDAP user %s: %v", req.Username, err)
+							c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create user"})
+							return
+						}
+
+						// 为新创建的 LDAP 用户分配默认用户组
+						// 管理员用户分配到 admin 组，普通用户分配到 default 组（如果不存在则创建）
+						var defaultGroup models.UserGroup
+						groupName := "default"
+						if ldapUser.IsAdmin {
+							groupName = "admin"
+						}
+
+						// 查找或创建默认用户组
+						if err := database.DB.Where("name = ?", groupName).First(&defaultGroup).Error; err != nil {
+							// 组不存在，尝试创建（仅对 default 组）
+							if groupName == "default" {
+								// 查找默认策略
+								var defaultPolicy models.Policy
+								if err := database.DB.Where("name = ?", "default").First(&defaultPolicy).Error; err == nil {
+									defaultGroup = models.UserGroup{
+										Name:        "default",
+										Description: "默认用户组",
+									}
+									if err := database.DB.Create(&defaultGroup).Error; err != nil {
+										log.Printf("Warning: Failed to create default user group: %v", err)
+									} else {
+										// 关联默认策略
+										if err := database.DB.Model(&defaultGroup).Association("Policies").Append(&defaultPolicy); err != nil {
+											log.Printf("Warning: Failed to assign default policy to default group: %v", err)
+										}
+										log.Printf("✓ Created default user group")
+									}
+								}
+							}
+						}
+
+						// 分配用户组
+						if defaultGroup.ID > 0 {
+							if err := database.DB.Model(&user).Association("Groups").Append(&defaultGroup); err != nil {
+								log.Printf("Warning: Failed to assign group '%s' to LDAP user %s: %v", groupName, req.Username, err)
+							} else {
+								log.Printf("✓ LDAP user %s assigned to group '%s'", req.Username, groupName)
+							}
+						} else {
+							log.Printf("Warning: User group '%s' not found, LDAP user %s has no groups (may affect VPN access)", groupName, req.Username)
+						}
+
+						log.Printf("✓ LDAP user created: %s (email: %s, fullname: %s, admin: %v)",
+							req.Username, ldapUser.Email, ldapUser.FullName, ldapUser.IsAdmin)
+					} else {
+						// 用户已存在，检查是否被禁用
+						if !user.IsActive {
+							// 记录失败的登录尝试
+							auditLogger := policy.GetAuditLogger()
+							clientIP := c.ClientIP()
+							auditLogger.LogAuthWithIP(user.ID, user.Username, models.AuditLogActionLogin, "failed", "Account disabled", clientIP, 0)
+							c.JSON(http.StatusForbidden, gin.H{"error": "User account is disabled"})
+							return
+						}
+
+						// 同步最新信息
+						updated := false
+						if user.Email != ldapUser.Email && ldapUser.Email != "" {
+							user.Email = ldapUser.Email
+							updated = true
+						}
+						if user.IsAdmin != ldapUser.IsAdmin {
+							user.IsAdmin = ldapUser.IsAdmin
+							updated = true
+						}
+						if updated {
+							if err := database.DB.Save(&user).Error; err != nil {
+								log.Printf("Failed to update LDAP user %s: %v", req.Username, err)
+							} else {
+								log.Printf("✓ LDAP user synced: %s (email: %s, fullname: %s, admin: %v)",
+									req.Username, ldapUser.Email, ldapUser.FullName, ldapUser.IsAdmin)
+							}
+						}
+					}
+					isLDAPAuth = true
+					log.Printf("✓ User %s authenticated via LDAP", req.Username)
+				} else {
+					// LDAP 认证失败，记录失败尝试并 fallback 到本地认证
+					auditLogger := policy.GetAuditLogger()
+					auditLogger.LogAuthWithIP(0, req.Username, models.AuditLogActionLogin, "failed", fmt.Sprintf("LDAP authentication failed: %v", err), clientIP, 0)
+
+					// 记录密码爆破尝试
+					if h.bruteforceProtection != nil {
+						blocked, _, blockedUntil := h.bruteforceProtection.RecordFailedAttempt(clientIP)
+						if blocked {
+							c.JSON(http.StatusTooManyRequests, gin.H{
+								"error":         fmt.Sprintf("Too many failed login attempts. IP address blocked until %v", blockedUntil.Format(time.RFC3339)),
+								"blocked_until": blockedUntil,
+							})
+							return
+						}
+					}
+					log.Printf("✗ LDAP authentication failed for %s: %v, trying local auth", req.Username, err)
+				}
+			}
+		} else {
+			// 用户不存在于数据库中，尝试LDAP认证
+			ldapUser, err := ldapAuth.Authenticate(req.Username, req.Password)
+			if err == nil {
+				// LDAP 认证成功，创建新用户
 				user = models.User{
 					Username: req.Username,
 					Email:    ldapUser.Email,
@@ -173,57 +309,37 @@ func (h *AuthHandler) Login(c *gin.Context) {
 					c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create user"})
 					return
 				}
-				log.Printf("✓ LDAP user created: %s (email: %s, fullname: %s, admin: %v)",
-					req.Username, ldapUser.Email, ldapUser.FullName, ldapUser.IsAdmin)
-			} else {
-				// 用户已存在，检查是否被禁用
-				if !user.IsActive {
-					// 记录失败的登录尝试
-					auditLogger := policy.GetAuditLogger()
-					clientIP := c.ClientIP()
-					auditLogger.LogAuthWithIP(user.ID, user.Username, models.AuditLogActionLogin, "failed", "Account disabled", clientIP, 0)
-					c.JSON(http.StatusForbidden, gin.H{"error": "User account is disabled"})
-					return
+
+				// 为新创建的 LDAP 用户分配默认用户组
+				var defaultGroup models.UserGroup
+				groupName := "default"
+				if ldapUser.IsAdmin {
+					groupName = "admin"
+				}
+				if err := database.DB.Where("name = ?", groupName).First(&defaultGroup).Error; err == nil {
+					database.DB.Model(&user).Association("Groups").Append(&defaultGroup)
 				}
 
-				// 同步最新信息
-				updated := false
-				if user.Email != ldapUser.Email && ldapUser.Email != "" {
-					user.Email = ldapUser.Email
-					updated = true
-				}
-				if user.IsAdmin != ldapUser.IsAdmin {
-					user.IsAdmin = ldapUser.IsAdmin
-					updated = true
-				}
-				if updated {
-					if err := database.DB.Save(&user).Error; err != nil {
-						log.Printf("Failed to update LDAP user %s: %v", req.Username, err)
-					} else {
-						log.Printf("✓ LDAP user synced: %s (email: %s, fullname: %s, admin: %v)",
-							req.Username, ldapUser.Email, ldapUser.FullName, ldapUser.IsAdmin)
+				isLDAPAuth = true
+				log.Printf("✓ LDAP user created and authenticated: %s", req.Username)
+			} else {
+				// LDAP 认证失败，记录失败尝试并 fallback 到本地认证
+				auditLogger := policy.GetAuditLogger()
+				auditLogger.LogAuthWithIP(0, req.Username, models.AuditLogActionLogin, "failed", fmt.Sprintf("LDAP authentication failed: %v", err), clientIP, 0)
+
+				// 记录密码爆破尝试
+				if h.bruteforceProtection != nil {
+					blocked, _, blockedUntil := h.bruteforceProtection.RecordFailedAttempt(clientIP)
+					if blocked {
+						c.JSON(http.StatusTooManyRequests, gin.H{
+							"error":         fmt.Sprintf("Too many failed login attempts. IP address blocked until %v", blockedUntil.Format(time.RFC3339)),
+							"blocked_until": blockedUntil,
+						})
+						return
 					}
 				}
+				log.Printf("✗ LDAP authentication failed for %s: %v, trying local auth", req.Username, err)
 			}
-			isLDAPAuth = true
-			log.Printf("✓ User %s authenticated via LDAP", req.Username)
-		} else {
-			// LDAP 认证失败，记录失败尝试并 fallback 到本地认证
-			auditLogger := policy.GetAuditLogger()
-			auditLogger.LogAuthWithIP(0, req.Username, models.AuditLogActionLogin, "failed", fmt.Sprintf("LDAP authentication failed: %v", err), clientIP, 0)
-
-			// 记录密码爆破尝试
-			if h.bruteforceProtection != nil {
-				blocked, _, blockedUntil := h.bruteforceProtection.RecordFailedAttempt(clientIP)
-				if blocked {
-					c.JSON(http.StatusTooManyRequests, gin.H{
-						"error":         fmt.Sprintf("Too many failed login attempts. IP address blocked until %v", blockedUntil.Format(time.RFC3339)),
-						"blocked_until": blockedUntil,
-					})
-					return
-				}
-			}
-			log.Printf("✗ LDAP authentication failed for %s: %v, trying local auth", req.Username, err)
 		}
 	}
 

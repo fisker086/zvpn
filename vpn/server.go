@@ -219,7 +219,16 @@ func NewVPNServer(cfg *config.Config) (*VPNServer, error) {
 				log.Printf("✅ NAT 配置成功: 使用 nftables/iptables MASQUERADE (fallback)")
 			}
 		} else {
-			log.Printf("✅ NAT 配置成功: 使用 eBPF TC egress NAT (高性能，内核级 NAT)")
+			log.Printf("✅ eBPF TC NAT 加载成功: 使用 eBPF TC egress NAT (高性能，内核级 NAT)")
+			// 即使 eBPF TC NAT 加载成功，也设置 iptables 规则作为备用
+			// 因为 eBPF TC NAT 可能在某些情况下不工作（权限、内核版本等）
+			log.Printf("配置 NAT: 同时设置 nftables/iptables MASQUERADE 作为备用...")
+			if err := setupIPTablesNAT(cfg.VPN.Network, cfg.VPN.EBPFInterfaceName); err != nil {
+				log.Printf("⚠️  备用 NAT 配置失败: iptables/nftables MASQUERADE 设置失败: %v", err)
+				log.Printf("   将仅依赖 eBPF TC NAT，如果 eBPF NAT 不工作，NAT 可能失败")
+			} else {
+				log.Printf("✅ 备用 NAT 配置成功: nftables/iptables MASQUERADE 已设置")
+			}
 		}
 
 		egressIPForServer = publicIP

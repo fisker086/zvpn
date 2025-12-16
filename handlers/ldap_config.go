@@ -3,8 +3,11 @@ package handlers
 import (
 	"crypto/tls"
 	"fmt"
+	"log"
 	"net/http"
+	"strings"
 
+	"github.com/fisker/zvpn/auth"
 	"github.com/fisker/zvpn/database"
 	"github.com/fisker/zvpn/models"
 	"github.com/go-ldap/ldap/v3"
@@ -251,5 +254,462 @@ func (h *LDAPConfigHandler) TestLDAPConnection(c *gin.Context) {
 		"success": true,
 		"message": "LDAP连接测试成功",
 	})
+}
+
+// TestLDAPAuth 测试LDAP用户认证（需要用户名和密码）
+func (h *LDAPConfigHandler) TestLDAPAuth(c *gin.Context) {
+	var req struct {
+		Username string `json:"username" binding:"required"`
+		Password string `json:"password" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   fmt.Sprintf("参数错误: %v", err),
+		})
+		return
+	}
+
+	config, err := getLDAPConfig()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	if !config.Enabled {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   "LDAP未启用",
+		})
+		return
+	}
+
+	// 验证必填字段
+	if config.Host == "" || config.BindDN == "" || config.BaseDN == "" || config.UserFilter == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   "LDAP配置不完整：请填写Host、BindDN、BaseDN和UserFilter",
+		})
+		return
+	}
+
+	// 连接LDAP服务器
+	address := fmt.Sprintf("%s:%d", config.Host, config.Port)
+	var conn *ldap.Conn
+	var connErr error
+
+	if config.UseSSL {
+		tlsConfig := &tls.Config{
+			InsecureSkipVerify: config.SkipTLSVerify,
+		}
+		conn, connErr = ldap.DialTLS("tcp", address, tlsConfig)
+	} else {
+		conn, connErr = ldap.Dial("tcp", address)
+	}
+
+	if connErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   fmt.Sprintf("无法连接到LDAP服务器 %s: %v", address, connErr),
+		})
+		return
+	}
+	defer conn.Close()
+
+	// 使用管理员账号绑定
+	if err := conn.Bind(config.BindDN, config.BindPassword); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   fmt.Sprintf("LDAP管理员绑定失败: %v", err),
+		})
+		return
+	}
+
+	// 构建搜索过滤器（支持 %s 和 {0} 格式）
+	escapedUsername := ldap.EscapeFilter(req.Username)
+	filter := config.UserFilter
+	if strings.Contains(filter, "{0}") {
+		filter = strings.ReplaceAll(filter, "{0}", escapedUsername)
+	} else if strings.Contains(filter, "%s") {
+		filter = fmt.Sprintf(filter, escapedUsername)
+		} else {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"success": false,
+				"error":   fmt.Sprintf("UserFilter格式错误：必须包含 %%s 或 {0} 占位符，当前值: %s", config.UserFilter),
+			})
+			return
+		}
+
+	// 搜索用户
+	searchRequest := ldap.NewSearchRequest(
+		config.BaseDN,
+		ldap.ScopeWholeSubtree,
+		ldap.NeverDerefAliases,
+		0,
+		0,
+		false,
+		filter,
+		[]string{"dn", "cn", "mail", "displayName", "memberOf"},
+		nil,
+	)
+
+	result, err := conn.Search(searchRequest)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   fmt.Sprintf("搜索用户失败（请检查UserFilter和BaseDN）: %v", err),
+		})
+		return
+	}
+
+	if len(result.Entries) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   fmt.Sprintf("用户 '%s' 未找到（请检查UserFilter和BaseDN）", req.Username),
+		})
+		return
+	}
+
+	if len(result.Entries) > 1 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   fmt.Sprintf("找到多个匹配的用户 '%s'（UserFilter可能不够精确）", req.Username),
+		})
+		return
+	}
+
+	userDN := result.Entries[0].DN
+	userInfo := result.Entries[0]
+
+	// 使用用户凭据验证
+	if err := conn.Bind(userDN, req.Password); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   fmt.Sprintf("用户认证失败（密码错误）: %v", err),
+		})
+		return
+	}
+
+	// 检查用户是否是管理员（如果配置了管理员组）
+	isAdmin := false
+	adminInfo := ""
+	if config.AdminGroup != "" {
+		memberOfList := userInfo.GetAttributeValues("memberOf")
+		for _, memberOf := range memberOfList {
+			if memberOf == config.AdminGroup {
+				isAdmin = true
+				break
+			}
+		}
+		if isAdmin {
+			adminInfo = fmt.Sprintf("，用户属于管理员组: %s", config.AdminGroup)
+		} else {
+			adminInfo = fmt.Sprintf("，用户不属于管理员组: %s", config.AdminGroup)
+		}
+	}
+
+	// 获取用户信息
+	email := userInfo.GetAttributeValue("mail")
+	fullName := userInfo.GetAttributeValue("displayName")
+	if fullName == "" {
+		fullName = userInfo.GetAttributeValue("cn")
+	}
+
+		c.JSON(http.StatusOK, gin.H{
+			"success": true,
+			"message": fmt.Sprintf("用户认证成功%s", adminInfo),
+			"user": gin.H{
+				"dn":        userDN,
+				"username":  req.Username,
+				"email":     email,
+				"full_name": fullName,
+				"is_admin":  isAdmin,
+			},
+		})
+	}
+
+// SyncLDAPUsers 同步 LDAP 用户到本地数据库
+func (h *LDAPConfigHandler) SyncLDAPUsers(c *gin.Context) {
+	config, err := getLDAPConfig()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"error":   err.Error(),
+		})
+		return
+	}
+
+	if !config.Enabled {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   "LDAP未启用",
+		})
+		return
+	}
+
+	// 验证必填字段
+	if config.Host == "" || config.BindDN == "" || config.BaseDN == "" || config.UserFilter == "" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   "LDAP配置不完整：请填写Host、BindDN、BaseDN和UserFilter",
+		})
+		return
+	}
+
+	// 创建 LDAP 认证器
+	authConfig := &auth.LDAPConfig{
+		Enabled:       config.Enabled,
+		Host:          config.Host,
+		Port:          config.Port,
+		UseSSL:        config.UseSSL,
+		BindDN:        config.BindDN,
+		BindPassword:  config.BindPassword,
+		BaseDN:        config.BaseDN,
+		UserFilter:    config.UserFilter,
+		AdminGroup:    config.AdminGroup,
+		SkipTLSVerify: config.SkipTLSVerify,
+	}
+	ldapAuth := auth.NewLDAPAuthenticator(authConfig)
+
+	// 搜索所有 LDAP 用户
+	ldapUsers, err := ldapAuth.SearchAllUsers()
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   fmt.Sprintf("搜索LDAP用户失败: %v", err),
+		})
+		return
+	}
+
+	if len(ldapUsers) == 0 {
+		c.JSON(http.StatusOK, gin.H{
+			"success": true,
+			"message": "未找到LDAP用户",
+			"synced":  0,
+			"created": 0,
+			"updated": 0,
+		})
+		return
+	}
+
+	// 确保默认用户组存在
+	var defaultGroup models.UserGroup
+	var adminGroup models.UserGroup
+	
+	// 查找或创建 default 组
+	if err := database.DB.Where("name = ?", "default").First(&defaultGroup).Error; err != nil {
+		var defaultPolicy models.Policy
+		if err := database.DB.Where("name = ?", "default").First(&defaultPolicy).Error; err == nil {
+			defaultGroup = models.UserGroup{
+				Name:        "default",
+				Description: "默认用户组",
+			}
+			if err := database.DB.Create(&defaultGroup).Error; err == nil {
+				database.DB.Model(&defaultGroup).Association("Policies").Append(&defaultPolicy)
+			}
+		}
+	}
+	
+	// 查找 admin 组（如果不存在则跳过，不影响普通用户分配）
+	if err := database.DB.Where("name = ?", "admin").First(&adminGroup).Error; err != nil {
+		log.Printf("Warning: Admin group not found, admin users will be assigned to default group")
+		adminGroup.ID = 0 // 确保ID为0，表示不存在
+	}
+
+	// 批量查询已存在的用户（建立用户名映射）
+	var existingUsers []models.User
+	usernames := make([]string, 0, len(ldapUsers))
+	for _, ldapUser := range ldapUsers {
+		usernames = append(usernames, ldapUser.Username)
+	}
+	if len(usernames) > 0 {
+		database.DB.Where("username IN ?", usernames).Find(&existingUsers)
+	}
+	
+	// 建立用户名到用户的映射
+	existingUserMap := make(map[string]*models.User)
+	for i := range existingUsers {
+		existingUserMap[existingUsers[i].Username] = &existingUsers[i]
+	}
+
+	// 分离需要创建和更新的用户
+	var usersToCreate []models.User
+	var usersToUpdate []models.User
+	userGroupMap := make(map[string]*models.UserGroup) // 记录每个用户应该分配的用户组
+	
+	for _, ldapUser := range ldapUsers {
+		if existingUser, exists := existingUserMap[ldapUser.Username]; exists {
+			// 用户已存在，检查是否需要更新
+			needsUpdate := false
+			if existingUser.Email != ldapUser.Email && ldapUser.Email != "" {
+				existingUser.Email = ldapUser.Email
+				needsUpdate = true
+			}
+			if existingUser.IsAdmin != ldapUser.IsAdmin {
+				existingUser.IsAdmin = ldapUser.IsAdmin
+				needsUpdate = true
+			}
+			if needsUpdate {
+				usersToUpdate = append(usersToUpdate, *existingUser)
+			}
+			
+			// 确定用户组
+			groupToAssign := &defaultGroup
+			if ldapUser.IsAdmin && adminGroup.ID > 0 {
+				groupToAssign = &adminGroup
+			}
+			userGroupMap[ldapUser.Username] = groupToAssign
+		} else {
+			// 用户不存在，准备创建
+			user := models.User{
+				Username: ldapUser.Username,
+				Email:    ldapUser.Email,
+				IsAdmin:  ldapUser.IsAdmin,
+				IsActive: true,
+			}
+			// LDAP 用户设置随机密码（不使用本地密码认证）
+			if err := user.SetPassword("ldap-user-no-local-password-" + ldapUser.Username); err != nil {
+				log.Printf("Warning: Failed to set password for user %s: %v", ldapUser.Username, err)
+				continue
+			}
+			usersToCreate = append(usersToCreate, user)
+			
+			// 确定用户组
+			groupToAssign := &defaultGroup
+			if ldapUser.IsAdmin && adminGroup.ID > 0 {
+				groupToAssign = &adminGroup
+			}
+			userGroupMap[ldapUser.Username] = groupToAssign
+		}
+	}
+
+	// 批量创建新用户
+	createdCount := 0
+	errorCount := 0
+	var errors []string
+	var createdUsernames []string // 记录成功创建的用户名，用于后续组分配
+	
+	if len(usersToCreate) > 0 {
+		// 使用 CreateInBatches 批量插入（每批100条）
+		// GORM的CreateInBatches会自动填充ID字段
+		if err := database.DB.CreateInBatches(usersToCreate, 100).Error; err != nil {
+			log.Printf("Error batch creating users: %v", err)
+			errorCount += len(usersToCreate)
+			errors = append(errors, fmt.Sprintf("批量创建用户失败: %v", err))
+		} else {
+			createdCount = len(usersToCreate)
+			// 记录成功创建的用户名
+			for _, user := range usersToCreate {
+				createdUsernames = append(createdUsernames, user.Username)
+			}
+		}
+	}
+
+	// 批量更新已存在的用户
+	updatedCount := 0
+	if len(usersToUpdate) > 0 {
+		// 使用 Save 批量更新（GORM会自动批量处理）
+		for _, user := range usersToUpdate {
+			if err := database.DB.Save(&user).Error; err != nil {
+				errorCount++
+				errors = append(errors, fmt.Sprintf("用户 %s: 更新失败: %v", user.Username, err))
+				log.Printf("Warning: Failed to update user %s: %v", user.Username, err)
+			} else {
+				updatedCount++
+			}
+		}
+	}
+
+	// 批量分配用户组关系
+	// 确保至少有一个有效的用户组
+	if defaultGroup.ID == 0 {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"success": false,
+			"error":   "默认用户组不存在，无法分配用户组",
+		})
+		return
+	}
+	
+	// 重新查询所有需要分配组的用户（包括新创建和已存在的）
+	// 这样可以确保获取到新创建用户的ID
+	var allUsers []models.User
+	if len(usernames) > 0 {
+		database.DB.Where("username IN ?", usernames).Find(&allUsers)
+	}
+	
+	// 建立用户ID到用户组的映射
+	userGroupAssignments := make(map[uint]*models.UserGroup)
+	for _, user := range allUsers {
+		if group, ok := userGroupMap[user.Username]; ok && group != nil && group.ID > 0 {
+			userGroupAssignments[user.ID] = group
+		} else {
+			// 如果没有找到对应的组，使用默认组
+			userGroupAssignments[user.ID] = &defaultGroup
+		}
+	}
+
+	// 批量分配用户组（使用事务提高性能）
+	if len(userGroupAssignments) > 0 {
+		tx := database.DB.Begin()
+		hasError := false
+		defer func() {
+			if r := recover(); r != nil {
+				tx.Rollback()
+				log.Printf("Panic in user group assignment: %v", r)
+			} else if hasError {
+				tx.Rollback()
+			}
+		}()
+		
+		// 检查每个用户是否已经有组，如果没有则添加
+		for userID, group := range userGroupAssignments {
+			var user models.User
+			if err := tx.First(&user, userID).Error; err != nil {
+				log.Printf("Warning: User with ID %d not found for group assignment", userID)
+				continue
+			}
+			
+			// 检查用户是否已经有组
+			// Count() 方法返回 int64，不是 error
+			groupCount := tx.Model(&user).Association("Groups").Count()
+			if groupCount == 0 {
+				// 用户没有组，添加默认组
+				if err := tx.Model(&user).Association("Groups").Append(group); err != nil {
+					log.Printf("Warning: Failed to assign group '%s' to user %s: %v", group.Name, user.Username, err)
+					hasError = true
+					// 继续处理其他用户，不中断
+				}
+			}
+		}
+		
+		if !hasError {
+			if err := tx.Commit().Error; err != nil {
+				log.Printf("Error committing user group assignments: %v", err)
+				hasError = true
+				tx.Rollback()
+			}
+		} else {
+			tx.Rollback()
+		}
+	}
+
+	response := gin.H{
+		"success": true,
+		"message": fmt.Sprintf("同步完成：共 %d 个用户，创建 %d 个，更新 %d 个", len(ldapUsers), createdCount, updatedCount),
+		"total":   len(ldapUsers),
+		"created": createdCount,
+		"updated": updatedCount,
+		"errors":  errorCount,
+	}
+	
+	if len(errors) > 0 {
+		response["error_details"] = errors
+	}
+
+	c.JSON(http.StatusOK, response)
 }
 

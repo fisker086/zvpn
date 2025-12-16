@@ -25,6 +25,35 @@ export interface LDAPTestResponse {
   error?: string
 }
 
+export interface LDAPAuthTestRequest {
+  username: string
+  password: string
+}
+
+export interface LDAPAuthTestResponse {
+  success: boolean
+  message?: string
+  error?: string
+  user?: {
+    dn: string
+    username: string
+    email: string
+    full_name: string
+    is_admin: boolean
+  }
+}
+
+export interface LDAPSyncResponse {
+  success: boolean
+  message?: string
+  error?: string
+  total?: number
+  created?: number
+  updated?: number
+  errors?: number
+  error_details?: string[]
+}
+
 export interface UpdateLDAPConfigRequest {
   enabled: boolean
   host: string
@@ -54,5 +83,13 @@ export const ldapApi = {
   // 测试LDAP连接（需要管理员权限）
   testConnection: (): Promise<LDAPTestResponse> => 
     request.post<LDAPTestResponse>('/ldap/test'),
+
+  // 测试LDAP用户认证（需要管理员权限）
+  testAuth: (data: LDAPAuthTestRequest): Promise<LDAPAuthTestResponse> => 
+    request.post<LDAPAuthTestResponse>('/ldap/test-auth', data),
+
+  // 同步LDAP用户到本地数据库（需要管理员权限）
+  syncUsers: (): Promise<LDAPSyncResponse> => 
+    request.post<LDAPSyncResponse>('/ldap/sync-users'),
 }
 

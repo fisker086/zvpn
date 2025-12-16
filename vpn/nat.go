@@ -109,28 +109,73 @@ func (s *VPNServer) PerformUserSpaceNAT(packet []byte) bool {
 	return true // NAT performed
 }
 
+// checkNATRuleExists checks if NAT rule already exists (set by docker-entrypoint.sh)
+func checkNATRuleExists(vpnNetwork, egressInterface string) bool {
+	// Check iptables rule
+	if ipt, err := iptables.New(); err == nil {
+		natRule := []string{"-s", vpnNetwork, "-o", egressInterface, "-j", "MASQUERADE"}
+		if exists, err := ipt.Exists("nat", "POSTROUTING", natRule...); err == nil && exists {
+			return true
+		}
+	}
+
+	// Check nftables rule (if nft command exists)
+	if _, err := exec.LookPath("nft"); err == nil {
+		cmd := exec.Command("nft", "list", "ruleset")
+		if output, err := cmd.CombinedOutput(); err == nil {
+			outputStr := string(output)
+			// Check if rule exists: contains VPN network, egress interface, and masquerade
+			if strings.Contains(outputStr, vpnNetwork) && strings.Contains(outputStr, egressInterface) && strings.Contains(outputStr, "masquerade") {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
 // setupIPTablesNAT configures NAT masquerading using nftables (preferred) or iptables (fallback)
 // This allows VPN clients to access external networks by masquerading their IP addresses
+// Note: This is a fallback mechanism. The docker-entrypoint.sh script should have already
+// set up the rules. If NAT rule exists, we skip adding it but still perform other checks
+// (kernel modules, FORWARD rules, verification, etc.)
 func setupIPTablesNAT(vpnNetwork, egressInterface string) error {
+	// Check if NAT rule already exists (set by docker-entrypoint.sh)
+	natRuleExists := checkNATRuleExists(vpnNetwork, egressInterface)
+
+	if natRuleExists {
+		log.Printf("NAT: ✅ NAT masquerade 规则已存在（docker-entrypoint.sh 已设置）")
+		log.Printf("NAT: 继续执行其他必要检查（内核模块、FORWARD 规则、验证等）...")
+	} else {
+		log.Printf("NAT: 未检测到 NAT 规则，开始完整配置（docker-entrypoint.sh 可能未执行或失败）...")
+	}
+
 	// Try nftables first (modern Linux systems)
-	err := setupNftablesNAT(vpnNetwork, egressInterface)
+	err := setupNftablesNAT(vpnNetwork, egressInterface, natRuleExists)
 	if err == nil {
-		log.Printf("NAT: Successfully configured using nftables")
+		if !natRuleExists {
+			log.Printf("NAT: ✅ NAT 规则已配置（使用 nftables，作为兜底）")
+		} else {
+			log.Printf("NAT: ✅ nftables NAT 规则验证完成（规则已存在）")
+		}
 		return nil
 	}
-	log.Printf("NAT: nftables configuration failed: %v, falling back to iptables", err)
+	log.Printf("NAT: nftables 配置失败: %v, 回退到 iptables", err)
 
 	// Fallback to iptables (works with iptables-nft backend)
-	err = setupIPTablesNATLegacy(vpnNetwork, egressInterface)
+	err = setupIPTablesNATLegacy(vpnNetwork, egressInterface, natRuleExists)
 	if err != nil {
 		return fmt.Errorf("both nftables and iptables failed: nftables=%v, iptables=%w", err, err)
 	}
-	log.Printf("NAT: Successfully configured using iptables")
+	if !natRuleExists {
+		log.Printf("NAT: ✅ NAT 规则已配置（使用 iptables，作为兜底）")
+	}
 	return nil
 }
 
 // setupNftablesNAT configures NAT using nftables
-func setupNftablesNAT(vpnNetwork, egressInterface string) error {
+// natRuleExists indicates if NAT rule already exists (set by docker-entrypoint.sh)
+func setupNftablesNAT(vpnNetwork, egressInterface string, natRuleExists bool) error {
 	// Check if nftables is available
 	if _, err := exec.LookPath("nft"); err != nil {
 		return fmt.Errorf("nftables not available: %w", err)
@@ -175,21 +220,35 @@ func setupNftablesNAT(vpnNetwork, egressInterface string) error {
 		// Chain exists, continue
 	}
 
-	// Add masquerade rule for VPN network
+	// Add masquerade rule for VPN network (only if it doesn't exist)
 	// Rule: masquerade packets from VPN network going out through egress interface
-	rule := fmt.Sprintf("ip saddr %s oifname %s masquerade", vpnNetwork, egressInterface)
+	if !natRuleExists {
+		rule := fmt.Sprintf("ip saddr %s oifname %s masquerade", vpnNetwork, egressInterface)
 
-	cmd := exec.Command("nft", "add", "rule", tableName, chainName, rule)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		outputStr := string(output)
-		// Check if rule already exists
-		if !strings.Contains(outputStr, "File exists") && !strings.Contains(outputStr, "exists") {
-			return fmt.Errorf("failed to add nftables rule: %w, output: %s", err, outputStr)
+		cmd := exec.Command("nft", "add", "rule", tableName, chainName, rule)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			outputStr := string(output)
+			// Check if rule already exists
+			if !strings.Contains(outputStr, "File exists") && !strings.Contains(outputStr, "exists") {
+				return fmt.Errorf("failed to add nftables rule: %w, output: %s", err, outputStr)
+			}
+			// Rule already exists, which is fine
+			log.Printf("NAT: nftables rule already exists")
+		} else {
+			log.Printf("NAT: Successfully added nftables masquerade rule: %s", rule)
 		}
-		// Rule already exists, which is fine
-		log.Printf("NAT: nftables rule already exists")
 	} else {
-		log.Printf("NAT: Successfully added nftables masquerade rule: %s", rule)
+		log.Printf("NAT: 跳过添加 nftables NAT 规则（docker-entrypoint.sh 已设置）")
+		// Verify rule exists
+		cmd := exec.Command("nft", "list", "ruleset")
+		if output, err := cmd.CombinedOutput(); err == nil {
+			outputStr := string(output)
+			if strings.Contains(outputStr, vpnNetwork) && strings.Contains(outputStr, egressInterface) && strings.Contains(outputStr, "masquerade") {
+				log.Printf("NAT: ✅ nftables NAT 规则验证成功")
+			} else {
+				log.Printf("NAT: ⚠️  警告: nftables NAT 规则验证失败，但继续执行")
+			}
+		}
 	}
 
 	return nil
@@ -212,10 +271,12 @@ func loadKernelModule(moduleName string) error {
 
 // setupIPTablesNATLegacy configures NAT using iptables (fallback)
 // Reference: https://github.com/bjdgyc/anylink/blob/1963feffe3a9715a4a66c7f414decc57d9990463/server/handler/link_tun.go
-func setupIPTablesNATLegacy(vpnNetwork, egressInterface string) error {
-	// Load necessary kernel modules (like anylink does for Rocky Linux)
+// natRuleExists indicates if NAT rule already exists (set by docker-entrypoint.sh)
+func setupIPTablesNATLegacy(vpnNetwork, egressInterface string, natRuleExists bool) error {
+	// Always load necessary kernel modules (like anylink does for Rocky Linux)
 	// This is important for NAT to work correctly, especially in containers
-	log.Printf("NAT: Loading kernel modules for iptables NAT support...")
+	// Even if rule exists, modules might not be loaded
+	log.Printf("NAT: 加载内核模块（iptables NAT 支持）...")
 	loadKernelModule("iptable_filter")
 	loadKernelModule("iptable_nat")
 
@@ -225,33 +286,37 @@ func setupIPTablesNATLegacy(vpnNetwork, egressInterface string) error {
 		return fmt.Errorf("failed to create iptables client: %w", err)
 	}
 
-	// Add NAT masquerade rule
-	// First check if rule already exists
+	// Add NAT masquerade rule (only if it doesn't exist)
 	natRule := []string{"-s", vpnNetwork, "-o", egressInterface, "-j", "MASQUERADE"}
-	exists, err := ipt.Exists("nat", "POSTROUTING", natRule...)
-	if err != nil {
-		log.Printf("NAT: Warning: Failed to check if NAT rule exists: %v", err)
-		// Continue anyway, try to add the rule
-		exists = false
-	}
-
-	if !exists {
-		// Try to insert at position 1 (highest priority), if that fails, append
-		err = ipt.Insert("nat", "POSTROUTING", 1, natRule...)
+	if !natRuleExists {
+		// First check if rule already exists (double-check)
+		exists, err := ipt.Exists("nat", "POSTROUTING", natRule...)
 		if err != nil {
-			// If insert fails (e.g., position conflict), try append
-			log.Printf("NAT: Insert at position 1 failed: %v, trying append...", err)
-			err = ipt.Append("nat", "POSTROUTING", natRule...)
+			log.Printf("NAT: Warning: Failed to check if NAT rule exists: %v", err)
+			// Continue anyway, try to add the rule
+			exists = false
+		}
+
+		if !exists {
+			// Try to insert at position 1 (highest priority), if that fails, append
+			err = ipt.Insert("nat", "POSTROUTING", 1, natRule...)
 			if err != nil {
-				log.Printf("NAT: Failed to add NAT rule: %v", err)
-				return fmt.Errorf("failed to add NAT rule: %w", err)
+				// If insert fails (e.g., position conflict), try append
+				log.Printf("NAT: Insert at position 1 failed: %v, trying append...", err)
+				err = ipt.Append("nat", "POSTROUTING", natRule...)
+				if err != nil {
+					log.Printf("NAT: Failed to add NAT rule: %v", err)
+					return fmt.Errorf("failed to add NAT rule: %w", err)
+				}
+				log.Printf("NAT: ✅ 已添加 NAT masquerade 规则（追加）: -s %s -o %s -j MASQUERADE", vpnNetwork, egressInterface)
+			} else {
+				log.Printf("NAT: ✅ 已添加 NAT masquerade 规则（位置 1）: -s %s -o %s -j MASQUERADE", vpnNetwork, egressInterface)
 			}
-			log.Printf("NAT: Successfully appended NAT masquerade rule: -s %s -o %s -j MASQUERADE", vpnNetwork, egressInterface)
 		} else {
-			log.Printf("NAT: Successfully inserted NAT masquerade rule at position 1: -s %s -o %s -j MASQUERADE", vpnNetwork, egressInterface)
+			log.Printf("NAT: ✅ NAT masquerade 规则已存在: -s %s -o %s -j MASQUERADE", vpnNetwork, egressInterface)
 		}
 	} else {
-		log.Printf("NAT: NAT masquerade rule already exists: -s %s -o %s -j MASQUERADE", vpnNetwork, egressInterface)
+		log.Printf("NAT: 跳过添加 NAT masquerade 规则（docker-entrypoint.sh 已设置）")
 	}
 
 	// Add FORWARD chain rule to allow forwarding (like anylink)
@@ -294,14 +359,25 @@ func setupIPTablesNATLegacy(vpnNetwork, egressInterface string) error {
 		for _, rule := range natRules {
 			if strings.Contains(rule, vpnNetwork) && strings.Contains(rule, egressInterface) && strings.Contains(rule, "MASQUERADE") {
 				ruleFound = true
+				log.Printf("NAT: ✅ Verified: NAT rule found in POSTROUTING chain")
 				break
 			}
 		}
 		if !ruleFound {
-			log.Printf("NAT: Warning: NAT rule not found in POSTROUTING chain list")
+			log.Printf("NAT: ⚠️  警告: NAT 规则在 POSTROUTING 链中未找到（可能 docker-entrypoint.sh 已设置但格式不同）")
+			log.Printf("NAT: 检查命令: iptables -t nat -L POSTROUTING -n -v")
+			// Try to add again as a last resort (兜底机制)
+			log.Printf("NAT: 尝试再次添加规则（兜底机制）...")
+			if err := ipt.Append("nat", "POSTROUTING", natRule...); err != nil {
+				log.Printf("NAT: ⚠️  兜底添加失败: %v（如果 docker-entrypoint.sh 已设置规则，可忽略此错误）", err)
+				// 不返回错误，因为规则可能已经通过其他方式存在
+			} else {
+				log.Printf("NAT: ✅ 规则已通过兜底机制添加成功")
+			}
 		}
 	} else {
 		log.Printf("NAT: Warning: Failed to list NAT POSTROUTING rules: %v", err)
+		log.Printf("NAT: Cannot verify rule, but assuming it was added successfully")
 	}
 
 	forwardRules, err := ipt.List("filter", "FORWARD")

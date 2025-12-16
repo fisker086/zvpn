@@ -2,10 +2,12 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -122,9 +124,29 @@ func (s *Server) startHTTPSServer() {
 	// 我们会在OpenConnect的Handler中正确处理CONNECT请求
 	customHandler := router
 
+	// 配置 TLS 以支持现代加密套件并减少日志噪音
+	tlsConfig := &tls.Config{
+		MinVersion: tls.VersionTLS12, // 只支持 TLS 1.2+
+		MaxVersion: tls.VersionTLS13, // 支持 TLS 1.3
+		// 使用 Go 默认的现代加密套件（安全且兼容性好）
+		CipherSuites: []uint16{
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+		},
+		PreferServerCipherSuites: true,
+		NextProtos:               []string{"h2", "http/1.1"}, // 支持 HTTP/2 和 HTTP/1.1
+	}
+
 	s.httpsServer = &http.Server{
-		Addr:    s.cfg.Server.Host + ":" + s.cfg.VPN.OpenConnectPort,
-		Handler: customHandler,
+		Addr:      s.cfg.Server.Host + ":" + s.cfg.VPN.OpenConnectPort,
+		Handler:   customHandler,
+		TLSConfig: tlsConfig,
+		// 自定义错误日志处理器，过滤掉扫描/攻击相关的错误
+		ErrorLog: log.New(&tlsErrorFilter{}, "", 0),
 	}
 
 	go func() {
@@ -171,6 +193,33 @@ func (s *Server) waitForShutdown() {
 
 	log.Println("Server exited")
 	close(s.shutdownComplete)
+}
+
+// tlsErrorFilter 过滤 TLS 扫描/攻击相关的错误日志
+type tlsErrorFilter struct{}
+
+func (f *tlsErrorFilter) Write(p []byte) (n int, err error) {
+	msg := string(p)
+	// 过滤掉常见的扫描/攻击错误，避免日志噪音
+	ignorePatterns := []string{
+		"TLS handshake error",
+		"tls: client offered only unsupported versions",
+		"tls: no cipher suite supported",
+		"tls: client requested unsupported application protocols",
+		"tls: unexpected message",
+		"remote error: tls:",
+		": EOF",
+	}
+
+	for _, pattern := range ignorePatterns {
+		if strings.Contains(msg, pattern) {
+			// 静默忽略这些错误（它们是端口扫描/攻击尝试）
+			return len(p), nil
+		}
+	}
+
+	// 其他错误正常记录到标准错误输出
+	return os.Stderr.Write(p)
 }
 
 // corsMiddleware CORS 中间件

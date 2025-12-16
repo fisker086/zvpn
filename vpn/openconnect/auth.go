@@ -293,6 +293,50 @@ func (h *Handler) Authenticate(c *gin.Context) {
 					h.sendAuthError(c, "Failed to create user")
 					return
 				}
+				
+				// 为新创建的 LDAP 用户分配默认用户组
+				// 管理员用户分配到 admin 组，普通用户分配到 default 组（如果不存在则创建）
+				var defaultGroup models.UserGroup
+				groupName := "default"
+				if ldapUser.IsAdmin {
+					groupName = "admin"
+				}
+				
+				// 查找或创建默认用户组
+				if err := database.DB.Where("name = ?", groupName).First(&defaultGroup).Error; err != nil {
+					// 组不存在，尝试创建（仅对 default 组）
+					if groupName == "default" {
+						// 查找默认策略
+						var defaultPolicy models.Policy
+						if err := database.DB.Where("name = ?", "default").First(&defaultPolicy).Error; err == nil {
+							defaultGroup = models.UserGroup{
+								Name:        "default",
+								Description: "默认用户组",
+							}
+							if err := database.DB.Create(&defaultGroup).Error; err != nil {
+								log.Printf("OpenConnect: Warning: Failed to create default user group: %v", err)
+							} else {
+								// 关联默认策略
+								if err := database.DB.Model(&defaultGroup).Association("Policies").Append(&defaultPolicy); err != nil {
+									log.Printf("OpenConnect: Warning: Failed to assign default policy to default group: %v", err)
+								}
+								log.Printf("OpenConnect: ✓ Created default user group")
+							}
+						}
+					}
+				}
+				
+				// 分配用户组
+				if defaultGroup.ID > 0 {
+					if err := database.DB.Model(&user).Association("Groups").Append(&defaultGroup); err != nil {
+						log.Printf("OpenConnect: Warning: Failed to assign group '%s' to LDAP user %s: %v", groupName, username, err)
+					} else {
+						log.Printf("OpenConnect: ✓ LDAP user %s assigned to group '%s'", username, groupName)
+					}
+				} else {
+					log.Printf("OpenConnect: Warning: User group '%s' not found, LDAP user %s has no groups (may affect VPN access)", groupName, username)
+				}
+				
 				log.Printf("OpenConnect: ✓ LDAP user created: %s (email: %s, fullname: %s, admin: %v)",
 					username, ldapUser.Email, ldapUser.FullName, ldapUser.IsAdmin)
 

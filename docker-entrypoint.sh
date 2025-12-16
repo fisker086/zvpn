@@ -60,9 +60,155 @@ else
     echo "   请使用 --sysctl net.ipv4.ip_forward=1 启动容器"
 fi
 
-# NAT 配置：优先使用 eBPF TC NAT（内核 5.19+），失败时自动回退到 iptables/nftables MASQUERADE
-# 程序启动时会自动配置，无需手动操作
-echo "🔧 NAT 配置：程序启动时自动配置（eBPF TC 或 iptables/nftables MASQUERADE）"
+# NAT 配置：在启动脚本中预先设置 iptables/nftables 规则，程序代码作为兜底
+echo "🔧 配置 NAT (iptables/nftables MASQUERADE)..."
+
+VPN_NETWORK="${VPN_NETWORK:-10.8.0.0/24}"
+VPN_EGRESS_INTERFACE="${VPN_EBPF_INTERFACE:-eth0}"
+
+# 函数：检查规则是否存在
+check_nat_rule_exists() {
+    local vpn_net="$1"
+    local egress_if="$2"
+    
+    # 检查 iptables 规则
+    if command -v iptables >/dev/null 2>&1; then
+        if iptables -t nat -C POSTROUTING -s "$vpn_net" -o "$egress_if" -j MASQUERADE >/dev/null 2>&1; then
+            return 0  # 规则存在
+        fi
+    fi
+    
+    # 检查 nftables 规则
+    if command -v nft >/dev/null 2>&1; then
+        if nft list ruleset 2>/dev/null | grep -q "saddr $vpn_net.*oifname \"$egress_if\".*masquerade"; then
+            return 0  # 规则存在
+        fi
+    fi
+    
+    return 1  # 规则不存在
+}
+
+# 函数：添加 iptables 规则
+add_iptables_rule() {
+    local vpn_net="$1"
+    local egress_if="$2"
+    
+    if ! command -v iptables >/dev/null 2>&1; then
+        return 1
+    fi
+    
+    # 加载必要的内核模块
+    modprobe iptable_filter 2>/dev/null || true
+    modprobe iptable_nat 2>/dev/null || true
+    
+    # 添加 NAT 规则
+    if iptables -t nat -C POSTROUTING -s "$vpn_net" -o "$egress_if" -j MASQUERADE >/dev/null 2>&1; then
+        echo "  ✅ iptables NAT 规则已存在"
+        return 0
+    fi
+    
+    # 尝试插入到位置 1（最高优先级）
+    if iptables -t nat -I POSTROUTING 1 -s "$vpn_net" -o "$egress_if" -j MASQUERADE 2>/dev/null; then
+        echo "  ✅ iptables NAT 规则已添加（位置 1）"
+        return 0
+    fi
+    
+    # 如果插入失败，尝试追加
+    if iptables -t nat -A POSTROUTING -s "$vpn_net" -o "$egress_if" -j MASQUERADE 2>/dev/null; then
+        echo "  ✅ iptables NAT 规则已添加（追加）"
+        return 0
+    fi
+    
+    return 1
+}
+
+# 函数：添加 nftables 规则
+add_nftables_rule() {
+    local vpn_net="$1"
+    local egress_if="$2"
+    
+    if ! command -v nft >/dev/null 2>&1; then
+        return 1
+    fi
+    
+    # 尝试使用 "ip nat" 表（兼容 iptables-nft）
+    local table_name="ip nat"
+    local chain_name="POSTROUTING"
+    
+    # 创建表（如果不存在）
+    nft add table "$table_name" 2>/dev/null || true
+    
+    # 创建链（如果不存在）
+    nft add chain "$table_name" "$chain_name" "{ type nat hook postrouting priority 100; }" 2>/dev/null || true
+    
+    # 检查规则是否已存在
+    if nft list ruleset 2>/dev/null | grep -q "saddr $vpn_net.*oifname \"$egress_if\".*masquerade"; then
+        echo "  ✅ nftables NAT 规则已存在"
+        return 0
+    fi
+    
+    # 添加规则
+    if nft add rule "$table_name" "$chain_name" "ip saddr $vpn_net oifname \"$egress_if\" masquerade" 2>/dev/null; then
+        echo "  ✅ nftables NAT 规则已添加"
+        return 0
+    fi
+    
+    # 如果 "ip nat" 失败，尝试 "inet nat"
+    table_name="inet nat"
+    nft add table "$table_name" 2>/dev/null || true
+    nft add chain "$table_name" "$chain_name" "{ type nat hook postrouting priority 100; }" 2>/dev/null || true
+    
+    if nft add rule "$table_name" "$chain_name" "ip saddr $vpn_net oifname \"$egress_if\" masquerade" 2>/dev/null; then
+        echo "  ✅ nftables NAT 规则已添加（inet nat）"
+        return 0
+    fi
+    
+    return 1
+}
+
+# 函数：添加 FORWARD 规则（允许转发）
+add_forward_rule() {
+    if ! command -v iptables >/dev/null 2>&1; then
+        return 1
+    fi
+    
+    # 检查规则是否已存在
+    if iptables -C FORWARD -j ACCEPT >/dev/null 2>&1; then
+        return 0
+    fi
+    
+    # 添加规则
+    if iptables -I FORWARD 1 -j ACCEPT 2>/dev/null || iptables -A FORWARD -j ACCEPT 2>/dev/null; then
+        echo "  ✅ FORWARD 规则已添加"
+        return 0
+    fi
+    
+    return 1
+}
+
+# 检查规则是否已存在
+if check_nat_rule_exists "$VPN_NETWORK" "$VPN_EGRESS_INTERFACE"; then
+    echo "  ✅ NAT 规则已存在，跳过设置"
+else
+    # 尝试添加规则（优先 nftables，然后 iptables）
+    NAT_ADDED=false
+    
+    if add_nftables_rule "$VPN_NETWORK" "$VPN_EGRESS_INTERFACE"; then
+        NAT_ADDED=true
+    elif add_iptables_rule "$VPN_NETWORK" "$VPN_EGRESS_INTERFACE"; then
+        NAT_ADDED=true
+    fi
+    
+    if [ "$NAT_ADDED" = "false" ]; then
+        echo "  ⚠️  警告: 无法在启动脚本中添加 NAT 规则"
+        echo "     程序启动时会自动尝试添加（作为兜底）"
+        echo "     如果仍然失败，请手动执行："
+        echo "     iptables -t nat -A POSTROUTING -s $VPN_NETWORK -o $VPN_EGRESS_INTERFACE -j MASQUERADE"
+    fi
+    
+    # 添加 FORWARD 规则（允许转发）
+    add_forward_rule || true
+fi
 
 # 显示配置信息
 echo "=========================================="

@@ -313,5 +313,7 @@ func registerLDAPConfigRoutes(admin *gin.RouterGroup, ldapConfigHandler *handler
 		ldap.GET("/config", ldapConfigHandler.GetLDAPConfig)
 		ldap.PUT("/config", ldapConfigHandler.UpdateLDAPConfig)
 		ldap.POST("/test", ldapConfigHandler.TestLDAPConnection)
+		ldap.POST("/test-auth", ldapConfigHandler.TestLDAPAuth)
+		ldap.POST("/sync-users", ldapConfigHandler.SyncLDAPUsers)
 	}
 }

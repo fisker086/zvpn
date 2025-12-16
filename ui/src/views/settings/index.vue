@@ -483,26 +483,85 @@
               <a-button @click="handleTest" :loading="testLoading" :disabled="!formData.enabled">
                 测试连接
               </a-button>
+              <a-button @click="showAuthTestModal = true" :disabled="!formData.enabled">
+                测试认证
+              </a-button>
+              <a-button @click="handleSyncUsers" :loading="syncLoading" :disabled="!formData.enabled" type="outline">
+                同步用户
+              </a-button>
             </a-space>
           </a-form-item>
         </a-form>
           </a-tab-pane>
         </a-tabs>
       </a-card>
+
+      <!-- LDAP 认证测试弹窗 -->
+      <a-modal
+        v-model:visible="showAuthTestModal"
+        title="LDAP 用户认证测试"
+        :width="500"
+        @ok="handleAuthTest"
+        @cancel="() => { authTestForm.username = ''; authTestForm.password = '' }"
+        :ok-loading="authTestLoading"
+        ok-text="测试"
+        cancel-text="取消"
+      >
+        <a-form :model="authTestForm" layout="vertical">
+          <a-form-item label="用户名" required>
+            <a-input
+              v-model="authTestForm.username"
+              placeholder="请输入要测试的LDAP用户名"
+              @press-enter="handleAuthTest"
+            />
+            <template #extra>
+              <a-typography-text type="secondary" style="font-size: 12px">
+                输入LDAP中的用户名（不是DN），系统会根据UserFilter搜索用户
+              </a-typography-text>
+            </template>
+          </a-form-item>
+          <a-form-item label="密码" required>
+            <a-input-password
+              v-model="authTestForm.password"
+              placeholder="请输入用户密码"
+              @press-enter="handleAuthTest"
+            />
+            <template #extra>
+              <a-typography-text type="secondary" style="font-size: 12px">
+                输入该用户在LDAP中的密码，用于验证认证是否正常
+              </a-typography-text>
+            </template>
+          </a-form-item>
+        </a-form>
+        <template #footer>
+          <a-space>
+            <a-button @click="showAuthTestModal = false">取消</a-button>
+            <a-button type="primary" @click="handleAuthTest" :loading="authTestLoading">
+              测试认证
+            </a-button>
+          </a-space>
+        </template>
+      </a-modal>
     </a-space>
   </div>
 </template>
 
 <script setup lang="ts">
 import { ref, reactive, onMounted } from 'vue'
-import { ldapApi, type UpdateLDAPConfigRequest } from '@/api/ldap'
-import { Message } from '@arco-design/web-vue'
+import { ldapApi, type UpdateLDAPConfigRequest, type LDAPAuthTestRequest, type LDAPSyncResponse } from '@/api/ldap'
+import { Message, Modal } from '@arco-design/web-vue'
 import request from '@/api/request'
 import { useForm } from '@/composables/useForm'
 import { validatePort, validateIP } from '@/utils/validators'
 
 const submitLoading = ref(false)
 const testLoading = ref(false)
+const authTestLoading = ref(false)
+const showAuthTestModal = ref(false)
+const authTestForm = reactive<LDAPAuthTestRequest>({
+  username: '',
+  password: '',
+})
 const compressionLoading = ref(false)
 const performanceLoading = ref(false)
 const securityLoading = ref(false)
@@ -684,6 +743,115 @@ const handleTest = async () => {
     Message.error(`连接测试失败: ${errorMsg}`)
   } finally {
     testLoading.value = false
+  }
+}
+
+const handleAuthTest = async () => {
+  if (!authTestForm.username || !authTestForm.password) {
+    Message.warning('请输入用户名和密码')
+    return
+  }
+
+  if (!formData.enabled) {
+    Message.warning('请先启用LDAP认证')
+    return
+  }
+
+  if (!formData.host || !formData.port || !formData.bind_dn || !formData.base_dn || !formData.user_filter) {
+    Message.warning('请先填写完整的LDAP配置（Host、Port、BindDN、BaseDN、UserFilter）')
+    return
+  }
+
+  authTestLoading.value = true
+  try {
+    // 先保存配置，确保测试使用的是最新配置
+    await ldapApi.updateConfig(formData)
+    // 然后测试用户认证
+    const result = await ldapApi.testAuth(authTestForm)
+    if (result.success) {
+      const userInfo = result.user
+      const adminInfo = userInfo?.is_admin ? '（管理员）' : '（普通用户）'
+      Modal.success({
+        title: '认证测试成功',
+        content: `
+          <div style="line-height: 1.8;">
+            <p><strong>用户信息：</strong></p>
+            <p>用户名: ${userInfo?.username} ${adminInfo}</p>
+            <p>DN: ${userInfo?.dn}</p>
+            ${userInfo?.email ? `<p>邮箱: ${userInfo.email}</p>` : ''}
+            ${userInfo?.full_name ? `<p>姓名: ${userInfo.full_name}</p>` : ''}
+            <p style="margin-top: 10px; color: #52c41a;">${result.message}</p>
+          </div>
+        `,
+      })
+      // 清空密码字段
+      authTestForm.password = ''
+    }
+  } catch (error: any) {
+    const errorMsg = error.response?.data?.error || error.response?.data?.message || '认证测试失败'
+    Message.error(`认证测试失败: ${errorMsg}`)
+  } finally {
+    authTestLoading.value = false
+  }
+}
+
+const handleSyncUsers = async () => {
+  if (!formData.enabled) {
+    Message.warning('请先启用LDAP认证')
+    return
+  }
+
+  if (!formData.host || !formData.port || !formData.bind_dn || !formData.base_dn || !formData.user_filter) {
+    Message.warning('请先填写完整的LDAP配置（Host、Port、BindDN、BaseDN、UserFilter）')
+    return
+  }
+
+  syncLoading.value = true
+  try {
+    // 先保存配置，确保同步使用的是最新配置
+    await ldapApi.updateConfig(formData)
+    // 然后同步用户
+    const result = await ldapApi.syncUsers()
+    if (result.success) {
+      const details = []
+      if (result.total !== undefined) {
+        details.push(`共找到 ${result.total} 个用户`)
+      }
+      if (result.created !== undefined && result.created > 0) {
+        details.push(`创建 ${result.created} 个`)
+      }
+      if (result.updated !== undefined && result.updated > 0) {
+        details.push(`更新 ${result.updated} 个`)
+      }
+      if (result.errors !== undefined && result.errors > 0) {
+        details.push(`失败 ${result.errors} 个`)
+      }
+      
+      const content = `
+        <div style="line-height: 1.8;">
+          <p style="color: #52c41a; font-weight: bold;">${result.message}</p>
+          ${details.length > 0 ? `<p>${details.join('，')}</p>` : ''}
+          ${result.error_details && result.error_details.length > 0 ? `
+            <div style="margin-top: 10px;">
+              <p style="color: #ff4d4f;"><strong>错误详情：</strong></p>
+              <ul style="margin: 5px 0; padding-left: 20px;">
+                ${result.error_details.map((err: string) => `<li style="margin: 3px 0;">${err}</li>`).join('')}
+              </ul>
+            </div>
+          ` : ''}
+        </div>
+      `
+      
+      Modal.success({
+        title: '用户同步完成',
+        content,
+      })
+    }
+  } catch (error: any) {
+    const errorMsg = error.response?.data?.error || error.response?.data?.message || '用户同步失败'
+    Message.error(`用户同步失败: ${errorMsg}`)
+  } finally {
+    syncLoading.value = false
   }
 }
 
