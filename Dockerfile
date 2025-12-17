@@ -32,11 +32,11 @@ RUN dnf install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
         zlib-devel \
         gcc gcc-c++ make git \
         golang 
-        # glibc-devel.i686 || echo "32-bit glibc-devel not available, continuing..." && \
-    # update-ca-trust extract && \
-    # go version && \
-    # dnf clean all && \
-    # rm -rf /var/cache/dnf /tmp/* /var/tmp/*
+        glibc-devel.i686 || echo "32-bit glibc-devel not available, continuing..." && \
+    update-ca-trust extract && \
+    go version && \
+    dnf clean all && \
+    rm -rf /var/cache/dnf /tmp/* /var/tmp/*
 
         # 3. Go 代理设置（使用阿里云代理，更稳定且证书可靠）
         # GOSUMDB 使用官方 sum.golang.org（证书更可靠）
