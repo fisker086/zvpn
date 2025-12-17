@@ -27,6 +27,11 @@
           <a-card :bordered="false" hoverable>
             <a-statistic title="系统负载 (1m)" :value="currentMetrics.load1" :precision="2">
               <template #prefix><icon-dashboard :style="{ color: '#00b42a' }" /></template>
+              <template #suffix>
+                <a-tooltip content="系统负载平均值，表示1分钟内的平均负载。通常应小于CPU核心数。">
+                  <span style="font-size: 14px; color: #86909c; cursor: help;">负载</span>
+                </a-tooltip>
+              </template>
             </a-statistic>
           </a-card>
         </a-col>

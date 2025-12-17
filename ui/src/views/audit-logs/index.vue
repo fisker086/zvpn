@@ -123,28 +123,39 @@
 
         <template #network="{ record }">
           <div class="network-info">
-            <div v-if="record.domain" class="domain-info">
+            <!-- 优先显示资源路径（访问的目标对象） -->
+            <div v-if="record.resource_path" class="target-object">
+              <a-tag v-if="record.resource_type === 'url'" color="green" size="small">
+                <icon-link style="margin-right: 4px;" />
+                {{ record.resource_path }}
+              </a-tag>
+              <a-tag v-else-if="record.resource_type === 'domain'" color="blue" size="small">
+                <icon-computer style="margin-right: 4px;" />
+                {{ record.resource_path }}
+              </a-tag>
+              <span v-else class="target-text">{{ record.resource_path }}</span>
+            </div>
+            <!-- 如果没有资源路径，显示域名 -->
+            <div v-else-if="record.domain" class="domain-info">
               <a-tag color="blue" size="small">{{ record.domain }}</a-tag>
             </div>
-            <div v-if="record.source_ip">
-              {{ record.source_ip }}<span v-if="record.source_port">:{{ record.source_port }}</span>
+            <!-- 显示源地址和目标地址 -->
+            <div v-if="record.source_ip" class="source-info">
+              <span class="text-secondary">从</span> {{ record.source_ip }}<span v-if="record.source_port">:{{ record.source_port }}</span>
             </div>
-            <div v-if="record.destination_ip" class="text-secondary">
-              → {{ record.destination_ip }}<span v-if="record.destination_port">:{{ record.destination_port }}</span>
+            <div v-if="record.destination_ip && (!record.resource_path || record.resource_path === record.destination_ip)" class="destination-info">
+              <span class="text-secondary">→</span> {{ record.destination_ip }}<span v-if="record.destination_port">:{{ record.destination_port }}</span>
             </div>
-            <div v-if="record.resource_path && !record.source_ip && !record.destination_ip" class="resource-info">
-              <span class="text-secondary">{{ record.resource_path }}</span>
-            </div>
-            <span v-if="!record.domain && !record.source_ip && !record.destination_ip && (!record.resource_path || (record.source_ip && record.resource_path))" class="text-secondary">
+            <span v-if="!record.resource_path && !record.domain && !record.source_ip && !record.destination_ip" class="text-secondary">
               -
             </span>
           </div>
         </template>
 
         <template #protocol="{ record }">
-          <span v-if="record.protocol && record.protocol.trim()" style="text-transform: uppercase;">
-            {{ record.protocol }}
-          </span>
+          <a-tag v-if="record.protocol && record.protocol.trim()" :color="getProtocolColor(record.protocol)" size="small">
+            {{ getProtocolLabel(record.protocol) }}
+          </a-tag>
           <span v-else class="text-secondary">-</span>
         </template>
 
@@ -194,27 +205,46 @@
           {{ currentLog.source_ip || '-' }}
           <span v-if="currentLog.source_port">:{{ currentLog.source_port }}</span>
         </a-descriptions-item>
-        <a-descriptions-item label="目标地址">
-          {{ currentLog.destination_ip || '-' }}
-          <span v-if="currentLog.destination_port">:{{ currentLog.destination_port }}</span>
+        <a-descriptions-item label="访问目标" v-if="currentLog.resource_path || currentLog.domain || currentLog.destination_ip">
+          <div style="display: flex; flex-direction: column; gap: 8px;">
+            <!-- 优先显示资源路径（访问的目标对象） -->
+            <div v-if="currentLog.resource_path">
+              <a-tag v-if="currentLog.resource_type === 'url'" color="green" size="small">
+                <icon-link style="margin-right: 4px;" />
+                {{ currentLog.resource_path }}
+              </a-tag>
+              <a-tag v-else-if="currentLog.resource_type === 'domain'" color="blue" size="small">
+                <icon-computer style="margin-right: 4px;" />
+                {{ currentLog.resource_path }}
+              </a-tag>
+              <span v-else style="font-weight: 500; color: var(--color-text-1);">{{ currentLog.resource_path }}</span>
+            </div>
+            <!-- 显示域名 -->
+            <div v-if="currentLog.domain && currentLog.resource_path !== currentLog.domain">
+              <a-tag color="blue" size="small">域名: {{ currentLog.domain }}</a-tag>
+            </div>
+            <!-- 显示目标IP和端口 -->
+            <div v-if="currentLog.destination_ip" style="color: var(--color-text-2); font-size: 13px;">
+              目标IP: {{ currentLog.destination_ip }}<span v-if="currentLog.destination_port">:{{ currentLog.destination_port }}</span>
+            </div>
+          </div>
+        </a-descriptions-item>
+        <a-descriptions-item label="源地址" v-if="currentLog.source_ip">
+          {{ currentLog.source_ip }}<span v-if="currentLog.source_port">:{{ currentLog.source_port }}</span>
         </a-descriptions-item>
         <a-descriptions-item label="协议">
-          <span v-if="currentLog.protocol && currentLog.protocol.trim()" style="text-transform: uppercase;">
-            {{ currentLog.protocol }}
-          </span>
+          <a-tag v-if="currentLog.protocol && currentLog.protocol.trim()" :color="getProtocolColor(currentLog.protocol)" size="small">
+            {{ getProtocolLabel(currentLog.protocol) }}
+          </a-tag>
           <span v-else>-</span>
         </a-descriptions-item>
-        <a-descriptions-item label="域名" v-if="currentLog.domain">
-          <a-tag color="blue">{{ currentLog.domain }}</a-tag>
+        <a-descriptions-item label="资源类型" v-if="currentLog.resource_type">
+          <a-tag :color="getResourceTypeColor(currentLog.resource_type)" size="small">
+            {{ getResourceTypeLabel(currentLog.resource_type) }}
+          </a-tag>
         </a-descriptions-item>
         <a-descriptions-item label="Hook" v-if="currentLog.hook_name">
           {{ currentLog.hook_name }}
-        </a-descriptions-item>
-        <a-descriptions-item label="资源类型" v-if="currentLog.resource_type">
-          {{ currentLog.resource_type }}
-        </a-descriptions-item>
-        <a-descriptions-item label="资源路径" v-if="currentLog.resource_path">
-          {{ currentLog.resource_path }}
         </a-descriptions-item>
         <a-descriptions-item label="策略" v-if="currentLog.policy_name">
           {{ currentLog.policy_name }} (ID: {{ currentLog.policy_id }})
@@ -241,7 +271,7 @@ import {
 } from '@/api/audit-logs'
 import { usersApi, type User } from '@/api/users'
 import { Message } from '@arco-design/web-vue'
-import { IconRefresh } from '@arco-design/web-vue/es/icon'
+import { IconRefresh, IconLink, IconComputer } from '@arco-design/web-vue/es/icon'
 import { formatDateTime, formatRelativeTime } from '@/utils/formatters'
 
 const loading = ref(false)
@@ -492,6 +522,120 @@ const getResultLabel = (result: string) => {
   return labels[result] || result
 }
 
+const getResourceTypeColor = (type: string) => {
+  const colors: Record<string, string> = {
+    url: 'green',
+    domain: 'blue',
+    network: 'gray',
+    ip: 'orange',
+  }
+  return colors[type] || 'gray'
+}
+
+const getResourceTypeLabel = (type: string) => {
+  const labels: Record<string, string> = {
+    url: 'URL',
+    domain: '域名',
+    network: '网络',
+    ip: 'IP地址',
+  }
+  return labels[type] || type
+}
+
+const getProtocolColor = (protocol: string) => {
+  const protocolLower = protocol.toLowerCase()
+  const colors: Record<string, string> = {
+    // Web协议
+    http: 'blue',
+    https: 'green',
+    'http-alt': 'cyan',
+    'https-alt': 'green',
+    // 数据库协议
+    mysql: 'orange',
+    postgresql: 'purple',
+    redis: 'red',
+    mongodb: 'green',
+    mssql: 'blue',
+    oracle: 'red',
+    cassandra: 'purple',
+    elasticsearch: 'orange',
+    couchdb: 'cyan',
+    // 远程访问协议
+    ssh: 'blue',
+    rdp: 'purple',
+    vnc: 'orange',
+    telnet: 'gray',
+    // 邮件协议
+    smtp: 'blue',
+    imap: 'cyan',
+    imaps: 'green',
+    pop3: 'orange',
+    pop3s: 'green',
+    // 目录服务
+    ldap: 'blue',
+    ldaps: 'green',
+    // 消息队列
+    amqp: 'purple',
+    mqtt: 'orange',
+    kafka: 'red',
+    // 其他
+    ftp: 'blue',
+    ftps: 'green',
+    dns: 'cyan',
+    tcp: 'gray',
+    udp: 'gray',
+    icmp: 'gray',
+  }
+  return colors[protocolLower] || 'gray'
+}
+
+const getProtocolLabel = (protocol: string) => {
+  const protocolLower = protocol.toLowerCase()
+  const labels: Record<string, string> = {
+    // Web协议
+    http: 'HTTP',
+    https: 'HTTPS',
+    'http-alt': 'HTTP',
+    'https-alt': 'HTTPS',
+    // 数据库协议
+    mysql: 'MySQL',
+    postgresql: 'PostgreSQL',
+    redis: 'Redis',
+    mongodb: 'MongoDB',
+    mssql: 'SQL Server',
+    oracle: 'Oracle',
+    cassandra: 'Cassandra',
+    elasticsearch: 'Elasticsearch',
+    couchdb: 'CouchDB',
+    // 远程访问协议
+    ssh: 'SSH',
+    rdp: 'RDP',
+    vnc: 'VNC',
+    telnet: 'Telnet',
+    // 邮件协议
+    smtp: 'SMTP',
+    imap: 'IMAP',
+    imaps: 'IMAPS',
+    pop3: 'POP3',
+    pop3s: 'POP3S',
+    // 目录服务
+    ldap: 'LDAP',
+    ldaps: 'LDAPS',
+    // 消息队列
+    amqp: 'AMQP',
+    mqtt: 'MQTT',
+    kafka: 'Kafka',
+    // 其他
+    ftp: 'FTP',
+    ftps: 'FTPS',
+    dns: 'DNS',
+    tcp: 'TCP',
+    udp: 'UDP',
+    icmp: 'ICMP',
+  }
+  return labels[protocolLower] || protocol.toUpperCase()
+}
+
 const fetchUsers = async () => {
   usersLoading.value = true
   try {
@@ -557,6 +701,26 @@ onMounted(() => {
   .text-secondary {
     color: var(--color-text-3);
     font-size: 12px;
+  }
+
+  .target-object {
+    margin-bottom: 4px;
+    
+    .target-text {
+      font-weight: 500;
+      color: var(--color-text-1);
+    }
+  }
+
+  .domain-info {
+    margin-bottom: 4px;
+  }
+
+  .source-info,
+  .destination-info {
+    font-size: 12px;
+    color: var(--color-text-2);
+    margin-top: 2px;
   }
 }
 

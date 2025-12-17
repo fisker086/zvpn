@@ -1,10 +1,15 @@
 package handlers
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/fisker/zvpn/auth"
@@ -89,13 +94,18 @@ func NewAuthHandler(cfg *config.Config, vpnServer interface{}) *AuthHandler {
 }
 
 type LoginRequest struct {
-	Username string `json:"username" binding:"required"`
-	Password string `json:"password" binding:"required"`
+	Username      string `json:"username" binding:"required"`
+	Password      string `json:"password"`      // 第一步：密码（必需），第二步：可选
+	OTPCode       string `json:"otp_code"`      // 第二步：OTP代码（多步骤认证时使用）
+	PasswordToken string `json:"password_token"` // 第二步：密码验证token（多步骤认证时使用）
 }
 
 type LoginResponse struct {
-	Token string      `json:"token"`
-	User  models.User `json:"user"`
+	Token         string      `json:"token,omitempty"`          // JWT token（最终登录成功时返回）
+	PasswordToken string      `json:"password_token,omitempty"` // 密码验证token（第一步成功时返回，要求输入OTP）
+	RequiresOTP   bool        `json:"requires_otp"`            // 是否需要OTP验证
+	User          models.User `json:"user,omitempty"`          // 用户信息（最终登录成功时返回）
+	Message       string      `json:"message,omitempty"`        // 提示信息
 }
 
 func (h *AuthHandler) Login(c *gin.Context) {
@@ -106,6 +116,13 @@ func (h *AuthHandler) Login(c *gin.Context) {
 	}
 
 	clientIP := c.ClientIP()
+
+	// 后台登录不需要OTP验证，直接验证密码即可
+	// 注意：OTP双因素认证仅用于OpenConnect客户端登录，后台登录不使用OTP
+	if req.Password == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Password is required"})
+		return
+	}
 
 	// 检查密码爆破防护
 	if h.bruteforceProtection != nil {
@@ -304,11 +321,14 @@ func (h *AuthHandler) Login(c *gin.Context) {
 						}
 					}
 					isLDAPAuth = true
-					log.Printf("✓ User %s authenticated via LDAP", req.Username)
+					log.Printf("✓ User %s authenticated via LDAP (password correct)", req.Username)
+					// LDAP认证成功，继续后续流程生成JWT token（后台登录不需要OTP）
 				} else {
-					// LDAP 认证失败，记录失败尝试并 fallback 到本地认证
+					// LDAP 认证失败，用户是LDAP用户，不应该fallback到本地认证
+					// 因为LDAP用户的密码存储在LDAP服务器中，本地数据库没有密码
 					auditLogger := policy.GetAuditLogger()
-					auditLogger.LogAuthWithIP(0, req.Username, models.AuditLogActionLogin, "failed", fmt.Sprintf("LDAP authentication failed: %v", err), clientIP, 0)
+					auditLogger.LogAuthWithIP(existingUser.ID, req.Username, models.AuditLogActionLogin, "failed",
+						fmt.Sprintf("LDAP authentication failed: %v. Source IP: %s", err, clientIP), clientIP, 0)
 
 					// 记录密码爆破尝试
 					if h.bruteforceProtection != nil {
@@ -321,7 +341,9 @@ func (h *AuthHandler) Login(c *gin.Context) {
 							return
 						}
 					}
-					log.Printf("✗ LDAP authentication failed for %s: %v, trying local auth", req.Username, err)
+					log.Printf("✗ LDAP authentication failed for LDAP user %s: %v", req.Username, err)
+					c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
+					return
 				}
 			}
 		} else {
@@ -362,11 +384,14 @@ func (h *AuthHandler) Login(c *gin.Context) {
 				}
 
 				isLDAPAuth = true
-				log.Printf("✓ LDAP user created and authenticated: %s", req.Username)
+				log.Printf("✓ LDAP user created and authenticated: %s (password correct)", req.Username)
+				// LDAP认证成功，继续后续流程生成JWT token（后台登录不需要OTP）
 			} else {
-				// LDAP 认证失败，记录失败尝试并 fallback 到本地认证
+				// LDAP 认证失败，用户不存在于数据库中，不应该fallback到本地认证
+				// 因为用户不存在，只有LDAP认证成功才能创建新用户
 				auditLogger := policy.GetAuditLogger()
-				auditLogger.LogAuthWithIP(0, req.Username, models.AuditLogActionLogin, "failed", fmt.Sprintf("LDAP authentication failed: %v", err), clientIP, 0)
+				auditLogger.LogAuthWithIP(0, req.Username, models.AuditLogActionLogin, "failed",
+					fmt.Sprintf("LDAP authentication failed: %v. Source IP: %s", err, clientIP), clientIP, 0)
 
 				// 记录密码爆破尝试
 				if h.bruteforceProtection != nil {
@@ -379,7 +404,9 @@ func (h *AuthHandler) Login(c *gin.Context) {
 						return
 					}
 				}
-				log.Printf("✗ LDAP authentication failed for %s: %v, trying local auth", req.Username, err)
+				log.Printf("✗ LDAP authentication failed for user %s (not in DB): %v", req.Username, err)
+				c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
+				return
 			}
 		}
 	}
@@ -408,6 +435,19 @@ func (h *AuthHandler) Login(c *gin.Context) {
 				return
 			}
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
+			return
+		}
+
+		// 检查：如果用户是LDAP用户，但LDAP已关闭，不允许登录
+		// 因为LDAP用户的密码存储在LDAP服务器中，本地数据库没有密码
+		if user.Source == models.UserSourceLDAP && !ldapConfig.Enabled {
+			log.Printf("User %s is an LDAP user but LDAP is disabled", req.Username)
+			auditLogger := policy.GetAuditLogger()
+			if auditLogger != nil {
+				auditLogger.LogAuthWithIP(user.ID, req.Username, models.AuditLogActionLogin, "failed",
+					fmt.Sprintf("LDAP user cannot login when LDAP is disabled. Source IP: %s", clientIP), clientIP, 0)
+			}
+			c.JSON(http.StatusForbidden, gin.H{"error": "LDAP authentication is disabled. Please contact administrator."})
 			return
 		}
 
@@ -443,9 +483,11 @@ func (h *AuthHandler) Login(c *gin.Context) {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
 			return
 		}
+
+		// 密码验证成功，继续后续流程生成JWT token（后台登录不需要OTP）
 	}
 
-	// 生成 JWT token
+	// 生成 JWT token（密码验证成功或LDAP认证成功）
 	token, err := auth.GenerateToken(user.ID, user.Username, user.IsAdmin, h.config.JWT.Secret, h.config.JWT.Expiration)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
@@ -523,4 +565,68 @@ func (h *AuthHandler) Profile(c *gin.Context) {
 
 	user.PasswordHash = ""
 	c.JSON(http.StatusOK, user)
+}
+
+// generatePasswordToken 生成密码验证token（用于多步骤认证）
+func (h *AuthHandler) generatePasswordToken(username string) string {
+	timestamp := time.Now().Unix()
+	message := fmt.Sprintf("%s:%d", username, timestamp)
+
+	// 使用JWT密钥生成密码验证token（与JWT使用相同的密钥）
+	secret := h.config.JWT.Secret
+	if secret == "" {
+		// 如果未配置，使用默认密钥（仅用于开发环境）
+		secret = "zvpn-default-secret-key-change-in-production"
+	}
+
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(message))
+	signature := base64.URLEncoding.EncodeToString(mac.Sum(nil))
+
+	return base64.URLEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", message, signature)))
+}
+
+// verifyPasswordToken 验证密码验证token
+func (h *AuthHandler) verifyPasswordToken(token string, username string) bool {
+	// 解码token
+	data, err := base64.URLEncoding.DecodeString(token)
+	if err != nil {
+		return false
+	}
+
+	parts := strings.Split(string(data), ":")
+	if len(parts) != 3 {
+		return false
+	}
+
+	tokenUsername := parts[0]
+	timestampStr := parts[1]
+	signature := parts[2]
+
+	// 验证用户名
+	if tokenUsername != username {
+		return false
+	}
+
+	// 验证时间戳（token有效期5分钟）
+	timestamp, err := strconv.ParseInt(timestampStr, 10, 64)
+	if err != nil {
+		return false
+	}
+	if time.Now().Unix()-timestamp > 300 { // 5分钟过期
+		return false
+	}
+
+	// 验证签名
+	message := fmt.Sprintf("%s:%d", username, timestamp)
+	secret := h.config.JWT.Secret
+	if secret == "" {
+		secret = "zvpn-default-secret-key-change-in-production"
+	}
+
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(message))
+	expectedSignature := base64.URLEncoding.EncodeToString(mac.Sum(nil))
+
+	return hmac.Equal([]byte(signature), []byte(expectedSignature))
 }

@@ -1,7 +1,9 @@
 package policy
 
 import (
+	"fmt"
 	"log"
+	"strings"
 	"sync"
 
 	"github.com/fisker/zvpn/database"
@@ -172,6 +174,81 @@ func (al *AuditLogger) LogAccess(ctx *Context, hook Hook, action Action, result 
 	}
 	// If protocol is already an application protocol (http, https, ssh, etc.), use it as-is
 
+	// 构建更详细的资源路径信息，清晰显示访问的目标对象
+	resourcePath := ctx.DstIP
+	domain := ""
+
+	// 从Metadata中提取域名信息（如果有）
+	if ctx.Metadata != nil {
+		if d, ok := ctx.Metadata["domain"].(string); ok && d != "" {
+			domain = d
+		}
+	}
+
+	// 构建资源路径：根据协议类型构建友好的格式
+	// 对于HTTP/HTTPS协议，构建URL格式
+	if protocol == "http" || protocol == "https" {
+		if domain != "" {
+			scheme := "https"
+			if protocol == "http" {
+				scheme = "http"
+			}
+			if ctx.DstPort == 80 || ctx.DstPort == 443 {
+				resourcePath = fmt.Sprintf("%s://%s", scheme, domain)
+			} else {
+				resourcePath = fmt.Sprintf("%s://%s:%d", scheme, domain, ctx.DstPort)
+			}
+		} else if ctx.DstPort > 0 {
+			scheme := "https"
+			if protocol == "http" {
+				scheme = "http"
+			}
+			resourcePath = fmt.Sprintf("%s://%s:%d", scheme, ctx.DstIP, ctx.DstPort)
+		}
+	} else if protocol != "tcp" && protocol != "udp" && protocol != "icmp" {
+		// 对于其他应用协议（SSH、MySQL、FTP等），显示协议类型和目标
+		protocolUpper := strings.ToUpper(protocol)
+		if domain != "" {
+			if ctx.DstPort > 0 {
+				resourcePath = fmt.Sprintf("%s %s:%d (%s)", protocolUpper, domain, ctx.DstPort, ctx.DstIP)
+			} else {
+				resourcePath = fmt.Sprintf("%s %s (%s)", protocolUpper, domain, ctx.DstIP)
+			}
+		} else if ctx.DstPort > 0 {
+			resourcePath = fmt.Sprintf("%s %s:%d", protocolUpper, ctx.DstIP, ctx.DstPort)
+		} else {
+			resourcePath = fmt.Sprintf("%s %s", protocolUpper, ctx.DstIP)
+		}
+	} else {
+		// 对于TCP/UDP/ICMP等网络层协议，显示IP:端口
+		if domain != "" {
+			// 有域名时，显示域名和IP
+			if ctx.DstPort > 0 {
+				resourcePath = fmt.Sprintf("%s:%d (%s)", domain, ctx.DstPort, ctx.DstIP)
+			} else {
+				resourcePath = fmt.Sprintf("%s (%s)", domain, ctx.DstIP)
+			}
+		} else if ctx.DstPort > 0 {
+			// 没有域名时，显示IP:端口
+			resourcePath = fmt.Sprintf("%s:%d", ctx.DstIP, ctx.DstPort)
+		}
+	}
+
+	// 确定资源类型
+	resourceType := "network"
+	if protocol == "http" || protocol == "https" {
+		if domain != "" {
+			resourceType = "url"
+		} else {
+			resourceType = "url"
+		}
+	} else if protocol != "tcp" && protocol != "udp" && protocol != "icmp" {
+		// 对于应用层协议（SSH、MySQL等），使用协议名作为资源类型
+		resourceType = protocol
+	} else if domain != "" {
+		resourceType = "domain"
+	}
+
 	auditLog := models.AuditLog{
 		UserID:          ctx.UserID,
 		Type:            models.AuditLogTypeAccess,
@@ -181,8 +258,9 @@ func (al *AuditLogger) LogAccess(ctx *Context, hook Hook, action Action, result 
 		SourcePort:      ctx.SrcPort,
 		DestinationPort: ctx.DstPort,
 		Protocol:        protocol,
-		ResourceType:    "network", // network, url, etc.
-		ResourcePath:    ctx.DstIP,
+		ResourceType:    resourceType,
+		ResourcePath:    resourcePath,
+		Domain:          domain,
 		Result:          result,
 		Reason:          reason,
 	}

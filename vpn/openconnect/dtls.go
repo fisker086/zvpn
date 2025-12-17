@@ -22,7 +22,9 @@ import (
 
 const (
 	// BufferSize DTLS 缓冲区大小
-	BufferSize = 1400
+	// 设置为1500字节以支持标准MTU（1460字节payload + 40字节头部开销）
+	// 这样可以正确处理MTU检测时发送的大尺寸DPD包
+	BufferSize = 1500
 )
 
 // customLoggerFactory 自定义日志工厂，确保日志被输出
@@ -473,13 +475,14 @@ func (h *Handler) handleDTLSConnection(conn net.Conn) {
 
 	// 处理 DTLS 数据流
 	// 使用配置的 MTU 值作为缓冲区大小（确保足够大以容纳 MTU 大小的数据包）
+	// 为了支持MTU检测，缓冲区需要至少1500字节（标准MTU）
 	bufSize := h.config.VPN.MTU
 	if bufSize <= 0 {
-		bufSize = BufferSize // 如果未配置，使用默认值
+		bufSize = BufferSize // 如果未配置，使用默认值（1500字节）
 	}
-	// 确保缓冲区足够大（MTU + 一些头部开销）
-	if bufSize < BufferSize {
-		bufSize = BufferSize
+	// 确保缓冲区足够大（至少1500字节以支持MTU检测）
+	if bufSize < 1500 {
+		bufSize = 1500
 	}
 	buf := make([]byte, bufSize)
 	for {

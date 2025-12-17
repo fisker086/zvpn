@@ -166,11 +166,12 @@ func (u *User) SetLDAPAttributes(attributes map[string][]string) error {
 }
 
 // GetLDAPAttributes 获取LDAP原始属性（从JSON字符串反序列化为map）
-func (u *User) GetLDAPAttributes() (map[string][]string, error) {
+// 返回格式：map[string]interface{}，其中值可以是string（单值属性）或[]string（多值属性）
+func (u *User) GetLDAPAttributes() (map[string]interface{}, error) {
 	if u.LDAPAttributes == "" {
 		return nil, nil
 	}
-	var attributes map[string][]string
+	var attributes map[string]interface{}
 	err := json.Unmarshal([]byte(u.LDAPAttributes), &attributes)
 	if err != nil {
 		return nil, err
@@ -218,4 +219,36 @@ func (u *User) CheckPasswordWithOTP(password string) bool {
 
 	// 未启用OTP，只验证密码
 	return u.CheckPassword(password)
+}
+
+// CheckOTPOnly 仅验证OTP代码（不验证密码）
+// 用于LDAP用户启用OTP的情况，因为LDAP用户的密码存储在LDAP服务器中，本地数据库没有密码
+// password参数应该是"密码+OTP代码"的格式，但这里只提取并验证OTP代码部分
+func (u *User) CheckOTPOnly(password string) bool {
+	if !u.OTPEnabled || u.OTPSecret == "" {
+		return false // 未启用OTP
+	}
+
+	// OpenConnect协议：密码格式为"密码+OTP代码"
+	// OTP代码通常是6位数字，从末尾提取
+	if len(password) < 6 {
+		return false // 密码太短，无法包含OTP
+	}
+
+	// 提取最后6位作为OTP代码
+	otpCode := password[len(password)-6:]
+
+	// 验证OTP代码格式（应该是6位数字）
+	if len(otpCode) != 6 {
+		return false
+	}
+	for _, c := range otpCode {
+		if c < '0' || c > '9' {
+			return false // OTP代码必须全是数字
+		}
+	}
+
+	// 验证OTP代码
+	otpAuth := auth.NewOTPAuthenticator("ZVPN")
+	return otpAuth.ValidateOTP(u.OTPSecret, otpCode)
 }

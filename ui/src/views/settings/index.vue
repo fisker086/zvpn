@@ -659,6 +659,7 @@ const syncLoading = ref(false)
 const showAuthTestModal = ref(false)
 const showAuthTestResultModal = ref(false)
 const showSyncResultModal = ref(false)
+const previousLDAPEnabled = ref(false) // 记录LDAP之前是否启用
 const authTestResult = reactive<{
   user?: {
     username?: string
@@ -754,6 +755,8 @@ const attributeMapping = reactive<LDAPAttributeMapping>({
 const fetchConfig = async () => {
   try {
     const config = await ldapApi.getConfig()
+    // 记录之前的LDAP启用状态
+    previousLDAPEnabled.value = config.enabled
     formData.enabled = config.enabled
     formData.host = config.host || ''
     formData.port = config.port || 389
@@ -859,6 +862,32 @@ const handleSubmit = async () => {
     }
   }
 
+  // 如果是从启用状态切换到禁用状态，显示确认提示
+  if (previousLDAPEnabled.value && !formData.enabled) {
+    return new Promise<void>((resolve) => {
+      Modal.confirm({
+        title: '确认关闭LDAP认证',
+        content: '关闭LDAP认证后，所有LDAP用户将无法登录系统（包括后台和VPN客户端）。系统用户仍可正常登录。是否确认关闭？',
+        okText: '确认关闭',
+        cancelText: '取消',
+        okButtonProps: { status: 'danger' },
+        onOk: async () => {
+          await doSubmit()
+          resolve()
+        },
+        onCancel: () => {
+          // 恢复启用状态
+          formData.enabled = true
+          resolve()
+        }
+      })
+    })
+  }
+
+  await doSubmit()
+}
+
+const doSubmit = async () => {
   submitLoading.value = true
   try {
     // 构建属性映射JSON（只包含非空字段）

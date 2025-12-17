@@ -125,15 +125,13 @@ func (l *LDAPAuthenticator) Authenticate(username, password string) (*LDAPUser, 
 	)
 
 	result2, err := conn.Search(searchRequest2)
-	var attributes map[string][]string
+	var attributes map[string]interface{}
 
 	if err == nil && len(result2.Entries) > 0 {
 		entry2 := result2.Entries[0]
 		// 收集所有LDAP属性（用于存储到数据库，便于扩展）
-		attributes = make(map[string][]string)
-		for _, attr := range entry2.Attributes {
-			attributes[attr.Name] = attr.Values
-		}
+		// 规范化属性：单值属性存储为字符串，多值属性存储为数组
+		attributes = normalizeLDAPAttributes(entry2.Attributes)
 	}
 
 	return &LDAPUser{
@@ -381,14 +379,34 @@ func (l *LDAPAuthenticator) extractUsernameFromEntry(entry *ldap.Entry, username
 	return ""
 }
 
+// normalizeLDAPAttributes 规范化LDAP属性
+// 单值属性（如cn、mail）存储为字符串，多值属性（如memberOf）存储为数组
+// 返回格式：map[string]interface{}，其中值可以是string或[]string
+func normalizeLDAPAttributes(attrs []*ldap.EntryAttribute) map[string]interface{} {
+	result := make(map[string]interface{})
+
+	for _, attr := range attrs {
+		// 如果属性只有一个值，存储为字符串（节省空间，更符合直觉）
+		if len(attr.Values) == 1 {
+			result[attr.Name] = attr.Values[0]
+		} else if len(attr.Values) > 1 {
+			// 多个值，存储为数组
+			result[attr.Name] = attr.Values
+		}
+		// 如果 len(attr.Values) == 0，跳过（空值不存储）
+	}
+
+	return result
+}
+
 // LDAPUser LDAP 用户信息
 type LDAPUser struct {
-	DN         string              // Distinguished Name
-	Username   string              // 用户名 (uid/sAMAccountName/cn)
-	Email      string              // 邮箱 (mail)
-	FullName   string              // 全名/中文名 (displayName/cn)
-	IsAdmin    bool                // 是否是管理员
-	Attributes map[string][]string // LDAP原始属性（用于存储所有属性，便于扩展）
+	DN         string                 // Distinguished Name
+	Username   string                 // 用户名 (uid/sAMAccountName/cn)
+	Email      string                 // 邮箱 (mail)
+	FullName   string                 // 全名/中文名 (displayName/cn)
+	IsAdmin    bool                   // 是否是管理员
+	Attributes map[string]interface{} // LDAP原始属性（单值属性为字符串，多值属性为数组）
 }
 
 // LDAPUserInfo LDAP 用户详细信息
@@ -495,10 +513,8 @@ func (l *LDAPAuthenticator) SearchAllUsers() ([]*LDAPUser, error) {
 		}
 
 		// 收集所有LDAP属性（用于存储到数据库，便于扩展）
-		attributes := make(map[string][]string)
-		for _, attr := range entry.Attributes {
-			attributes[attr.Name] = attr.Values
-		}
+		// 规范化属性：单值属性存储为字符串，多值属性存储为数组
+		attributes := normalizeLDAPAttributes(entry.Attributes)
 
 		users = append(users, &LDAPUser{
 			DN:         entry.DN,

@@ -185,6 +185,7 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     protocol VARCHAR(20),
     resource_type VARCHAR(50),
     resource_path VARCHAR(500),
+    domain VARCHAR(255),
     hook_id VARCHAR(255),
     hook_name VARCHAR(255),
     policy_name VARCHAR(255),
@@ -197,6 +198,7 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 CREATE INDEX IF NOT EXISTS idx_audit_logs_user_id ON audit_logs(user_id);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_type ON audit_logs(type);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_domain ON audit_logs(domain);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);
 
 -- 域名管理表

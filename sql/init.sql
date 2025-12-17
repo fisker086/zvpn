@@ -180,6 +180,7 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     protocol VARCHAR(20),
     resource_type VARCHAR(50),
     resource_path VARCHAR(500),
+    domain VARCHAR(255),
     hook_id VARCHAR(255),
     hook_name VARCHAR(255),
     policy_name VARCHAR(255),
@@ -190,6 +191,7 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     INDEX idx_user_id (user_id),
     INDEX idx_type (type),
     INDEX idx_action (action),
+    INDEX idx_domain (domain),
     INDEX idx_created_at (created_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 

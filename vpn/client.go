@@ -149,14 +149,9 @@ func (c *VPNClient) writePacket(packet []byte) {
 		// Byte 6: Type (0x00)
 		// Byte 7: Reserved (0x00)
 		// Byte 8+: Payload
-		version := packet[3]
 		payloadLength := binary.BigEndian.Uint16(packet[4:6]) // Length at byte 4-5
-		packetType := packet[6]
-		reserved := packet[7]
 		// Total packet = STF(3) + Header(5) + Payload = 8 + payloadLength
 		expectedTotalSize := 8 + int(payloadLength)
-		log.Printf("Writing CSTP packet to client %d (IP: %s): STF prefix=[0x%02x,0x%02x,0x%02x], version=0x%02x, payload length=%d (BIG-ENDIAN at byte 4-5: bytes [0x%02x, 0x%02x]), type=0x%02x, reserved=0x%02x, total=%d bytes, first 16 bytes: %x",
-			c.UserID, c.IP.String(), packet[0], packet[1], packet[2], version, payloadLength, packet[4], packet[5], packetType, reserved, len(packet), packet[:min(16, len(packet))])
 
 		// Verify CSTP length field matches expected size
 		if expectedTotalSize != len(packet) {
@@ -253,13 +248,9 @@ func (c *VPNClient) writeBatch(batch [][]byte) {
 			// Byte 6: Type (0x00)
 			// Byte 7: Reserved (0x00)
 			// Byte 8+: Payload
-			version := packet[3]
 			payloadLength := binary.BigEndian.Uint16(packet[4:6]) // Length at byte 4-5
-			pktType := packet[6]
 			// Total packet = STF(3) + Header(5) + Payload = 8 + payloadLength
 			expectedTotalSize := 8 + int(payloadLength)
-			log.Printf("Writing CSTP packet (batch) to client %d (IP: %s): STF prefix, version=0x%02x, payload length=%d (BIG-ENDIAN at byte 4-5), type=0x%02x, total=%d bytes",
-				c.UserID, c.IP.String(), version, payloadLength, pktType, len(packet))
 
 			// Verify CSTP length field matches expected size
 			if expectedTotalSize != len(packet) {
