@@ -407,11 +407,6 @@
 
             <a-form-item label="跳过 TLS 证书验证">
               <a-switch v-model="formData.skip_tls_verify" />
-              <template #extra>
-                <a-typography-text type="warning" style="font-size: 12px">
-                  仅测试环境使用，生产环境请设为关闭
-                </a-typography-text>
-              </template>
             </a-form-item>
 
             <a-divider orientation="left">绑定账号配置</a-divider>

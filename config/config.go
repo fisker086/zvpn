@@ -77,6 +77,10 @@ type VPNConfig struct {
 	DNSPort     string `mapstructure:"dnsport"`     // DNS server port (default: 53)
 	UpstreamDNS string `mapstructure:"upstreamdns"` // Upstream DNS servers (comma-separated, default: 8.8.8.8:53,8.8.4.4:53)
 
+	// CSTP/DTLS keepalive configuration
+	CSTPDPD       int `mapstructure:"cstpdpd"`       // CSTP dead peer detection interval in seconds (default: 30)
+	CSTPKeepalive int `mapstructure:"cstpkeepalive"` // CSTP keepalive interval in seconds (default: 20)
+
 	// Security and protection settings
 	EnableRateLimit      bool  `mapstructure:"enableratelimit"`      // Enable rate limiting (default: true)
 	RateLimitPerIP       int64 `mapstructure:"ratelimitperip"`       // Rate limit per IP (packets per second, default: 1000)

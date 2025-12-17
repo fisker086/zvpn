@@ -31,12 +31,12 @@ RUN dnf install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
         kernel-headers kernel-devel \
         zlib-devel \
         gcc gcc-c++ make git \
-        golang \
-        glibc-devel.i686 || echo "32-bit glibc-devel not available, continuing..." && \
-    update-ca-trust extract && \
-    go version && \
-    dnf clean all && \
-    rm -rf /var/cache/dnf /tmp/* /var/tmp/*
+        golang 
+        # glibc-devel.i686 || echo "32-bit glibc-devel not available, continuing..." && \
+    # update-ca-trust extract && \
+    # go version && \
+    # dnf clean all && \
+    # rm -rf /var/cache/dnf /tmp/* /var/tmp/*
 
         # 3. Go 代理设置（使用阿里云代理，更稳定且证书可靠）
         # GOSUMDB 使用官方 sum.golang.org（证书更可靠）
@@ -169,7 +169,7 @@ ENV GIN_MODE=release \
     VPN_ENABLE_CUSTOM_PROTOCOL=false
 
 VOLUME ["/sys/fs/bpf"]
-EXPOSE 18080 443
+EXPOSE 18080 443 443/udp
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
     CMD wget -qO- http://127.0.0.1:18080/api/v1/health || exit 1

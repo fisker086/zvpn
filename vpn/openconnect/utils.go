@@ -52,13 +52,28 @@ func getCompressionType(cfg *config.Config) string {
 }
 
 // getDTLSConfig 获取 DTLS 配置（用于CSTP配置）
-func getDTLSConfig(cfg *config.Config) string {
+// 注意：OpenConnect 客户端需要完整的 DTLS 配置，包括 host 和 port
+// clientHost 是客户端实际连接的主机地址（来自 HTTP 请求的 Host 头）
+func getDTLSConfig(cfg *config.Config, clientHost string) string {
 	if !cfg.VPN.EnableDTLS {
 		return "<cstp:dtls-enabled>false</cstp:dtls-enabled>"
 	}
 
 	// DTLS 启用，端口使用与 TCP 相同的端口（OpenConnect 默认行为）
-	return "<cstp:dtls-enabled>true</cstp:dtls-enabled>"
+	// 需要显式指定 dtls-host 和 dtls-port，否则客户端可能无法建立 DTLS 连接
+	dtlsPort := cfg.VPN.OpenConnectPort
+
+	// 如果 clientHost 包含端口，只保留主机部分
+	if colonPos := strings.Index(clientHost, ":"); colonPos != -1 {
+		clientHost = clientHost[:colonPos]
+	}
+
+	// 构建完整的 DTLS 配置
+	dtlsConfig := "\n\t\t<cstp:dtls-enabled>true</cstp:dtls-enabled>"
+	dtlsConfig += "\n\t\t<cstp:dtls-host>" + clientHost + "</cstp:dtls-host>"
+	dtlsConfig += "\n\t\t<cstp:dtls-port>" + dtlsPort + "</cstp:dtls-port>"
+
+	return dtlsConfig
 }
 
 // isPublicDNS 判断DNS服务器是否是公网DNS

@@ -54,7 +54,7 @@ func (c *customLogger) Tracef(format string, args ...interface{}) {
 func (c *customLogger) Debug(msg string) {
 	// 总是输出 Debug 日志以便调试
 	log.Printf("DTLS [%s] DEBUG: %s", c.scope, msg)
-	// 如果包含关键信息，额外输出
+	// 如果包含关键信息，额外输出（特别是扩展相关的）
 	msgLower := strings.ToLower(msg)
 	if strings.Contains(msgLower, "handshake") ||
 		strings.Contains(msgLower, "client") ||
@@ -64,7 +64,18 @@ func (c *customLogger) Debug(msg string) {
 		strings.Contains(msgLower, "read") ||
 		strings.Contains(msgLower, "write") ||
 		strings.Contains(msgLower, "received") ||
-		strings.Contains(msgLower, "sent") {
+		strings.Contains(msgLower, "sent") ||
+		strings.Contains(msgLower, "extension") ||
+		strings.Contains(msgLower, "hello") ||
+		strings.Contains(msgLower, "flight") ||
+		strings.Contains(msgLower, "serverhello") ||
+		strings.Contains(msgLower, "supported") ||
+		strings.Contains(msgLower, "curve") ||
+		strings.Contains(msgLower, "point") ||
+		strings.Contains(msgLower, "format") ||
+		strings.Contains(msgLower, "group") ||
+		strings.Contains(msgLower, "algorithm") ||
+		strings.Contains(msgLower, "signature") {
 		log.Printf("DTLS [%s] DEBUG (KEY): %s", c.scope, msg)
 	}
 }
@@ -80,7 +91,10 @@ func (c *customLogger) Debugf(format string, args ...interface{}) {
 		strings.Contains(msgLower, "error") ||
 		strings.Contains(msgLower, "packet") ||
 		strings.Contains(msgLower, "udp") ||
-		strings.Contains(msgLower, "connect") {
+		strings.Contains(msgLower, "connect") ||
+		strings.Contains(msgLower, "extension") ||
+		strings.Contains(msgLower, "hello") ||
+		strings.Contains(msgLower, "flight") {
 		log.Printf("DTLS [%s] DEBUG (KEY): "+format, append([]interface{}{c.scope}, args...)...)
 	}
 }
@@ -110,14 +124,12 @@ func (c *customLogger) Errorf(format string, args ...interface{}) {
 }
 
 // dtlsSessionStore DTLS 会话存储（用于存储和检索 DTLS session）
-// 参考 anylink 的实现，需要能够从 session ID 获取 master secret
-// anylink 使用 Dtls2MasterSecret 和 Dtls2CSess 来关联 DTLS session 和 TCP session
+// 需要能够从 session ID 获取 master secret
+// 使用 handler 来访问 dtlsClients，从中可以获取客户端信息
 type dtlsSessionStore struct {
 	sessions map[string]*dtlsSessionInfo
 	lock     sync.RWMutex
 	handler  *Handler // 用于访问客户端信息
-	// anylink 使用全局的 Dtls2MasterSecret 和 Dtls2CSess 映射
-	// 我们使用 handler 来访问 dtlsClients，从中可以获取客户端信息
 }
 
 type dtlsSessionInfo struct {
@@ -152,35 +164,64 @@ func (s *dtlsSessionStore) Set(key []byte, session dtls.Session) error {
 }
 
 // Get 获取 DTLS session
-// 参考 anylink 的实现：Dtls2MasterSecret(k)
 // 注意：如果返回错误，DTLS 库会允许新的握手（不使用 session resumption）
 func (s *dtlsSessionStore) Get(key []byte) (dtls.Session, error) {
-	s.lock.RLock()
-	defer s.lock.RUnlock()
-
 	keyStr := hex.EncodeToString(key)
-	log.Printf("DTLS: Session store Get called with key: %s", keyStr)
 
-	// 首先尝试从存储的 session 中获取
+	s.lock.RLock()
 	info, exists := s.sessions[keyStr]
-	if exists {
-		// 检查是否过期
-		if time.Now().After(info.expiresAt) {
-			delete(s.sessions, keyStr)
-			log.Printf("DTLS: Session expired for key: %s", keyStr)
-		} else {
-			log.Printf("DTLS: Found session for key: %s", keyStr)
-			return dtls.Session{
-				ID:     info.sessionID,
-				Secret: info.masterSecret,
-			}, nil
-		}
+	now := time.Now()
+	s.lock.RUnlock()
+
+	if !exists {
+		return dtls.Session{}, errors.New("session not found")
 	}
 
-	// 如果 session store 中没有，返回错误以允许新的握手
-	// OpenConnect 客户端通常会进行新的 DTLS 握手，而不是使用 session resumption
-	log.Printf("DTLS: Session not found for key: %s, allowing new handshake", keyStr)
-	return dtls.Session{}, errors.New("session not found")
+	// 检查是否过期（需要写锁来删除）
+	if now.After(info.expiresAt) {
+		s.lock.Lock()
+		delete(s.sessions, keyStr)
+		s.lock.Unlock()
+		return dtls.Session{}, errors.New("session expired")
+	}
+
+	return dtls.Session{
+		ID:     info.sessionID,
+		Secret: info.masterSecret,
+	}, nil
+}
+
+// StoreMasterSecret 存储 master secret（从客户端 CONNECT 请求中获取）
+// 这个方法在 sendCSTPConfig 中调用，将 master secret 与 session ID 关联
+func (s *dtlsSessionStore) StoreMasterSecret(sessionIDHex string, masterSecretHex string) error {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	if masterSecretHex == "" {
+		return nil // 如果没有 master secret，不存储
+	}
+
+	// 解码 master secret（hex 字符串）
+	masterSecret, err := hex.DecodeString(masterSecretHex)
+	if err != nil {
+		log.Printf("DTLS: Failed to decode master secret: %v", err)
+		return err
+	}
+
+	// 解码 session ID（hex 字符串）
+	sessionID, err := hex.DecodeString(sessionIDHex)
+	if err != nil {
+		log.Printf("DTLS: Failed to decode session ID: %v", err)
+		return err
+	}
+
+	log.Printf("DTLS: Storing master secret for session ID: %s", sessionIDHex)
+	s.sessions[sessionIDHex] = &dtlsSessionInfo{
+		sessionID:    sessionID,
+		masterSecret: masterSecret,
+		expiresAt:    time.Now().Add(24 * time.Hour), // 24小时过期
+	}
+	return nil
 }
 
 // Del 删除 DTLS session
@@ -193,24 +234,36 @@ func (s *dtlsSessionStore) Del(key []byte) error {
 	return nil
 }
 
-// dtlsCipherSuites DTLS 加密套件映射（OpenConnect 兼容）
+// dtlsCipherSuites DTLS 加密套件映射（用于解析客户端请求）
+// 只支持两个密码套件
 var dtlsCipherSuites = map[string]dtls.CipherSuiteID{
 	"ECDHE-RSA-AES256-GCM-SHA384": dtls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
 	"ECDHE-RSA-AES128-GCM-SHA256": dtls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
 }
 
-// checkDtls12Ciphersuite 检查并返回支持的加密套件
+// checkDtls12Ciphersuite 验证和选择客户端请求的 DTLS 1.2 密码套件
+// 如果客户端请求的套件不在支持列表中，返回默认值
 func checkDtls12Ciphersuite(ciphersuite string) string {
-	for k := range dtlsCipherSuites {
-		if k == ciphersuite {
-			return k
+	if ciphersuite == "" {
+		// 如果没有请求，返回默认值（优先级最高的）
+		return "ECDHE-RSA-AES256-GCM-SHA384"
+	}
+
+	// 分割客户端请求的密码套件列表（冒号分隔）
+	csArr := strings.Split(ciphersuite, ":")
+	for _, v := range csArr {
+		v = strings.TrimSpace(v)
+		// 检查是否在支持的密码套件列表中
+		if _, ok := dtlsCipherSuites[v]; ok {
+			return v
 		}
 	}
-	// 返回默认值
-	return "ECDHE-RSA-AES128-GCM-SHA256"
+
+	// 如果没有找到支持的密码套件，返回默认值（优先级最高的）
+	return "ECDHE-RSA-AES256-GCM-SHA384"
 }
 
-// startRealDTLSServer 启动真正的 DTLS 服务器（参考 anylink 实现）
+// startRealDTLSServer 启动真正的 DTLS 服务器
 func (h *Handler) startRealDTLSServer() error {
 	log.Printf("StartDTLSServer called: EnableDTLS=%v", h.config.VPN.EnableDTLS)
 	if !h.config.VPN.EnableDTLS {
@@ -254,36 +307,55 @@ func (h *Handler) startRealDTLSServer() error {
 	logf := &customLoggerFactory{}
 	logf.DefaultLogLevel = logging.LogLevelDebug // 使用 Debug 级别以便看到更多信息
 
-	// 创建 session store（传入 handler 以便访问客户端信息）
-	sessStore := newDTLSSessionStore(h)
+	// 配置 DTLS：从 dtlsCipherSuites map 中获取密码套件列表
+	// 只启用两个特定的密码套件，不使用 pion/dtls 的默认套件
+	priorityCipherSuites := make([]dtls.CipherSuiteID, 0, len(dtlsCipherSuites))
+	for _, vv := range dtlsCipherSuites {
+		priorityCipherSuites = append(priorityCipherSuites, vv)
+	}
 
-	// 配置 DTLS
-	log.Printf("DTLS: Configuring DTLS with %d cipher suites", len(dtlsCipherSuites))
+	// 确保只包含两个密码套件
+	if len(priorityCipherSuites) != 2 {
+		log.Printf("DTLS: WARNING - Expected 2 cipher suites, got %d", len(priorityCipherSuites))
+	}
+	log.Printf("DTLS: Configuring DTLS with %d cipher suites", len(priorityCipherSuites))
+
+	// 创建 session store（使用 sessionStore 而不是 nil）
+	sessStore := newDTLSSessionStore(h)
+	// 保存到 Handler 中，以便在 sendCSTPConfig 中使用
+	h.dtlsSessionStore = sessStore
+
+	// 使用配置文件中的 MTU（与发送给客户端的 X-DTLS-MTU 保持一致）
+	// DTLS MTU 需要考虑 IP 头（20字节）+ UDP 头（8字节）+ DTLS 头（约13字节）的开销
+	// 但为了与客户端配置一致，直接使用配置的 MTU 值
+	dtlsMTU := h.config.VPN.MTU
+	if dtlsMTU <= 0 {
+		// 如果配置中没有设置或为0，使用默认值
+		dtlsMTU = BufferSize
+		log.Printf("DTLS: MTU not configured, using default: %d", dtlsMTU)
+	} else {
+		log.Printf("DTLS: Using MTU from config: %d", dtlsMTU)
+	}
+
+	// DTLS 配置
 	dtlsConfig := &dtls.Config{
 		Certificates:         []tls.Certificate{cert},
 		ExtendedMasterSecret: dtls.DisableExtendedMasterSecret, // OpenConnect 兼容（必须禁用）
-		CipherSuites: func() []dtls.CipherSuiteID {
-			var cs []dtls.CipherSuiteID
-			for name, id := range dtlsCipherSuites {
-				cs = append(cs, id)
-				log.Printf("DTLS: Enabled cipher suite: %s (ID: %d, hex: 0x%04x)", name, id, id)
-			}
-			log.Printf("DTLS: Total %d cipher suites configured", len(cs))
-			return cs
-		}(),
-		LoggerFactory: logf,
-		MTU:           BufferSize,
-		SessionStore:  sessStore,
+		CipherSuites:         priorityCipherSuites,
+		LoggerFactory:        logf,
+		MTU:                  dtlsMTU,   // 使用配置文件中的 MTU
+		SessionStore:         sessStore, // 使用 session store
+		// 设置握手超时（使用 5 秒）
 		ConnectContextMaker: func() (context.Context, func()) {
-			// 增加握手超时时间到 30 秒（OpenConnect 客户端可能需要更长时间）
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			return ctx, func() {
-				log.Printf("DTLS: Handshake context cancelled or timed out")
-				cancel()
-			}
+			return context.WithTimeout(context.Background(), 5*time.Second)
 		},
-		// 不要求客户端证书（OpenConnect 客户端通常不提供客户端证书）
-		ClientAuth: dtls.NoClientCert,
+		// 注意：以下选项使用默认值，让 pion/dtls 使用默认配置
+		// - SRTPProtectionProfiles
+		// - EllipticCurves
+		// - SupportedProtocols
+		// - FlightInterval
+		// - SignatureSchemes
+		// - ClientAuth（使用默认值 NoClientCert）
 	}
 
 	// 解析地址
@@ -309,30 +381,13 @@ func (h *Handler) startRealDTLSServer() error {
 	// 2. UDP 包被防火墙阻止
 	// 3. 或者客户端配置有问题
 
-	log.Printf("DTLS: Creating DTLS listener with custom logger...")
-	log.Printf("DTLS: Custom logger will output all handshake logs with 'DTLS [scope]' prefix")
+	log.Printf("DTLS: Creating DTLS listener on %s", udpAddr.String())
 
-	// 关键：检查 DTLS 配置
-	cipherSuites := dtlsConfig.CipherSuites
-	log.Printf("DTLS: Config summary:")
-	log.Printf("DTLS:   - Certificates: %d", len(dtlsConfig.Certificates))
-	log.Printf("DTLS:   - CipherSuites: %d", len(cipherSuites))
-	log.Printf("DTLS:   - ExtendedMasterSecret: Disabled (OpenConnect requirement)")
-	log.Printf("DTLS:   - ClientAuth: NoClientCert")
-	log.Printf("DTLS:   - MTU: %d", dtlsConfig.MTU)
-	log.Printf("DTLS:   - LoggerFactory: %T", dtlsConfig.LoggerFactory)
-	log.Printf("DTLS:   - SessionStore: %T", dtlsConfig.SessionStore)
-	log.Printf("DTLS: Listening on UDP address: %s", udpAddr.String())
+	// 注意：不能同时创建两个 UDP 监听器监听同一个端口
+	// dtls.Listen() 会创建自己的 UDP 连接，所以这里不需要额外的调试监听器
+	// 如果需要调试，可以使用 tcpdump 或 wireshark 来捕获 UDP 包
 
 	// 使用 dtls.Listen 创建 DTLS 监听器
-	// 这会处理 DTLS 握手和数据传输
-	log.Printf("DTLS: Calling dtls.Listen()...")
-	log.Printf("DTLS: All UDP packets will be handled by pion/dtls library")
-	log.Printf("DTLS: DTLS handshake logs will appear with 'DTLS [scope]' prefix")
-	log.Printf("DTLS: If you don't see 'DTLS: LoggerFactory.NewLogger called' logs, UDP packets may not be reaching the server")
-
-	// 注意：dtls.Listen() 内部会创建一个 UDP 连接并开始监听
-	// 如果 UDP 包到达，pion/dtls 会调用我们的 LoggerFactory.NewLogger
 	ln, err := dtls.Listen("udp", udpAddr, dtlsConfig)
 	if err != nil {
 		log.Printf("DTLS: Failed to listen on UDP port %s: %v", dtlsPort, err)
@@ -342,45 +397,22 @@ func (h *Handler) startRealDTLSServer() error {
 	// 存储 listener
 	h.dtlsListener = ln
 
-	log.Printf("DTLS: dtls.Listen() succeeded, listener type: %T", ln)
-	log.Printf("DTLS UDP server started successfully on %s (UDP port %s)", addr, dtlsPort)
-	log.Printf("DTLS: Listener created successfully, ready to accept connections")
-	log.Printf("DTLS: Server is ready to accept DTLS connections on UDP port %s", dtlsPort)
-	log.Printf("DTLS: Note - Accept() will only return after successful handshake. Failed handshakes won't be logged here.")
-	log.Printf("DTLS: IMPORTANT - If no 'DTLS [scope]' logs appear, it means:")
-	log.Printf("DTLS:   1. UDP packets are not reaching the server (check firewall/network)")
-	log.Printf("DTLS:   2. Client is not sending DTLS handshake packets")
-	log.Printf("DTLS:   3. Use 'sudo tcpdump -i any -n udp port %s' to verify UDP packets", dtlsPort)
+	log.Printf("DTLS: UDP server started on %s", addr)
 
 	// 启动接受连接的 goroutine
 	go func() {
-		log.Printf("DTLS: Accept loop started, waiting for DTLS connections...")
-		log.Printf("DTLS: IMPORTANT - Accept() will block until handshake completes successfully")
-		log.Printf("DTLS: If handshake fails, you should see 'DTLS [scope] ERROR' logs above")
-		log.Printf("DTLS: If no logs appear, check:")
-		log.Printf("DTLS:   1. Client is actually attempting DTLS connection")
-		log.Printf("DTLS:   2. UDP port %s is accessible from client", dtlsPort)
-		log.Printf("DTLS:   3. Firewall is not blocking UDP packets")
-		log.Printf("DTLS:   4. Check if UDP packets are reaching the server (use: sudo tcpdump -i any -n udp port %s)", dtlsPort)
-		log.Printf("DTLS:   5. Check client logs for DTLS connection errors")
-		log.Printf("DTLS:   6. Verify network connectivity: ping server and check UDP port with: nc -u -v server_ip %s", dtlsPort)
-
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
-				// 检查是否是关闭错误
 				if strings.Contains(err.Error(), "use of closed network connection") {
 					log.Printf("DTLS: Listener closed, exiting accept loop")
 					return
 				}
-				log.Printf("DTLS: Accept error (handshake failed or connection closed): %v (type: %T)", err, err)
-				log.Printf("DTLS: This error means Accept() returned, which usually indicates handshake failure")
-				log.Printf("DTLS: Check 'DTLS [scope] ERROR' logs above for detailed error information")
+				log.Printf("DTLS: Accept error: %v", err)
 				continue
 			}
 
-			log.Printf("DTLS: ✓ Handshake successful! New connection accepted from %s", conn.RemoteAddr())
-			// 处理 DTLS 连接
+			log.Printf("DTLS: Handshake successful, connection from %s", conn.RemoteAddr())
 			go h.handleDTLSConnection(conn)
 		}
 	}()
@@ -394,7 +426,6 @@ func (h *Handler) handleDTLSConnection(conn net.Conn) {
 
 	dtlsConn := conn.(*dtls.Conn)
 	sessionID := hex.EncodeToString(dtlsConn.ConnectionState().SessionID)
-	log.Printf("DTLS: New connection established, session ID: %s", sessionID)
 
 	// 获取客户端地址
 	remoteAddr := conn.RemoteAddr()
@@ -407,22 +438,15 @@ func (h *Handler) handleDTLSConnection(conn net.Conn) {
 	// 查找匹配的客户端（通过 UDP 地址或未连接的客户端）
 	h.dtlsLock.Lock()
 	var matchedClient *TunnelClient
-	var matchedVPNIP string
-
-	log.Printf("DTLS: Attempting to match client for DTLS connection from %s (session ID: %s)", udpAddr, sessionID)
-	log.Printf("DTLS: Total registered clients: %d", len(h.dtlsClients))
 
 	// 首先尝试通过 UDP 地址匹配（最准确）
 	// 注意：客户端在注册时 UDPAddr 可能是 nil，所以这个匹配可能不会成功
-	for vpnIP, clientInfo := range h.dtlsClients {
+	for _, clientInfo := range h.dtlsClients {
 		if clientInfo.UDPAddr != nil && clientInfo.UDPAddr.IP.Equal(udpAddr.IP) && clientInfo.UDPAddr.Port == udpAddr.Port {
 			matchedClient = clientInfo.Client
-			matchedVPNIP = vpnIP
-			// 更新 DTLS 连接和地址信息
 			clientInfo.DTLSConn = conn
 			clientInfo.UDPAddr = udpAddr
 			clientInfo.LastSeen = time.Now()
-			log.Printf("DTLS: Matched client by UDP address (VPN IP: %s, UDP: %s)", vpnIP, udpAddr)
 			break
 		}
 	}
@@ -430,16 +454,12 @@ func (h *Handler) handleDTLSConnection(conn net.Conn) {
 	// 如果没有通过地址匹配，尝试通过第一个未连接的客户端匹配
 	// 这是最常见的场景：客户端刚建立 TCP 连接，现在尝试建立 DTLS 连接
 	if matchedClient == nil {
-		log.Printf("DTLS: No client matched by UDP address, trying to match unconnected client...")
-		for vpnIP, clientInfo := range h.dtlsClients {
+		for _, clientInfo := range h.dtlsClients {
 			if clientInfo.Client != nil && clientInfo.DTLSConn == nil {
 				matchedClient = clientInfo.Client
-				matchedVPNIP = vpnIP
-				// 设置 DTLS 连接和地址信息
 				clientInfo.DTLSConn = conn
 				clientInfo.UDPAddr = udpAddr
 				clientInfo.LastSeen = time.Now()
-				log.Printf("DTLS: Matched unconnected client for session ID %s (VPN IP: %s, User: %s)", sessionID, vpnIP, clientInfo.Client.User.Username)
 				break
 			}
 		}
@@ -447,28 +467,21 @@ func (h *Handler) handleDTLSConnection(conn net.Conn) {
 	h.dtlsLock.Unlock()
 
 	if matchedClient == nil {
-		log.Printf("DTLS: ERROR - No matching client found for session ID: %s, remote: %s", sessionID, udpAddr)
-		log.Printf("DTLS: This usually means:")
-		log.Printf("DTLS:   1. Client TCP connection was not established before DTLS handshake")
-		log.Printf("DTLS:   2. Client was not registered in dtlsClients map")
-		log.Printf("DTLS:   3. All clients already have DTLS connections")
-		log.Printf("DTLS: Available clients: %d", len(h.dtlsClients))
-		for vpnIP, clientInfo := range h.dtlsClients {
-			if clientInfo.Client != nil {
-				log.Printf("DTLS:   - VPN IP: %s, User: %s, Has DTLS Conn: %v, UDP Addr: %v",
-					vpnIP, clientInfo.Client.User.Username, clientInfo.DTLSConn != nil, clientInfo.UDPAddr)
-			} else {
-				log.Printf("DTLS:   - VPN IP: %s, Client: nil", vpnIP)
-			}
-		}
-		log.Printf("DTLS: Closing DTLS connection due to no matching client")
+		log.Printf("DTLS: No matching client found for session ID: %s, remote: %s", sessionID, udpAddr)
 		return
 	}
 
-	log.Printf("DTLS: Matched client for session ID %s (VPN IP: %s, remote: %s)", sessionID, matchedVPNIP, udpAddr)
-
 	// 处理 DTLS 数据流
-	buf := make([]byte, BufferSize)
+	// 使用配置的 MTU 值作为缓冲区大小（确保足够大以容纳 MTU 大小的数据包）
+	bufSize := h.config.VPN.MTU
+	if bufSize <= 0 {
+		bufSize = BufferSize // 如果未配置，使用默认值
+	}
+	// 确保缓冲区足够大（MTU + 一些头部开销）
+	if bufSize < BufferSize {
+		bufSize = BufferSize
+	}
+	buf := make([]byte, bufSize)
 	for {
 		n, err := conn.Read(buf)
 		if err != nil {
@@ -476,36 +489,70 @@ func (h *Handler) handleDTLSConnection(conn net.Conn) {
 			return
 		}
 
-		if n < 5 {
+		if n < 8 {
 			log.Printf("DTLS: Packet too short: %d bytes", n)
 			continue
 		}
 
-		// 解析 CSTP 数据包
-		packetType := buf[3]
-		length := binary.BigEndian.Uint16(buf[1:3])
+		// 查找 STF 前缀（OpenConnect 客户端总是发送 STF 前缀）
+		var packetType byte
+		var length uint16
+		var payload []byte
+		var payloadStart int
 
-		if int(length)+5 != n {
-			log.Printf("DTLS: Invalid packet length: declared=%d, actual=%d", int(length)+5, n)
-			if n >= 5 {
-				payload := buf[5:n]
-				go func() {
-					if err := matchedClient.processPacket(packetType, payload); err != nil {
-						log.Printf("DTLS: Error processing packet: %v", err)
-					}
-				}()
+		// 检查是否有 STF 前缀
+		if buf[0] == 'S' && buf[1] == 'T' && buf[2] == 'F' {
+			// 现代格式：STF(3) + Header(5) = 8 bytes, payload starts at offset 8
+			if n < 8 {
+				log.Printf("DTLS: Packet too short for STF prefix: %d bytes", n)
+				continue
+			}
+
+			// 解析 CSTP 头（STF 前缀之后）
+			// Byte 3: Version (0x01)
+			// Byte 4-5: Length (BIG-ENDIAN) - payload length only, NOT including header
+			// Byte 6: Payload type
+			// Byte 7: Reserved (0x00)
+			if buf[3] != 0x01 {
+				log.Printf("DTLS: Invalid version byte after STF prefix: 0x%02x", buf[3])
+				continue
+			}
+
+			length = binary.BigEndian.Uint16(buf[4:6])
+			packetType = buf[6]
+			payloadStart = 8 // STF(3) + Header(5)
+		} else {
+			// 兼容旧格式：没有 STF 前缀，直接解析 CSTP 头
+			if n < 5 {
+				log.Printf("DTLS: Packet too short for legacy format: %d bytes", n)
+				continue
+			}
+
+			length = binary.BigEndian.Uint16(buf[1:3])
+			packetType = buf[3]
+			payloadStart = 5 // 直接是 CSTP 头
+		}
+
+		// 验证总长度
+		expectedLength := payloadStart + int(length)
+		if expectedLength != n {
+			log.Printf("DTLS: Invalid packet length: declared=%d, expected total=%d, actual=%d", length, expectedLength, n)
+			// 仍然尝试处理数据包，因为某些客户端可能发送不同格式
+			if n >= payloadStart {
+				payload = buf[payloadStart:n]
+				if err := matchedClient.processPacket(packetType, payload); err != nil {
+					log.Printf("DTLS: Error processing packet: %v", err)
+				}
 			}
 			continue
 		}
 
-		payload := buf[5:n]
-		log.Printf("DTLS: Received packet, type=0x%02x, length=%d", packetType, length)
+		// 提取 payload
+		payload = buf[payloadStart:n]
 
 		// 处理数据包
-		go func() {
-			if err := matchedClient.processPacket(packetType, payload); err != nil {
-				log.Printf("DTLS: Error processing packet: %v", err)
-			}
-		}()
+		if err := matchedClient.processPacket(packetType, payload); err != nil {
+			log.Printf("DTLS: Error processing packet: %v", err)
+		}
 	}
 }

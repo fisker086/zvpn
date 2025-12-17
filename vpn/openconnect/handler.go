@@ -1,7 +1,9 @@
 package openconnect
 
 import (
+	"crypto/rand"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"net"
@@ -40,6 +42,7 @@ type Handler struct {
 	dtlsRawUDPConn       *net.UDPConn               // 原始 UDP 连接（用于调试）
 	dtlsClients          map[string]*DTLSClientInfo // VPN IP -> DTLSClientInfo 映射，用于 DTLS
 	dtlsLock             sync.RWMutex
+	dtlsSessionStore     *dtlsSessionStore // DTLS session store（用于 session resumption）
 	bruteforceProtection *security.BruteforceProtection
 }
 
@@ -67,6 +70,16 @@ func parseClientInfo(ua string) (osName string, version string) {
 		version = matches[2]
 	}
 	return
+}
+
+// getHeaderCaseInsensitive 获取 HTTP header，尝试多个可能的名称（大小写不敏感）
+func getHeaderCaseInsensitive(c *gin.Context, names ...string) string {
+	for _, name := range names {
+		if value := c.GetHeader(name); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // NewHandler 创建 OpenConnect 处理器
@@ -370,7 +383,24 @@ func (h *Handler) handleConnect(c *gin.Context) {
 	}
 
 	// 发送CSTP配置响应（包含HTTP响应头）
-	if err := h.sendCSTPConfig(conn, &user, dnsServers); err != nil {
+	// 调试：打印所有请求头
+	log.Printf("OpenConnect: DEBUG - All request headers:")
+	for key, values := range c.Request.Header {
+		for _, value := range values {
+			log.Printf("OpenConnect: DEBUG -   %s: %s", key, value)
+		}
+	}
+
+	// 获取客户端请求的 DTLS 密码套件和 Master Secret
+	clientCipherSuite := getHeaderCaseInsensitive(c, "X-Dtls12-Ciphersuite", "X-DTLS12-CipherSuite", "X-Dtls-Ciphersuite", "X-DTLS-CipherSuite")
+	if clientCipherSuite == "PSK-NEGOTIATE" {
+		// 服务器使用证书模式，不支持 PSK
+		clientCipherSuite = ""
+	}
+
+	clientMasterSecret := getHeaderCaseInsensitive(c, "X-Dtls-Master-Secret", "X-DTLS-Master-Secret")
+
+	if err := h.sendCSTPConfig(conn, &user, dnsServers, clientCipherSuite, clientMasterSecret); err != nil {
 		log.Printf("OpenConnect: Failed to send CSTP config: %v", err)
 		conn.Close()
 		return
@@ -510,7 +540,7 @@ func (h *Handler) handleConnect(c *gin.Context) {
 }
 
 // sendCSTPConfig 发送CSTP配置响应
-func (h *Handler) sendCSTPConfig(conn net.Conn, user *models.User, dnsServers []string) error {
+func (h *Handler) sendCSTPConfig(conn net.Conn, user *models.User, dnsServers []string, clientCipherSuite string, clientMasterSecret string) error {
 	// 解析VPN网络配置
 	_, ipNet, err := net.ParseCIDR(h.config.VPN.Network)
 	if err != nil {
@@ -535,8 +565,17 @@ func (h *Handler) sendCSTPConfig(conn net.Conn, user *models.User, dnsServers []
 	response += "X-CSTP-Address: " + user.VPNIP + "\r\n"
 	response += "X-CSTP-Netmask: " + netmask + "\r\n"
 	response += "X-CSTP-MTU: " + strconv.Itoa(h.config.VPN.MTU) + "\r\n"
-	response += "X-CSTP-DPD: 30\r\n"
-	response += "X-CSTP-Keepalive: 20\r\n"
+	// 使用配置文件中的 DPD 和 Keepalive 值（如果未配置则使用默认值）
+	cstpDPD := h.config.VPN.CSTPDPD
+	if cstpDPD == 0 {
+		cstpDPD = 30 // 默认值
+	}
+	cstpKeepalive := h.config.VPN.CSTPKeepalive
+	if cstpKeepalive == 0 {
+		cstpKeepalive = 20 // 默认值
+	}
+	response += fmt.Sprintf("X-CSTP-DPD: %d\r\n", cstpDPD)
+	response += fmt.Sprintf("X-CSTP-Keepalive: %d\r\n", cstpKeepalive)
 	response += "X-CSTP-Session-Timeout: 2592000\r\n"
 	response += "X-CSTP-Idle-Timeout: 0\r\n"
 	if tunnelAllDNS {
@@ -545,6 +584,83 @@ func (h *Handler) sendCSTPConfig(conn net.Conn, user *models.User, dnsServers []
 		response += "X-CSTP-Tunnel-All-DNS: false\r\n"
 	}
 	response += "X-CSTP-Tunnel-All-Networks: false\r\n" // 使用split-tunnel模式
+
+	// 添加DTLS支持（如果启用）
+	if h.config.VPN.EnableDTLS {
+		// OpenConnect客户端需要看到DTLS相关头部才会尝试建立DTLS连接
+		// 需要设置以下头部：
+		// X-DTLS-Session-ID - DTLS会话ID（用于会话恢复）
+		// X-DTLS-Port - DTLS端口（UDP端口，通常与TCP端口相同）
+		// X-DTLS-DPD - DTLS死连接检测间隔（秒）
+		// X-DTLS-Keepalive - DTLS保活间隔（秒）
+		// X-DTLS12-CipherSuite - DTLS 1.2密码套件列表
+
+		// 生成DTLS Session ID（32字节，64个十六进制字符）
+		// 在初始连接时生成一个临时ID，客户端可以用它来恢复会话
+		sessionIDBytes := make([]byte, 32)
+		if _, err := rand.Read(sessionIDBytes); err != nil {
+			log.Printf("OpenConnect: Warning - Failed to generate DTLS session ID: %v", err)
+			// 如果生成失败，使用零值（客户端会进行新的握手）
+			sessionIDBytes = make([]byte, 32)
+		}
+		dtlsSessionID := hex.EncodeToString(sessionIDBytes)
+
+		// DTLS端口（使用与TCP相同的端口，但使用UDP协议）
+		dtlsPort := h.config.VPN.OpenConnectPort
+		if h.config.VPN.DTLSPort != "" && h.config.VPN.DTLSPort != h.config.VPN.OpenConnectPort {
+			// 如果配置了不同的DTLS端口，使用配置的端口
+			dtlsPort = h.config.VPN.DTLSPort
+		}
+
+		// DTLS DPD和Keepalive（使用与CSTP相同的值）
+		// 使用配置文件中的 DPD 和 Keepalive 值（如果未配置则使用默认值）
+		cstpDPD := h.config.VPN.CSTPDPD
+		if cstpDPD == 0 {
+			cstpDPD = 30 // 默认值
+		}
+		cstpKeepalive := h.config.VPN.CSTPKeepalive
+		if cstpKeepalive == 0 {
+			cstpKeepalive = 20 // 默认值
+		}
+		dtlsDPD := strconv.Itoa(cstpDPD)             // 与X-CSTP-DPD一致
+		dtlsKeepalive := strconv.Itoa(cstpKeepalive) // 与X-CSTP-Keepalive一致
+
+		// DTLS 密码套件（使用标准 TLS 密码套件名称）
+		// 使用 checkDtls12Ciphersuite 函数验证和选择客户端请求的密码套件
+		// 如果客户端请求了密码套件，验证并选择支持的密码套件；否则使用默认值（ECDHE-RSA-AES256-GCM-SHA384）
+		cipherSuiteHeader := checkDtls12Ciphersuite(clientCipherSuite)
+		// 记录密码套件配置
+		if clientCipherSuite != "" {
+			log.Printf("OpenConnect: DTLS cipher suites: %s (client requested: %s)", cipherSuiteHeader, clientCipherSuite)
+		} else {
+			log.Printf("OpenConnect: DTLS cipher suites: %s (using default)", cipherSuiteHeader)
+		}
+
+		response += "X-DTLS-Session-ID: " + dtlsSessionID + "\r\n"
+		response += "X-DTLS-Port: " + dtlsPort + "\r\n"
+		response += "X-DTLS-MTU: " + strconv.Itoa(h.config.VPN.MTU) + "\r\n" // DTLS MTU（与CSTP MTU相同）
+		response += "X-DTLS-DPD: " + dtlsDPD + "\r\n"
+		response += "X-DTLS-Keepalive: " + dtlsKeepalive + "\r\n"
+		response += "X-DTLS-CipherSuite: " + cipherSuiteHeader + "\r\n"   // DTLS 1.0/1.2 通用（单个短名称）
+		response += "X-DTLS12-CipherSuite: " + cipherSuiteHeader + "\r\n" // DTLS 1.2 专用（单个短名称）- 注意：必须使用连字符
+
+		// 如果客户端提供了 master secret，将其存储到 session store 中
+		// 这样在 DTLS 握手时可以使用它进行 session resumption
+		if clientMasterSecret != "" && h.dtlsSessionStore != nil {
+			if err := h.dtlsSessionStore.StoreMasterSecret(dtlsSessionID, clientMasterSecret); err != nil {
+				log.Printf("OpenConnect: Warning - Failed to store master secret: %v", err)
+			} else {
+				log.Printf("OpenConnect: Stored master secret for session ID: %s", dtlsSessionID)
+			}
+		}
+
+		log.Printf("OpenConnect: CSTP config - DTLS enabled:")
+		log.Printf("OpenConnect:   - Session ID: %s", dtlsSessionID)
+		log.Printf("OpenConnect:   - Port: %s (UDP)", dtlsPort)
+		log.Printf("OpenConnect:   - DPD: %s seconds", dtlsDPD)
+		log.Printf("OpenConnect:   - Keepalive: %s seconds", dtlsKeepalive)
+		log.Printf("OpenConnect:   - Cipher Suites: %s", cipherSuiteHeader)
+	}
 
 	// 添加DNS服务器
 	for _, dns := range dnsServers {
@@ -630,7 +746,7 @@ func (h *Handler) TunnelHandler(c *gin.Context) {
 }
 
 // StartDTLSServer 启动 DTLS UDP 服务器
-// 现在使用真正的 DTLS 实现（基于 pion/dtls，参考 anylink）
+// 使用真正的 DTLS 实现（基于 pion/dtls）
 func (h *Handler) StartDTLSServer() error {
 	return h.startRealDTLSServer()
 }

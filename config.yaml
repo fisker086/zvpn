@@ -21,7 +21,7 @@ vpn:
   # 网络配置
   interfacename: "zvpn0"
   network: "10.8.0.0/24"  # 使用与环境变量一致的网段
-  mtu: 1400
+  mtu: 1460
   ebpfinterfacename: "eth0"  # 指定eBPF程序要挂载的物理网卡（如eth0, ens33, enp0s3等）
   
   # SSL 证书配置
@@ -35,6 +35,10 @@ vpn:
   openconnectport: "443"        # HTTPS 端口（VPN 客户端连接）
   enabledtls: true               # 启用 DTLS (UDP) 加速
   dtlsport: "443"               # DTLS UDP 端口（与 TCP 保持一致）
+  
+  # CSTP/DTLS 连接保活配置
+  cstpdpd: 30                    # CSTP 死连接检测间隔（秒，默认：30）
+  cstpkeepalive: 20             # CSTP 保活间隔（秒，默认：20）
   
   # DNS拦截器和域名动态拆分隧道（DNS拦截器始终启用）
   dnsport: "53"                 # DNS服务器端口

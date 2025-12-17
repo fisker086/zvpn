@@ -56,12 +56,17 @@ func (s *Server) Start() error {
 
 	// 启动 DTLS UDP 服务器（如果启用）
 	if s.cfg.VPN.EnableDTLS {
+		log.Printf("========================================")
 		log.Printf("DTLS is enabled in config, attempting to start DTLS UDP server...")
+		log.Printf("DTLS will listen on UDP port: %s (same as TCP port)", s.cfg.VPN.OpenConnectPort)
 		if err := s.ocHandler.StartDTLSServer(); err != nil {
 			log.Printf("ERROR: Failed to start DTLS server: %v", err)
 			log.Printf("DTLS will be disabled. Clients will use SSL/TLS only.")
+			log.Printf("========================================")
 		} else {
 			log.Printf("DTLS UDP server started successfully")
+			log.Printf("DTLS is ready to accept connections on UDP port %s", s.cfg.VPN.OpenConnectPort)
+			log.Printf("========================================")
 		}
 	} else {
 		log.Printf("DTLS is disabled in config (enabledtls: false)")

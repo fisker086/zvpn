@@ -1000,7 +1000,7 @@ func (h *Handler) Authenticate(c *gin.Context) {
 		<cstp:idle-timeout>7200</cstp:idle-timeout>
 		<cstp:session-timeout>86400</cstp:session-timeout>
 
-		<!-- DTLS 配置（启用以提升性能） -->` + getDTLSConfig(h.config) + `
+		<!-- DTLS 配置（启用以提升性能） -->` + getDTLSConfig(h.config, c.Request.Host) + `
 
 		<!-- 心跳和保活 -->
 		<cstp:keepalive>20</cstp:keepalive>

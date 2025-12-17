@@ -270,10 +270,9 @@ func loadKernelModule(moduleName string) error {
 }
 
 // setupIPTablesNATLegacy configures NAT using iptables (fallback)
-// Reference: https://github.com/bjdgyc/anylink/blob/1963feffe3a9715a4a66c7f414decc57d9990463/server/handler/link_tun.go
 // natRuleExists indicates if NAT rule already exists (set by docker-entrypoint.sh)
 func setupIPTablesNATLegacy(vpnNetwork, egressInterface string, natRuleExists bool) error {
-	// Always load necessary kernel modules (like anylink does for Rocky Linux)
+	// Always load necessary kernel modules
 	// This is important for NAT to work correctly, especially in containers
 	// Even if rule exists, modules might not be loaded
 	log.Printf("NAT: 加载内核模块（iptables NAT 支持）...")
@@ -319,7 +318,7 @@ func setupIPTablesNATLegacy(vpnNetwork, egressInterface string, natRuleExists bo
 		log.Printf("NAT: 跳过添加 NAT masquerade 规则（docker-entrypoint.sh 已设置）")
 	}
 
-	// Add FORWARD chain rule to allow forwarding (like anylink)
+	// Add FORWARD chain rule to allow forwarding
 	// This is important for packets to be forwarded through the VPN
 	// Note: In Docker containers, FORWARD chain might have default DROP policy
 	forwardRule := []string{"-j", "ACCEPT"}

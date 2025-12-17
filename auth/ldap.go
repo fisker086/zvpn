@@ -85,11 +85,16 @@ func (l *LDAPAuthenticator) Authenticate(username, password string) (*LDAPUser, 
 	// 搜索用户
 	userDN, userInfo, err := l.searchUser(conn, username)
 	if err != nil {
+		log.Printf("LDAP: User search failed for username '%s' with filter '%s' in BaseDN '%s': %v",
+			username, l.config.UserFilter, l.config.BaseDN, err)
 		return nil, fmt.Errorf("user not found: %w", err)
 	}
 
+	log.Printf("LDAP: Found user '%s' with DN: %s", username, userDN)
+
 	// 使用用户凭据验证
 	if err := conn.Bind(userDN, password); err != nil {
+		log.Printf("LDAP: Authentication failed for user '%s' (DN: %s). Error: %v", username, userDN, err)
 		return nil, fmt.Errorf("invalid credentials: %w", err)
 	}
 
@@ -145,14 +150,34 @@ func (l *LDAPAuthenticator) Authenticate(username, password string) (*LDAPUser, 
 func (l *LDAPAuthenticator) connect() (*ldap.Conn, error) {
 	address := fmt.Sprintf("%s:%d", l.config.Host, l.config.Port)
 
+	var conn *ldap.Conn
+	var err error
+
 	if l.config.UseSSL {
+		// LDAPS (直接 TLS 连接，端口 636)
 		tlsConfig := &tls.Config{
 			InsecureSkipVerify: l.config.SkipTLSVerify,
+			ServerName:         l.config.Host, // 设置 SNI，某些服务器需要
 		}
-		return ldap.DialTLS("tcp", address, tlsConfig)
+		conn, err = ldap.DialTLS("tcp", address, tlsConfig)
+		if err != nil {
+			return nil, fmt.Errorf("failed to connect to LDAPS server %s: %w", address, err)
+		}
+	} else {
+		// 普通 LDAP 连接（端口 389）
+		conn, err = ldap.Dial("tcp", address)
+		if err != nil {
+			return nil, fmt.Errorf("failed to connect to LDAP server %s: %w", address, err)
+		}
 	}
 
-	return ldap.Dial("tcp", address)
+	// 设置 LDAP 版本（默认 v3，某些服务器可能需要显式设置）
+	conn.SetTimeout(ldap.DefaultTimeout)
+
+	// 注意：某些 LDAP 服务器可能需要 StartTLS，但目前代码使用直接的 LDAPS
+	// 如果需要 StartTLS，需要先 Dial，然后调用 StartTLS()
+
+	return conn, nil
 }
 
 // searchUser 搜索用户
@@ -189,16 +214,23 @@ func (l *LDAPAuthenticator) searchUser(conn *ldap.Conn, username string) (string
 		nil,
 	)
 
+	log.Printf("LDAP: Searching user '%s' with filter '%s' in BaseDN '%s'", username, filter, l.config.BaseDN)
 	result, err := conn.Search(searchRequest)
 	if err != nil {
+		log.Printf("LDAP: Search failed for user '%s': %v", username, err)
 		return "", nil, err
 	}
 
 	if len(result.Entries) == 0 {
+		log.Printf("LDAP: No user found matching filter '%s' in BaseDN '%s'", filter, l.config.BaseDN)
 		return "", nil, fmt.Errorf("user not found")
 	}
 
 	if len(result.Entries) > 1 {
+		log.Printf("LDAP: Multiple users found (%d) matching filter '%s':", len(result.Entries), filter)
+		for i, entry := range result.Entries {
+			log.Printf("LDAP:   [%d] DN: %s", i+1, entry.DN)
+		}
 		return "", nil, fmt.Errorf("multiple users found")
 	}
 
