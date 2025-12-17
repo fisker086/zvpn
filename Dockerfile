@@ -31,7 +31,7 @@ RUN dnf install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
         kernel-headers kernel-devel \
         zlib-devel \
         gcc gcc-c++ make git \
-        golang 
+        golang \
         glibc-devel.i686 || echo "32-bit glibc-devel not available, continuing..." && \
     update-ca-trust extract && \
     go version && \
