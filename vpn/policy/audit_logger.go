@@ -366,6 +366,15 @@ func (al *AuditLogger) LogAuthWithIP(userID uint, username string, action models
 	}
 
 	al.writeLog(auditLog)
+	
+	// For authentication events (especially failures), try to flush immediately
+	// This ensures critical auth logs are written even if the buffer hasn't reached threshold
+	// Use async flush to avoid blocking the authentication flow
+	go func() {
+		if err := al.Flush(); err != nil {
+			log.Printf("Failed to flush audit log for auth event (user: %s, action: %s, result: %s): %v", username, action, result, err)
+		}
+	}()
 }
 
 // writeLog writes audit log to database (with buffering for performance)
@@ -398,13 +407,23 @@ func (al *AuditLogger) Flush() error {
 		return nil
 	}
 
+	// Make a copy of the buffer to avoid holding the lock during database operation
+	logsToWrite := make([]models.AuditLog, len(al.buffer))
+	copy(logsToWrite, al.buffer)
+
 	// Batch insert
-	if err := database.DB.CreateInBatches(al.buffer, 100).Error; err != nil {
-		log.Printf("Failed to write audit logs: %v", err)
+	if err := database.DB.CreateInBatches(logsToWrite, 100).Error; err != nil {
+		log.Printf("Failed to write audit logs (%d entries): %v", len(logsToWrite), err)
+		// Don't clear buffer on error - keep logs for retry
+		// However, if buffer is getting too large, we need to prevent memory issues
+		if len(al.buffer) > al.bufSize*10 {
+			log.Printf("Warning: Audit log buffer is too large (%d entries), clearing to prevent memory issues", len(al.buffer))
+			al.buffer = al.buffer[:0]
+		}
 		return err
 	}
 
-	// Clear buffer
+	// Clear buffer only on success
 	al.buffer = al.buffer[:0]
 	return nil
 }

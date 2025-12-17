@@ -35,8 +35,8 @@ type User struct {
 	LDAPAttributes string `gorm:"type:text" json:"-"`        // LDAP原始属性JSON（不返回给API，用于扩展）
 
 	// VPN related
-	VPNIP     string     `json:"vpn_ip"`    // Assigned VPN IP
-	ClientIP  string     `json:"client_ip"` // Client's real IP
+	VPNIP     string     `gorm:"size:50" json:"-"`    // Assigned VPN IP (不返回给前端API，在线用户接口单独返回)
+	ClientIP  string     `gorm:"size:50" json:"-"`    // Client's real IP (不返回给前端API)
 	Connected bool       `gorm:"default:false" json:"connected"`
 	LastSeen  *time.Time `json:"last_seen"`
 

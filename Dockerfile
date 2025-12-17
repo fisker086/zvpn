@@ -31,19 +31,19 @@ RUN dnf install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
         kernel-headers kernel-devel \
         zlib-devel \
         gcc gcc-c++ make git \
-        golang \
+        golang 
         glibc-devel.i686 || echo "32-bit glibc-devel not available, continuing..." && \
     update-ca-trust extract && \
     go version && \
     dnf clean all && \
     rm -rf /var/cache/dnf /tmp/* /var/tmp/*
 
-        # 3. Go 代理设置（使用阿里云代理，更稳定且证书可靠）
-        # GOSUMDB 使用官方 sum.golang.org（证书更可靠）
-        ENV GOPROXY=https://mirrors.aliyun.com/goproxy/,direct \
-                GOSUMDB=sum.golang.org \
-                SSL_CERT_DIR=/etc/pki/ca-trust/extracted/pem \
-                SSL_CERT_FILE=/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
+# Go 代理设置（使用阿里云代理，更稳定且证书可靠）
+# GOSUMDB 使用官方 sum.golang.org（证书更可靠）
+ENV GOPROXY=https://mirrors.aliyun.com/goproxy/,direct \
+        GOSUMDB=sum.golang.org \
+        SSL_CERT_DIR=/etc/pki/ca-trust/extracted/pem \
+        SSL_CERT_FILE=/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
 
 WORKDIR /app
 COPY go.mod go.sum ./

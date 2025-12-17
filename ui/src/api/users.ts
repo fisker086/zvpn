@@ -7,6 +7,7 @@ export interface User {
   full_name?: string  // 中文名/全名（LDAP用户有，系统账户可选）
   is_admin: boolean
   is_active: boolean
+  source?: string  // system 或 ldap
   vpn_ip?: string
   connected: boolean
   groups?: Array<{
@@ -32,6 +33,7 @@ export interface UpdateUserRequest {
   is_admin?: boolean
   is_active?: boolean
   group_ids?: number[] // 更新用户组（必须至少一个）
+  password?: string    // 密码（可选，留空则不修改）
 }
 
 export const usersApi = {

@@ -23,6 +23,7 @@
             :placeholder="ldapEnabled ? '请输入 LDAP 用户名' : '请输入用户名'"
             size="large"
             allow-clear
+            autocomplete="username"
           >
             <template #prefix>
               <icon-user />
@@ -45,6 +46,7 @@
             :placeholder="ldapEnabled ? '请输入 LDAP 密码或系统账户密码' : '请输入密码'"
             size="large"
             allow-clear
+            autocomplete="current-password"
             @press-enter="handleSubmit"
           >
             <template #prefix>
@@ -103,19 +105,110 @@ const checkLDAPStatus = async () => {
   }
 }
 
-const handleSubmit = async () => {
+const handleSubmit = async (data?: any, e?: Event | any) => {
+  // Arco Design 表单提交时，第一个参数是验证后的表单数据，第二个参数可能是事件对象
+  // 阻止表单默认提交行为，避免页面刷新
+  if (e && typeof e.preventDefault === 'function') {
+    e.preventDefault()
+  }
+  
+  // 如果第一个参数是事件对象（某些情况下），也尝试阻止默认行为
+  if (data && typeof data.preventDefault === 'function') {
+    data.preventDefault()
+  }
+  
   if (!formData.username || !formData.password) {
     Message.warning('请输入用户名和密码')
-    return
+    return false
   }
 
   loading.value = true
   try {
     await authStore.login(formData)
     Message.success('登录成功')
-    router.push('/')
+    // 使用 nextTick 确保消息显示后再跳转
+    setTimeout(() => {
+      router.push('/')
+    }, 300)
   } catch (error: any) {
-    Message.error(error.response?.data?.error || '登录失败')
+    // 详细错误处理，确保用户能看到具体的错误信息
+    console.error('Login error details:', {
+      error,
+      response: error?.response,
+      status: error?.response?.status,
+      data: error?.response?.data,
+      message: error?.message,
+      config: error?.config,
+    })
+    
+    let errorMessage = '登录失败，请检查用户名和密码'
+    
+    // 优先从响应数据中获取错误信息
+    if (error?.response?.data) {
+      const data = error.response.data
+      
+      // 尝试多种可能的错误信息字段
+      if (typeof data === 'string') {
+        errorMessage = data
+      } else if (data.error) {
+        errorMessage = String(data.error)
+      } else if (data.message) {
+        errorMessage = String(data.message)
+      } else if (data.msg) {
+        errorMessage = String(data.msg)
+      } else if (data.detail) {
+        errorMessage = String(data.detail)
+      } else {
+        // 如果都没有，根据状态码显示友好的错误信息
+        const status = error.response.status
+        switch (status) {
+          case 400:
+            errorMessage = '请求参数错误，请检查用户名和密码格式'
+            break
+          case 401:
+            errorMessage = '用户名或密码错误，请重试'
+            break
+          case 403:
+            errorMessage = '账户已被禁用，请联系管理员'
+            break
+          case 404:
+            errorMessage = '用户不存在'
+            break
+          case 429:
+            errorMessage = '登录尝试次数过多，请稍后再试'
+            break
+          case 500:
+          case 502:
+          case 503:
+            errorMessage = '服务器错误，请稍后重试'
+            break
+          default:
+            errorMessage = `登录失败 (错误代码: ${status})`
+        }
+      }
+    } else if (error?.message) {
+      // 网络错误或其他错误
+      if (error.message.includes('timeout')) {
+        errorMessage = '请求超时，请检查网络连接'
+      } else if (error.message.includes('Network Error')) {
+        errorMessage = '网络连接失败，请检查网络设置'
+      } else {
+        errorMessage = `登录失败: ${error.message}`
+      }
+    } else if (typeof error === 'string') {
+      errorMessage = error
+    }
+    
+    // 确保错误消息一定会显示（使用 setTimeout 确保在下一个事件循环中显示）
+    setTimeout(() => {
+      Message.error({
+        content: errorMessage,
+        duration: 5000, // 显示5秒，让用户有足够时间看到
+      })
+    }, 100)
+    
+    // 确保不会刷新页面
+    return false
   } finally {
     loading.value = false
   }

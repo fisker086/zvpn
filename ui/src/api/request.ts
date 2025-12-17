@@ -57,14 +57,30 @@ service.interceptors.response.use(
     return response.data
   },
   (error) => {
+    // 检查是否是登录请求（通过请求URL判断）
+    const isLoginRequest = error.config?.url?.includes('/auth/login') || error.config?.url === '/auth/login'
+    // 检查是否在登录页面
+    const isLoginPage = window.location.pathname === '/login' || window.location.pathname === '/login/'
+    
     if (error.response?.status === 401) {
-      // Token 过期，跳转到登录页
+      // 如果是登录请求失败，不要跳转，让登录页面自己处理错误
+      if (isLoginRequest || isLoginPage) {
+        // 登录失败，不显示错误（由登录页面处理），也不跳转
+        return Promise.reject(error)
+      }
+      // Token 过期，跳转到登录页（非登录请求的401错误）
       localStorage.removeItem('token')
-      window.location.href = '/login'
-      Message.error('登录已过期，请重新登录')
+      // 使用 router 跳转而不是 window.location，避免页面刷新
+      if (window.location.pathname !== '/login') {
+        window.location.href = '/login'
+        Message.error('登录已过期，请重新登录')
+      }
     } else {
-      const message = error.response?.data?.error || error.message || '请求失败'
-      Message.error(message)
+      // 非登录请求的错误才在这里显示（登录请求的错误由登录组件自己处理）
+      if (!isLoginRequest && !isLoginPage) {
+        const message = error.response?.data?.error || error.response?.data?.message || error.message || '请求失败'
+        Message.error(message)
+      }
     }
     return Promise.reject(error)
   }

@@ -194,9 +194,12 @@ func Init(cfg *config.Config) error {
 	}
 
 	// Create default admin user if not exists
+	// 注意：只有当系统中没有任何管理员用户时才会创建默认admin用户
+	// 如果admin用户已存在，不会重置其密码，确保用户修改的密码不会被覆盖
 	var adminCount int64
 	DB.Model(&models.User{}).Where("is_admin = ?", true).Count(&adminCount)
 	if adminCount == 0 {
+		log.Printf("No admin user found, creating default admin user")
 		// 创建默认管理员用户组
 		var adminGroup models.UserGroup
 		var groupCount int64
@@ -236,6 +239,8 @@ func Init(cfg *config.Config) error {
 			}
 			log.Println("Default admin user created: admin/admin123")
 		}
+	} else {
+		log.Printf("Admin user already exists (%d admin users found), skipping default admin creation to preserve existing passwords", adminCount)
 	}
 
 	// Create default system settings if not exists

@@ -11,8 +11,8 @@ import (
 	"github.com/fisker/zvpn/auth"
 	"github.com/fisker/zvpn/database"
 	"github.com/fisker/zvpn/models"
-	"github.com/go-ldap/ldap/v3"
 	"github.com/gin-gonic/gin"
+	"github.com/go-ldap/ldap/v3"
 	"gorm.io/gorm"
 )
 
@@ -70,7 +70,7 @@ func saveLDAPConfig(config *models.LDAPConfig) error {
 func convertToAuthLDAPConfig(config *models.LDAPConfig) *auth.LDAPConfig {
 	// 获取属性映射配置
 	mapping := config.GetAttributeMapping()
-	
+
 	return &auth.LDAPConfig{
 		Enabled:       config.Enabled,
 		Host:          config.Host,
@@ -101,18 +101,18 @@ func (h *LDAPConfigHandler) GetLDAPConfig(c *gin.Context) {
 
 	// 不返回密码字段
 	response := gin.H{
-		"id":             config.ID,
-		"enabled":        config.Enabled,
-		"host":           config.Host,
-		"port":           config.Port,
-		"use_ssl":        config.UseSSL,
-		"bind_dn":        config.BindDN,
-		"base_dn":        config.BaseDN,
-		"user_filter":    config.UserFilter,
-		"admin_group":    config.AdminGroup,
+		"id":              config.ID,
+		"enabled":         config.Enabled,
+		"host":            config.Host,
+		"port":            config.Port,
+		"use_ssl":         config.UseSSL,
+		"bind_dn":         config.BindDN,
+		"base_dn":         config.BaseDN,
+		"user_filter":     config.UserFilter,
+		"admin_group":     config.AdminGroup,
 		"skip_tls_verify": config.SkipTLSVerify,
-		"created_at":     config.CreatedAt,
-		"updated_at":     config.UpdatedAt,
+		"created_at":      config.CreatedAt,
+		"updated_at":      config.UpdatedAt,
 	}
 
 	c.JSON(http.StatusOK, response)
@@ -184,18 +184,18 @@ func (h *LDAPConfigHandler) UpdateLDAPConfig(c *gin.Context) {
 
 	// 返回更新后的配置（不包含密码）
 	response := gin.H{
-		"id":               config.ID,
-		"enabled":          config.Enabled,
-		"host":             config.Host,
-		"port":             config.Port,
-		"use_ssl":          config.UseSSL,
-		"bind_dn":          config.BindDN,
-		"base_dn":          config.BaseDN,
-		"user_filter":      config.UserFilter,
-		"admin_group":      config.AdminGroup,
-		"skip_tls_verify":  config.SkipTLSVerify,
+		"id":                config.ID,
+		"enabled":           config.Enabled,
+		"host":              config.Host,
+		"port":              config.Port,
+		"use_ssl":           config.UseSSL,
+		"bind_dn":           config.BindDN,
+		"base_dn":           config.BaseDN,
+		"user_filter":       config.UserFilter,
+		"admin_group":       config.AdminGroup,
+		"skip_tls_verify":   config.SkipTLSVerify,
 		"attribute_mapping": config.AttributeMapping,
-		"updated_at":       config.UpdatedAt,
+		"updated_at":        config.UpdatedAt,
 	}
 
 	c.JSON(http.StatusOK, response)
@@ -374,13 +374,13 @@ func (h *LDAPConfigHandler) TestLDAPAuth(c *gin.Context) {
 		filter = strings.ReplaceAll(filter, "{0}", escapedUsername)
 	} else if strings.Contains(filter, "%s") {
 		filter = fmt.Sprintf(filter, escapedUsername)
-		} else {
-			c.JSON(http.StatusBadRequest, gin.H{
-				"success": false,
-				"error":   fmt.Sprintf("UserFilter格式错误：必须包含 %%s 或 {0} 占位符，当前值: %s", config.UserFilter),
-			})
-			return
-		}
+	} else {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"success": false,
+			"error":   fmt.Sprintf("UserFilter格式错误：必须包含 %%s 或 {0} 占位符，当前值: %s", config.UserFilter),
+		})
+		return
+	}
 
 	// 获取属性映射配置
 	mapping := config.GetAttributeMapping()
@@ -396,12 +396,12 @@ func (h *LDAPConfigHandler) TestLDAPAuth(c *gin.Context) {
 	if memberOfAttr == "" {
 		memberOfAttr = "memberOf"
 	}
-	
+
 	// 构建属性列表（包含配置的属性以及常见的fallback属性）
 	attributes := []string{"dn", "cn", emailAttr, fullNameAttr, memberOfAttr}
 	// 添加常见的fallback属性
 	attributes = append(attributes, "uid", "sAMAccountName")
-	
+
 	// 搜索用户
 	searchRequest := ldap.NewSearchRequest(
 		config.BaseDN,
@@ -478,18 +478,18 @@ func (h *LDAPConfigHandler) TestLDAPAuth(c *gin.Context) {
 		fullName = userInfo.GetAttributeValue("cn")
 	}
 
-		c.JSON(http.StatusOK, gin.H{
-			"success": true,
-			"message": fmt.Sprintf("用户认证成功%s", adminInfo),
-			"user": gin.H{
-				"dn":        userDN,
-				"username":  req.Username,
-				"email":     email,
-				"full_name": fullName,
-				"is_admin":  isAdmin,
-			},
-		})
-	}
+	c.JSON(http.StatusOK, gin.H{
+		"success": true,
+		"message": fmt.Sprintf("用户认证成功%s", adminInfo),
+		"user": gin.H{
+			"dn":        userDN,
+			"username":  req.Username,
+			"email":     email,
+			"full_name": fullName,
+			"is_admin":  isAdmin,
+		},
+	})
+}
 
 // SyncLDAPUsers 同步 LDAP 用户到本地数据库
 func (h *LDAPConfigHandler) SyncLDAPUsers(c *gin.Context) {
@@ -547,7 +547,7 @@ func (h *LDAPConfigHandler) SyncLDAPUsers(c *gin.Context) {
 	// 确保默认用户组存在
 	var defaultGroup models.UserGroup
 	var adminGroup models.UserGroup
-	
+
 	// 查找或创建 default 组
 	if err := database.DB.Where("name = ?", "default").First(&defaultGroup).Error; err != nil {
 		var defaultPolicy models.Policy
@@ -561,7 +561,7 @@ func (h *LDAPConfigHandler) SyncLDAPUsers(c *gin.Context) {
 			}
 		}
 	}
-	
+
 	// 查找 admin 组（如果不存在则跳过，不影响普通用户分配）
 	if err := database.DB.Where("name = ?", "admin").First(&adminGroup).Error; err != nil {
 		log.Printf("Warning: Admin group not found, admin users will be assigned to default group")
@@ -577,7 +577,7 @@ func (h *LDAPConfigHandler) SyncLDAPUsers(c *gin.Context) {
 	if len(usernames) > 0 {
 		database.DB.Where("username IN ?", usernames).Find(&existingUsers)
 	}
-	
+
 	// 建立用户名到用户的映射
 	existingUserMap := make(map[string]*models.User)
 	for i := range existingUsers {
@@ -588,8 +588,8 @@ func (h *LDAPConfigHandler) SyncLDAPUsers(c *gin.Context) {
 	var usersToCreate []models.User
 	var usersToUpdate []models.User
 	userGroupMap := make(map[string]*models.UserGroup) // 记录每个用户应该分配的用户组
-	
-		for _, ldapUser := range ldapUsers {
+
+	for _, ldapUser := range ldapUsers {
 		if existingUser, exists := existingUserMap[ldapUser.Username]; exists {
 			// 用户已存在，检查是否需要更新
 			needsUpdate := false
@@ -628,7 +628,7 @@ func (h *LDAPConfigHandler) SyncLDAPUsers(c *gin.Context) {
 			if needsUpdate {
 				usersToUpdate = append(usersToUpdate, *existingUser)
 			}
-			
+
 			// 确定用户组
 			groupToAssign := &defaultGroup
 			if ldapUser.IsAdmin && adminGroup.ID > 0 {
@@ -638,13 +638,13 @@ func (h *LDAPConfigHandler) SyncLDAPUsers(c *gin.Context) {
 		} else {
 			// 用户不存在，准备创建
 			user := models.User{
-				Username:  ldapUser.Username,
-				Email:     ldapUser.Email,
-				IsAdmin:   ldapUser.IsAdmin,
-				IsActive:  true,
-				Source:    models.UserSourceLDAP, // 标记为LDAP用户
-				LDAPDN:    ldapUser.DN,
-				FullName:  ldapUser.FullName,
+				Username: ldapUser.Username,
+				Email:    ldapUser.Email,
+				IsAdmin:  ldapUser.IsAdmin,
+				IsActive: true,
+				Source:   models.UserSourceLDAP, // 标记为LDAP用户
+				LDAPDN:   ldapUser.DN,
+				FullName: ldapUser.FullName,
 				// PasswordHash 留空，LDAP用户不需要存储密码（认证由LDAP服务器完成）
 			}
 			// 序列化LDAP原始属性为JSON（用于扩展）
@@ -654,7 +654,7 @@ func (h *LDAPConfigHandler) SyncLDAPUsers(c *gin.Context) {
 				}
 			}
 			usersToCreate = append(usersToCreate, user)
-			
+
 			// 确定用户组
 			groupToAssign := &defaultGroup
 			if ldapUser.IsAdmin && adminGroup.ID > 0 {
@@ -669,7 +669,7 @@ func (h *LDAPConfigHandler) SyncLDAPUsers(c *gin.Context) {
 	errorCount := 0
 	var errors []string
 	var createdUsernames []string // 记录成功创建的用户名，用于后续组分配
-	
+
 	if len(usersToCreate) > 0 {
 		// 使用 CreateInBatches 批量插入（每批100条）
 		// GORM的CreateInBatches会自动填充ID字段
@@ -689,9 +689,11 @@ func (h *LDAPConfigHandler) SyncLDAPUsers(c *gin.Context) {
 	// 批量更新已存在的用户
 	updatedCount := 0
 	if len(usersToUpdate) > 0 {
-		// 使用 Save 批量更新（GORM会自动批量处理）
+		// 使用 Select 明确指定只更新 LDAP 相关字段，避免覆盖其他字段
+		// 注意：LDAP用户的密码会被清空（password_hash = ""），因为密码存储在LDAP服务器中
+		updateFields := []string{"source", "password_hash", "email", "is_admin", "ldap_dn", "full_name", "ldap_attributes", "updated_at"}
 		for _, user := range usersToUpdate {
-			if err := database.DB.Save(&user).Error; err != nil {
+			if err := database.DB.Model(&user).Select(updateFields).Updates(user).Error; err != nil {
 				errorCount++
 				errors = append(errors, fmt.Sprintf("用户 %s: 更新失败: %v", user.Username, err))
 				log.Printf("Warning: Failed to update user %s: %v", user.Username, err)
@@ -710,14 +712,14 @@ func (h *LDAPConfigHandler) SyncLDAPUsers(c *gin.Context) {
 		})
 		return
 	}
-	
+
 	// 重新查询所有需要分配组的用户（包括新创建和已存在的）
 	// 这样可以确保获取到新创建用户的ID
 	var allUsers []models.User
 	if len(usernames) > 0 {
 		database.DB.Where("username IN ?", usernames).Find(&allUsers)
 	}
-	
+
 	// 建立用户ID到用户组的映射
 	userGroupAssignments := make(map[uint]*models.UserGroup)
 	for _, user := range allUsers {
@@ -741,7 +743,7 @@ func (h *LDAPConfigHandler) SyncLDAPUsers(c *gin.Context) {
 				tx.Rollback()
 			}
 		}()
-		
+
 		// 检查每个用户是否已经有组，如果没有则添加
 		for userID, group := range userGroupAssignments {
 			var user models.User
@@ -749,7 +751,7 @@ func (h *LDAPConfigHandler) SyncLDAPUsers(c *gin.Context) {
 				log.Printf("Warning: User with ID %d not found for group assignment", userID)
 				continue
 			}
-			
+
 			// 检查用户是否已经有组
 			// Count() 方法返回 int64，不是 error
 			groupCount := tx.Model(&user).Association("Groups").Count()
@@ -762,7 +764,7 @@ func (h *LDAPConfigHandler) SyncLDAPUsers(c *gin.Context) {
 				}
 			}
 		}
-		
+
 		if !hasError {
 			if err := tx.Commit().Error; err != nil {
 				log.Printf("Error committing user group assignments: %v", err)
@@ -782,11 +784,10 @@ func (h *LDAPConfigHandler) SyncLDAPUsers(c *gin.Context) {
 		"updated": updatedCount,
 		"errors":  errorCount,
 	}
-	
+
 	if len(errors) > 0 {
 		response["error_details"] = errors
 	}
 
 	c.JSON(http.StatusOK, response)
 }
-

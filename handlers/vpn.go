@@ -127,9 +127,10 @@ func (h *VPNHandler) Connect(c *gin.Context) {
 	}
 
 	// Update user with VPN IP
+	// 使用 Select 明确指定只更新 VPN 相关字段，避免覆盖密码
 	user.VPNIP = vpnIP.String()
 	user.Connected = true
-	if err := database.DB.Save(&user).Error; err != nil {
+	if err := database.DB.Model(&user).Select("vpn_ip", "connected", "updated_at").Updates(user).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save user"})
 		return
 	}
@@ -211,10 +212,11 @@ func (h *VPNHandler) Disconnect(c *gin.Context) {
 	}
 
 	// Update user status
+	// 使用 Select 明确指定只更新 VPN 相关字段，避免覆盖密码
 	user.Connected = false
 	releaseIP := user.VPNIP
 	user.VPNIP = ""
-	if err := database.DB.Save(&user).Error; err != nil {
+	if err := database.DB.Model(&user).Select("connected", "vpn_ip", "updated_at").Updates(user).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update user"})
 		return
 	}

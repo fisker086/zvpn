@@ -2,11 +2,11 @@ package handlers
 
 import (
 	"encoding/base64"
+	"fmt"
 	"image/png"
+	"log"
 	"net/http"
 	"strings"
-
-	"fmt"
 
 	"github.com/fisker/zvpn/config"
 	"github.com/fisker/zvpn/database"
@@ -38,6 +38,7 @@ type UpdateUserRequest struct {
 	FullName string `json:"full_name"` // 中文名/全名（可选）
 	IsActive bool   `json:"is_active"`
 	GroupIDs []uint `json:"group_ids"` // 更新用户组
+	Password string `json:"password"`  // 密码（可选，留空则不修改）
 }
 
 func (h *UserHandler) ListUsers(c *gin.Context) {
@@ -178,7 +179,31 @@ func (h *UserHandler) UpdateUser(c *gin.Context) {
 	}
 	// 如果没有提供用户组字段（nil），保持原有用户组不变
 
-	if err := database.DB.Save(&user).Error; err != nil {
+	// 处理密码更新（如果提供了密码字段）
+	updatePassword := false
+	if req.Password != "" {
+		// 检查是否是LDAP用户
+		if user.Source == models.UserSourceLDAP {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Cannot change password for LDAP user. Password is managed by LDAP server."})
+			return
+		}
+
+		// 设置新密码
+		if err := user.SetPassword(req.Password); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
+			return
+		}
+		updatePassword = true
+		log.Printf("UpdateUser: Password will be updated for user '%s'", user.Username)
+	}
+
+	// 使用 Select 明确指定要更新的字段
+	// 如果更新密码，则包含 password_hash；否则排除 password_hash，避免密码被覆盖
+	updateFields := []string{"email", "full_name", "is_active", "updated_at"}
+	if updatePassword {
+		updateFields = append(updateFields, "password_hash")
+	}
+	if err := database.DB.Model(&user).Select(updateFields).Updates(user).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -285,26 +310,60 @@ func (h *UserHandler) ChangePassword(c *gin.Context) {
 		Password string `json:"password" binding:"required"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
+		log.Printf("ChangePassword: Invalid request for user ID %s: %v", id, err)
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
 	var user models.User
 	if err := database.DB.First(&user, id).Error; err != nil {
+		log.Printf("ChangePassword: User ID %s not found: %v", id, err)
 		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 		return
 	}
 
+	log.Printf("ChangePassword: Changing password for user '%s' (ID: %d, Source: %s)", user.Username, user.ID, user.Source)
+
+	// 检查是否是LDAP用户
+	if user.Source == models.UserSourceLDAP {
+		log.Printf("ChangePassword: Cannot change password for LDAP user '%s' (password is managed by LDAP server)", user.Username)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Cannot change password for LDAP user. Password is managed by LDAP server."})
+		return
+	}
+
+	// 保存旧密码哈希长度用于日志
+	oldPasswordHashLen := len(user.PasswordHash)
+
 	if err := user.SetPassword(req.Password); err != nil {
+		log.Printf("ChangePassword: Failed to hash password for user '%s': %v", user.Username, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
 		return
 	}
 
-	if err := database.DB.Save(&user).Error; err != nil {
+	log.Printf("ChangePassword: Password hashed successfully for user '%s' (old hash length: %d, new hash length: %d)",
+		user.Username, oldPasswordHashLen, len(user.PasswordHash))
+
+	// 使用 Select 明确指定只更新 password_hash 字段，避免其他字段被覆盖
+	// 这样可以确保密码修改不会影响其他字段
+	if err := database.DB.Model(&user).Select("password_hash", "updated_at").Updates(user).Error; err != nil {
+		log.Printf("ChangePassword: Failed to save password for user '%s': %v", user.Username, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
+	// 验证密码是否真的被更新了
+	var verifyUser models.User
+	if err := database.DB.Select("password_hash").First(&verifyUser, user.ID).Error; err == nil {
+		if verifyUser.PasswordHash == user.PasswordHash {
+			log.Printf("ChangePassword: Password verified successfully for user '%s' (hash length: %d)",
+				user.Username, len(verifyUser.PasswordHash))
+		} else {
+			log.Printf("ChangePassword: WARNING - Password hash mismatch for user '%s' (expected length: %d, actual length: %d)",
+				user.Username, len(user.PasswordHash), len(verifyUser.PasswordHash))
+		}
+	}
+
+	log.Printf("ChangePassword: Password changed successfully for user '%s'", user.Username)
 	c.JSON(http.StatusOK, gin.H{"message": "Password changed"})
 }
 
@@ -363,9 +422,10 @@ func (h *UserHandler) GenerateOTP(c *gin.Context) {
 	qrCode := buf.String()
 
 	// 保存OTP密钥到用户
+	// 使用 Select 明确指定只更新 OTP 相关字段，避免覆盖密码
 	user.OTPSecret = secret
 	user.OTPEnabled = true
-	if err := database.DB.Save(&user).Error; err != nil {
+	if err := database.DB.Model(&user).Select("otp_secret", "otp_enabled", "updated_at").Updates(user).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save OTP secret"})
 		return
 	}
@@ -409,9 +469,10 @@ func (h *UserHandler) DisableOTP(c *gin.Context) {
 	}
 
 	// 清除OTP密钥并禁用
+	// 使用 Select 明确指定只更新 OTP 相关字段，避免覆盖密码
 	user.OTPSecret = ""
 	user.OTPEnabled = false
-	if err := database.DB.Save(&user).Error; err != nil {
+	if err := database.DB.Model(&user).Select("otp_secret", "otp_enabled", "updated_at").Updates(user).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to disable OTP"})
 		return
 	}

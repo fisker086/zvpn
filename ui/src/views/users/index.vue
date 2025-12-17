@@ -67,11 +67,10 @@
             />
           </template>
 
-          <template #vpn_ip="{ record }">
-            <a-tag v-if="record.vpn_ip" color="arcoblue">
-              {{ record.vpn_ip }}
-            </a-tag>
-            <span v-else class="text-secondary">-</span>
+          <template #source="{ record }">
+            <a-tag v-if="record.source === 'ldap'" color="purple">LDAP</a-tag>
+            <a-tag v-else-if="record.source === 'system'" color="blue">系统</a-tag>
+            <a-tag v-else color="gray">{{ record.source || '系统' }}</a-tag>
           </template>
 
           <template #groups="{ record }">
@@ -135,8 +134,19 @@
         <a-form-item label="密码" :required="!isEdit">
           <a-input-password
             v-model="formData.password"
-            placeholder="请输入密码"
+            :placeholder="isEdit ? '留空则不修改密码' : '请输入密码'"
+            :disabled="isEdit && currentUser?.source === 'ldap'"
           />
+          <template #extra v-if="isEdit && currentUser?.source === 'ldap'">
+            <a-typography-text type="secondary" style="font-size: 12px">
+              LDAP用户的密码由LDAP服务器管理，无法在此修改
+            </a-typography-text>
+          </template>
+          <template #extra v-else-if="isEdit">
+            <a-typography-text type="secondary" style="font-size: 12px">
+              留空则不修改密码，填写新密码将更新用户密码
+            </a-typography-text>
+          </template>
         </a-form-item>
 
         <a-form-item label="邮箱">
@@ -359,10 +369,11 @@ const columns = [
     align: 'center',
   },
   {
-    title: 'VPN IP',
-    slotName: 'vpn_ip',
-    width: 150,
+    title: '来源',
+    slotName: 'source',
+    width: 100,
     align: 'center',
+    tooltip: '用户来源：系统账户或LDAP用户',
   },
   {
     title: '用户组',
@@ -421,6 +432,7 @@ const handleEdit = async (record: User) => {
   formData.full_name = record.full_name || ''
   formData.is_admin = record.is_admin
   formData.is_active = record.is_active
+  formData.password = '' // 编辑时清空密码字段，如果用户需要修改密码，需要填写新密码
   formData.group_ids = record.groups?.map(g => g.id) || []
   if (formData.group_ids.length === 0) {
     Message.warning('该用户未分配用户组，请先分配用户组')
@@ -470,16 +482,32 @@ const handleSubmit = async () => {
   submitLoading.value = true
   try {
     if (isEdit.value && currentUser.value) {
-      // 更新用户基本信息（包括用户组）
-      await usersApi.update(currentUser.value.id, {
+      // 如果填写了密码，验证密码强度
+      if (formData.password && formData.password.trim() !== '' && currentUser.value.source !== 'ldap') {
+        const passwordCheck = validatePasswordStrength(formData.password)
+        if (!passwordCheck.valid) {
+          Message.warning(passwordCheck.message)
+          submitLoading.value = false
+          return
+        }
+      }
+      
+      // 更新用户信息（包括密码，如果提供了）
+      const updateData: UpdateUserRequest = {
         email: formData.email,
         full_name: formData.full_name || undefined,
         is_admin: formData.is_admin,
         is_active: formData.is_active,
         group_ids: formData.group_ids,
-      })
+      }
       
-      Message.success('更新成功')
+      // 如果填写了密码，且不是LDAP用户，则添加到更新数据中
+      if (formData.password && formData.password.trim() !== '' && currentUser.value.source !== 'ldap') {
+        updateData.password = formData.password
+      }
+      
+      await usersApi.update(currentUser.value.id, updateData)
+      Message.success(updateData.password ? '用户信息和密码已更新' : '更新成功')
     } else {
       // 创建用户（必须指定用户组）
       await usersApi.create({
