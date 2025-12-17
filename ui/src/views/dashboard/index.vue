@@ -90,6 +90,9 @@ const currentMetrics = ref<SystemMetrics>({
   mem_total_bytes: 0, mem_used_bytes: 0, mem_free_bytes: 0,
   swap_total_bytes: 0, swap_used_bytes: 0,
   tx_bytes: 0, rx_bytes: 0, interface: '',
+  interface_ok: false,
+  timestamp: Date.now(),
+  interval_sec: 0,
 })
 
 const loadChartRef = ref<HTMLElement | null>(null)

@@ -554,7 +554,7 @@
 import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
 import { usePermission } from '@/composables/usePermission'
 
-const { canCreate, canEdit, canDelete } = usePermission()
+const { canCreate, canEdit } = usePermission()
 import {
   hooksApi,
   type Hook,
@@ -567,7 +567,7 @@ import {
   HookType,
 } from '@/api/hooks'
 import { usersApi, type User } from '@/api/users'
-import { Message, Modal, Tooltip } from '@arco-design/web-vue'
+import { Message, Modal } from '@arco-design/web-vue'
 import {
   IconPlus,
   IconCode,
@@ -721,19 +721,23 @@ const filteredHooks = computed(() => {
 })
 
 const getTypeColor = (type: HookType) => {
-  const colors: Record<HookType, string> = {
+  const colors: Partial<Record<HookType, string>> = {
     [HookType.ACL]: 'blue',
     [HookType.PortFilter]: 'green',
     [HookType.UserPolicy]: 'purple',
+    [HookType.TimeRestriction]: 'orange',
+    [HookType.Custom]: 'gray',
   }
   return colors[type] || 'gray'
 }
 
 const getTypeLabel = (type: HookType) => {
-  const labels: Record<HookType, string> = {
+  const labels: Partial<Record<HookType, string>> = {
     [HookType.ACL]: 'ACL',
     [HookType.PortFilter]: '端口过滤',
     [HookType.UserPolicy]: '用户策略',
+    [HookType.TimeRestriction]: '时间限制',
+    [HookType.Custom]: '自定义',
   }
   return labels[type] || type
 }
@@ -753,18 +757,20 @@ const getCurrentHookScenarios = () => {
 }
 
 const getActionColor = (action: PolicyAction) => {
-  const colors = {
+  const colors: Partial<Record<PolicyAction, string>> = {
     [PolicyAction.Allow]: 'green',
     [PolicyAction.Deny]: 'red',
+    [PolicyAction.Redirect]: 'orange',
     [PolicyAction.Log]: 'blue',
   }
   return colors[action] || 'gray'
 }
 
 const getActionLabel = (action: PolicyAction) => {
-  const labels = {
+  const labels: Partial<Record<PolicyAction, string>> = {
     [PolicyAction.Allow]: '允许',
     [PolicyAction.Deny]: '拒绝',
+    [PolicyAction.Redirect]: '重定向',
     [PolicyAction.Log]: '记录',
   }
   return labels[action] || ''
@@ -900,7 +906,7 @@ const handleSubmit = async () => {
       })
       Message.success('更新成功')
     } else {
-      const newHook = await hooksApi.create({
+      await hooksApi.create({
         name: formData.name,
         hook_point: formData.hook_point,
         priority: formData.priority,
@@ -1025,8 +1031,8 @@ const formatRule = (rule: any): HookRule => {
         if (part.includes('-')) {
           // 端口范围：8000-9000
           const [startStr, endStr] = part.split('-').map(s => s.trim())
-          const start = parseInt(startStr, 10)
-          const end = parseInt(endStr, 10)
+          const start = parseInt(startStr || '0', 10)
+          const end = parseInt(endStr || '0', 10)
           if (!isNaN(start) && !isNaN(end) && start > 0 && end > 0 && start <= end && start <= 65535 && end <= 65535) {
             ranges.push({ start, end })
           }

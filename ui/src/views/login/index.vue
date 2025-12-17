@@ -146,12 +146,18 @@ const handleSubmit = async (data?: any, e?: Event | any) => {
     // 优先从响应数据中获取错误信息
     if (error?.response?.data) {
       const data = error.response.data
+      const status = error.response.status
       
       // 尝试多种可能的错误信息字段
       if (typeof data === 'string') {
         errorMessage = data
       } else if (data.error) {
         errorMessage = String(data.error)
+        
+        // 如果是401错误且包含剩余尝试次数，补充显示
+        if (status === 401 && data.remaining_attempts !== undefined) {
+          errorMessage += `，还剩${data.remaining_attempts}次尝试机会`
+        }
       } else if (data.message) {
         errorMessage = String(data.message)
       } else if (data.msg) {
@@ -160,13 +166,16 @@ const handleSubmit = async (data?: any, e?: Event | any) => {
         errorMessage = String(data.detail)
       } else {
         // 如果都没有，根据状态码显示友好的错误信息
-        const status = error.response.status
         switch (status) {
           case 400:
             errorMessage = '请求参数错误，请检查用户名和密码格式'
             break
           case 401:
-            errorMessage = '用户名或密码错误，请重试'
+            if (data.remaining_attempts !== undefined) {
+              errorMessage = `用户名或密码错误，请重试，还剩${data.remaining_attempts}次尝试机会`
+            } else {
+              errorMessage = '用户名或密码错误，请重试'
+            }
             break
           case 403:
             errorMessage = '账户已被禁用，请联系管理员'
@@ -175,7 +184,12 @@ const handleSubmit = async (data?: any, e?: Event | any) => {
             errorMessage = '用户不存在'
             break
           case 429:
-            errorMessage = '登录尝试次数过多，请稍后再试'
+            // 使用后端返回的具体封禁信息，如果没有则使用默认信息
+            if (data.error) {
+              errorMessage = data.error
+            } else {
+              errorMessage = '登录尝试次数过多，请稍后再试'
+            }
             break
           case 500:
           case 502:
@@ -189,7 +203,7 @@ const handleSubmit = async (data?: any, e?: Event | any) => {
     } else if (error?.message) {
       // 网络错误或其他错误
       if (error.message.includes('timeout')) {
-        errorMessage = '请求超时，请检查网络连接'
+        errorMessage = '请求超时，请检查网络连接或稍后重试'
       } else if (error.message.includes('Network Error')) {
         errorMessage = '网络连接失败，请检查网络设置'
       } else {

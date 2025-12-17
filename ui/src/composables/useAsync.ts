@@ -71,7 +71,7 @@ export function useAsync<T extends (...args: any[]) => Promise<any>>(
   }
 
   if (immediate) {
-    execute()
+    execute(...([] as unknown as Parameters<T>))
   }
 
   return {

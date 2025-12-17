@@ -36,6 +36,7 @@ type CreateUserRequest struct {
 type UpdateUserRequest struct {
 	Email    string `json:"email"`
 	FullName string `json:"full_name"` // 中文名/全名（可选）
+	IsAdmin  bool   `json:"is_admin"` // 管理员状态
 	IsActive bool   `json:"is_active"`
 	GroupIDs []uint `json:"group_ids"` // 更新用户组
 	Password string `json:"password"`  // 密码（可选，留空则不修改）
@@ -158,6 +159,8 @@ func (h *UserHandler) UpdateUser(c *gin.Context) {
 	if req.FullName != "" {
 		user.FullName = req.FullName
 	}
+	// 更新IsAdmin
+	user.IsAdmin = req.IsAdmin
 	user.IsActive = req.IsActive
 
 	// 更新用户组（如果提供了，必须至少一个）
@@ -199,7 +202,7 @@ func (h *UserHandler) UpdateUser(c *gin.Context) {
 
 	// 使用 Select 明确指定要更新的字段
 	// 如果更新密码，则包含 password_hash；否则排除 password_hash，避免密码被覆盖
-	updateFields := []string{"email", "full_name", "is_active", "updated_at"}
+	updateFields := []string{"email", "full_name", "is_admin", "is_active", "updated_at"}
 	if updatePassword {
 		updateFields = append(updateFields, "password_hash")
 	}
@@ -224,7 +227,7 @@ func (h *UserHandler) UpdateUser(c *gin.Context) {
 			ResourceType: "user",
 			ResourcePath: fmt.Sprintf("user:%s", user.Username),
 			Result:       "success",
-			Reason:       fmt.Sprintf("User updated: %s (ID: %d, Active: %v)", user.Username, user.ID, user.IsActive),
+			Reason:       fmt.Sprintf("User updated: %s (ID: %d, Admin: %v, Active: %v)", user.Username, user.ID, user.IsAdmin, user.IsActive),
 		})
 	}
 

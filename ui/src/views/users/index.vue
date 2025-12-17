@@ -291,7 +291,6 @@ import {
   IconPlus, 
   IconUser, 
   IconInfoCircle, 
-  IconLock, 
   IconCopy,
   IconCheckCircle
 } from '@arco-design/web-vue/es/icon'
@@ -301,7 +300,7 @@ import { useConfirm } from '@/composables/useConfirm'
 import { usePermission } from '@/composables/usePermission'
 import { validateEmail, validatePasswordStrength } from '@/utils/validators'
 
-const { canCreate, canEdit, canDelete } = usePermission()
+const { canCreate, canEdit } = usePermission()
 
 const loading = ref(false)
 const submitLoading = ref(false)
@@ -599,12 +598,14 @@ const handleGenerateOTP = async () => {
 const handleDisableOTP = async () => {
   if (!currentOTPUser.value) return
   
+  const username = currentOTPUser.value.username
+  
   // 确认对话框
   const confirmed = await new Promise<boolean>((resolve) => {
     // 使用 Arco Design 的 Modal.confirm
     Modal.confirm({
       title: '确认禁用OTP',
-      content: `确定要为用户 ${currentOTPUser.value.username} 禁用OTP双因素认证吗？禁用后用户将不再需要输入OTP代码即可登录。`,
+      content: `确定要为用户 ${username} 禁用OTP双因素认证吗？禁用后用户将不再需要输入OTP代码即可登录。`,
       onOk: () => resolve(true),
       onCancel: () => resolve(false),
     })

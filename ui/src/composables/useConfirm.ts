@@ -1,5 +1,4 @@
 import { Modal } from '@arco-design/web-vue'
-import type { ModalConfig } from '@arco-design/web-vue'
 
 /**
  * 确认对话框 Composable

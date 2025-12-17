@@ -51,7 +51,7 @@ func AuthMiddleware(cfg *config.Config) gin.HandlerFunc {
 		}
 
 		if !user.IsActive {
-			c.JSON(http.StatusForbidden, gin.H{"error": "User account is disabled"})
+			c.JSON(http.StatusForbidden, gin.H{"error": "您的账户已被禁用，无法访问。请联系管理员激活账户。"})
 			c.Abort()
 			return
 		}

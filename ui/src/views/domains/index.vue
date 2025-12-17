@@ -182,7 +182,7 @@
 import { ref, reactive, onMounted, computed } from 'vue'
 import { usePermission } from '@/composables/usePermission'
 
-const { canCreate, canEdit, canDelete } = usePermission()
+const { canCreate, canEdit } = usePermission()
 import { Message } from '@arco-design/web-vue'
 import { IconPlus, IconRefresh } from '@arco-design/web-vue/es/icon'
 import request from '@/api/request'
@@ -508,7 +508,7 @@ const handleViewRoutes = (domain: Domain) => {
     { label: '状态', value: domain.resolved ? '已解析' : '未解析' },
     { label: '策略', value: domain.policy_name || '无' },
     { label: '访问次数', value: domain.access_count.toString() },
-    { label: '最后使用', value: formatLastUsed(domain.last_used) },
+    { label: '最后使用', value: domain.last_used ? formatLastUsed(domain.last_used) : '从未使用' },
   ]
   if (domain.routes && domain.routes.length > 0) {
     routeInfo.value.push({

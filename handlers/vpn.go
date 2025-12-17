@@ -95,7 +95,7 @@ func (h *VPNHandler) Connect(c *gin.Context) {
 
 	// Check if user is active
 	if !user.IsActive {
-		c.JSON(http.StatusForbidden, gin.H{"error": "User account is not active"})
+		c.JSON(http.StatusForbidden, gin.H{"error": "您的账户已被禁用，无法连接VPN。请联系管理员激活账户。"})
 		return
 	}
 

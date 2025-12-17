@@ -54,7 +54,7 @@ export function useForm<T extends Record<string, any>>(
     clearErrors()
 
     if (validateFn) {
-      const result = validateFn(formData)
+      const result = validateFn({ ...formData } as T)
       if (typeof result === 'string') {
         Message.warning(result)
         return false
@@ -75,7 +75,7 @@ export function useForm<T extends Record<string, any>>(
 
     loading.value = true
     try {
-      const response = await submitFn(formData)
+      const response = await submitFn({ ...formData } as T)
       Message.success(successMessage)
       if (onSuccess) {
         onSuccess(response)

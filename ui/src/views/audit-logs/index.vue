@@ -272,7 +272,7 @@ import {
 import { usersApi, type User } from '@/api/users'
 import { Message } from '@arco-design/web-vue'
 import { IconRefresh, IconLink, IconComputer } from '@arco-design/web-vue/es/icon'
-import { formatDateTime, formatRelativeTime } from '@/utils/formatters'
+import { formatDateTime } from '@/utils/formatters'
 
 const loading = ref(false)
 const logs = ref<AuditLog[]>([])

@@ -385,7 +385,7 @@
 import { ref, reactive, onMounted } from 'vue'
 import { usePermission } from '@/composables/usePermission'
 
-const { canCreate, canEdit, canDelete } = usePermission()
+const { canCreate, canEdit } = usePermission()
 import {
   policiesApi,
   type Policy,

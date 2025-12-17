@@ -649,8 +649,6 @@ import { ref, reactive, onMounted } from 'vue'
 import { ldapApi, type UpdateLDAPConfigRequest, type LDAPAuthTestRequest, type LDAPSyncResponse, type LDAPAttributeMapping } from '@/api/ldap'
 import { Message, Modal } from '@arco-design/web-vue'
 import request from '@/api/request'
-import { useForm } from '@/composables/useForm'
-import { validatePort, validateIP } from '@/utils/validators'
 
 const submitLoading = ref(false)
 const testLoading = ref(false)

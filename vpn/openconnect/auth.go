@@ -418,7 +418,7 @@ func (h *Handler) Authenticate(c *gin.Context) {
 							// 用户已存在，检查是否被禁用
 							if !user.IsActive {
 								log.Printf("OpenConnect: User %s is disabled, rejecting LDAP authentication", username)
-								h.sendAuthError(c, "User account is disabled")
+								h.sendAuthError(c, "您的账户已被禁用，无法连接VPN。请联系管理员激活账户。")
 								return
 							}
 
@@ -624,7 +624,7 @@ func (h *Handler) Authenticate(c *gin.Context) {
 				auditLogger.LogAuthWithIP(user.ID, username, models.AuditLogActionLogin, "failed",
 					fmt.Sprintf("Account disabled. Source IP: %s", clientIP), clientIP, 0)
 			}
-			h.sendAuthError(c, "User account is disabled")
+			h.sendAuthError(c, "您的账户已被禁用，无法连接VPN。请联系管理员激活账户。")
 			return
 		}
 

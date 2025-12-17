@@ -212,7 +212,7 @@ func (h *AuthHandler) Login(c *gin.Context) {
 				if !user.IsActive {
 					auditLogger := policy.GetAuditLogger()
 					auditLogger.LogAuthWithIP(user.ID, user.Username, models.AuditLogActionLogin, "failed", "Account disabled", clientIP, 0)
-					c.JSON(http.StatusForbidden, gin.H{"error": "User account is disabled"})
+					c.JSON(http.StatusForbidden, gin.H{"error": "您的账户已被禁用，无法登录。请联系管理员激活账户。"})
 					return
 				}
 
@@ -258,14 +258,20 @@ func (h *AuthHandler) Login(c *gin.Context) {
 					fmt.Sprintf("LDAP authentication failed: %v. Source IP: %s", err, clientIP), clientIP, 0)
 
 				if h.bruteforceProtection != nil {
-					blocked, _, blockedUntil := h.bruteforceProtection.RecordFailedAttempt(clientIP)
+					blocked, remaining, blockedUntil := h.bruteforceProtection.RecordFailedAttempt(clientIP)
 					if blocked {
+						remainingTime := time.Until(blockedUntil)
 						c.JSON(http.StatusTooManyRequests, gin.H{
-							"error":         fmt.Sprintf("Too many failed login attempts. IP address blocked until %v", blockedUntil.Format(time.RFC3339)),
+							"error":         fmt.Sprintf("IP address is temporarily blocked due to too many failed login attempts. Please try again after %v", remainingTime.Round(time.Second)),
 							"blocked_until": blockedUntil,
 						})
 						return
 					}
+					c.JSON(http.StatusUnauthorized, gin.H{
+						"error":              "LDAP authentication failed. Please check your username and password.",
+						"remaining_attempts": remaining,
+					})
+					return
 				}
 				log.Printf("Backend Login: ✗ LDAP authentication failed for LDAP user '%s': %v", req.Username, err)
 				c.JSON(http.StatusUnauthorized, gin.H{"error": "LDAP authentication failed. Please check your username and password."})
@@ -282,8 +288,9 @@ func (h *AuthHandler) Login(c *gin.Context) {
 				if h.bruteforceProtection != nil {
 					blocked, remaining, blockedUntil := h.bruteforceProtection.RecordFailedAttempt(clientIP)
 					if blocked {
+						remainingTime := time.Until(blockedUntil)
 						c.JSON(http.StatusTooManyRequests, gin.H{
-							"error":         fmt.Sprintf("Too many failed login attempts. IP address blocked until %v", blockedUntil.Format(time.RFC3339)),
+							"error":         fmt.Sprintf("IP address is temporarily blocked due to too many failed login attempts. Please try again after %v", remainingTime.Round(time.Second)),
 							"blocked_until": blockedUntil,
 						})
 						return
@@ -303,7 +310,7 @@ func (h *AuthHandler) Login(c *gin.Context) {
 				log.Printf("Backend Login: User '%s' account is disabled", req.Username)
 				auditLogger := policy.GetAuditLogger()
 				auditLogger.LogAuth(user.ID, user.Username, models.AuditLogActionLogin, "failed", "Account disabled")
-				c.JSON(http.StatusForbidden, gin.H{"error": "User account is disabled"})
+				c.JSON(http.StatusForbidden, gin.H{"error": "您的账户已被禁用，无法登录。请联系管理员激活账户。"})
 				return
 			}
 
@@ -317,8 +324,9 @@ func (h *AuthHandler) Login(c *gin.Context) {
 				if h.bruteforceProtection != nil {
 					blocked, remaining, blockedUntil := h.bruteforceProtection.RecordFailedAttempt(clientIP)
 					if blocked {
+						remainingTime := time.Until(blockedUntil)
 						c.JSON(http.StatusTooManyRequests, gin.H{
-							"error":         fmt.Sprintf("Too many failed login attempts. IP address blocked until %v", blockedUntil.Format(time.RFC3339)),
+							"error":         fmt.Sprintf("IP address is temporarily blocked due to too many failed login attempts. Please try again after %v", remainingTime.Round(time.Second)),
 							"blocked_until": blockedUntil,
 						})
 						return
@@ -383,14 +391,20 @@ func (h *AuthHandler) Login(c *gin.Context) {
 					fmt.Sprintf("User not found and LDAP authentication failed: %v. Source IP: %s", err, clientIP), clientIP, 0)
 
 				if h.bruteforceProtection != nil {
-					blocked, _, blockedUntil := h.bruteforceProtection.RecordFailedAttempt(clientIP)
+					blocked, remaining, blockedUntil := h.bruteforceProtection.RecordFailedAttempt(clientIP)
 					if blocked {
+						remainingTime := time.Until(blockedUntil)
 						c.JSON(http.StatusTooManyRequests, gin.H{
-							"error":         fmt.Sprintf("Too many failed login attempts. IP address blocked until %v", blockedUntil.Format(time.RFC3339)),
+							"error":         fmt.Sprintf("IP address is temporarily blocked due to too many failed login attempts. Please try again after %v", remainingTime.Round(time.Second)),
 							"blocked_until": blockedUntil,
 						})
 						return
 					}
+					c.JSON(http.StatusUnauthorized, gin.H{
+						"error":              "User not found or invalid credentials",
+						"remaining_attempts": remaining,
+					})
+					return
 				}
 				log.Printf("Backend Login: ✗ User '%s' not found and LDAP authentication failed: %v", req.Username, err)
 				c.JSON(http.StatusUnauthorized, gin.H{"error": "User not found or invalid credentials"})
@@ -405,8 +419,9 @@ func (h *AuthHandler) Login(c *gin.Context) {
 			if h.bruteforceProtection != nil {
 				blocked, remaining, blockedUntil := h.bruteforceProtection.RecordFailedAttempt(clientIP)
 				if blocked {
+					remainingTime := time.Until(blockedUntil)
 					c.JSON(http.StatusTooManyRequests, gin.H{
-						"error":         fmt.Sprintf("Too many failed login attempts. IP address blocked until %v", blockedUntil.Format(time.RFC3339)),
+						"error":         fmt.Sprintf("IP address is temporarily blocked due to too many failed login attempts. Please try again after %v", remainingTime.Round(time.Second)),
 						"blocked_until": blockedUntil,
 					})
 					return
