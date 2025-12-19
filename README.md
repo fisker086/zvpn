@@ -2,6 +2,12 @@
 
 基于 Golang 实现的高性能 SSL VPN 服务器，支持 OpenConnect 协议、用户认证和策略管理。
 
+## 相关展示
+<img width="902" height="1184" alt="image" src="https://github.com/user-attachments/assets/ab991ab8-e3a6-4e96-8814-c38bbdaf4cbc" />
+
+<img width="2968" height="1480" alt="image" src="https://github.com/user-attachments/assets/4031fd3d-36fd-4a78-94d4-aebbe6cef4d0" />
+
+
 ## 快速部署
 
 ### Docker 部署（推荐）
@@ -9,7 +15,7 @@
 #### 1. 克隆项目
 
 ```bash
-git clone <repository-url>
+git clone 
 cd zvpn-backend
 ```
 
@@ -95,19 +101,11 @@ jwt:
 ./generate-cert.sh
 ```
 
-#### 5. 编译运行
-
+### 5. 自有证书
 ```bash
-# 编译 eBPF 程序
-cd vpn/ebpf
-go generate
+cd certs
 
-# 编译主程序
-cd ../..
-CGO_ENABLED=1 go build -tags ebpf -o zvpn ./main.go
-
-# 运行（需要 root 权限）
-sudo ./zvpn
+替换server.pem证书
 ```
 
 ## 客户端连接
@@ -124,24 +122,9 @@ brew install openconnect
 
 # Windows/iOS/Android
 # 下载 OpenConnect GUI 客户端
+
+客户端下载链接: https://ocserv.yydy.link:2023/
 ```
-
-### 连接服务器
-
-```bash
-sudo openconnect -u admin https://<服务器IP>
-```
-
-输入密码后即可连接。
-
-## 配置说明
-
-### 必需配置项
-
-- `VPN_NETWORK`: VPN 网段（默认：`10.8.0.0/24`）
-- `VPN_EBPF_INTERFACE`: eBPF 挂载的网卡（默认：`eth0`）
-- `JWT_SECRET`: JWT 密钥（生产环境必须修改）
-- `DB_DSN`: 数据库连接字符串
 
 ### 环境变量
 
@@ -153,31 +136,10 @@ export VPN_NETWORK=10.8.0.0/24
 export JWT_SECRET=your-secret-key
 ```
 
-## 常见问题
+### QQ交流群
 
-### NAT 不工作
+<img width="862" height="1360" alt="image" src="https://github.com/user-attachments/assets/3d19f85e-6c2d-44f7-92cb-4cc06442305d" />
 
-如果 VPN 客户端无法访问外部网络，检查 NAT 规则：
-
-```bash
-# 检查 NAT 规则
-iptables -t nat -L POSTROUTING -n -v
-
-# 如果没有规则，手动添加
-iptables -t nat -A POSTROUTING -s 10.8.0.0/24 -o eth0 -j MASQUERADE
-```
-
-### eBPF 加载失败
-
-- 检查内核版本：`uname -r`（需要 4.18+）
-- 检查权限：需要 `NET_ADMIN` 和 `SYS_ADMIN` 权限
-- Docker 容器需要添加：`--cap-add=NET_ADMIN --cap-add=SYS_ADMIN`
-
-### 客户端无法连接
-
-- 检查端口是否开放：`netstat -tlnp | grep 443`
-- 检查防火墙规则
-- 检查证书是否正确：`openssl x509 -in certs/server.crt -text -noout`
 
 ## 许可证
 
