@@ -3,8 +3,6 @@
 基于 Golang 实现的高性能 SSL VPN 服务器，支持 OpenConnect 协议、用户认证和策略管理。
 
 ## 相关展示
-<img width="902" height="1184" alt="image" src="https://github.com/user-attachments/assets/ab991ab8-e3a6-4e96-8814-c38bbdaf4cbc" />
-
 <img width="2968" height="1480" alt="image" src="https://github.com/user-attachments/assets/4031fd3d-36fd-4a78-94d4-aebbe6cef4d0" />
 
 
