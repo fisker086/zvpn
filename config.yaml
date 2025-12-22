@@ -1,0 +1,50 @@
+# ZVPN 配置文件
+
+# ==================== 服务器配置 ====================
+server:
+  host: "0.0.0.0"
+  port: "18080"    # HTTP 管理 API 端口
+  mode: "debug"   # debug 或 release
+
+# ==================== 数据库配置 ====================
+database:
+  type: "mysql"
+  dsn: "root:123456@tcp(mysql:3306)/zvpn?charset=utf8mb4&parseTime=True&loc=Local"
+  # 连接池配置（可选，使用默认值即可）
+  maxopenconns: 25      # 最大打开连接数（默认：25）
+  maxidleconns: 10      # 最大空闲连接数（默认：10）
+  connmaxlifetime: 300  # 连接最大生存时间（秒，默认：300，即5分钟）
+  connmaxidletime: 60   # 连接最大空闲时间（秒，默认：60，即1分钟）
+  
+# ==================== VPN 网络配置 ====================
+vpn:
+  # 网络配置
+  interfacename: "zvpn0"
+  network: "10.8.0.0/24"  # 使用与环境变量一致的网段
+  mtu: 1460
+  ebpfinterfacename: "eth0"  # 指定eBPF程序要挂载的物理网卡（如eth0, ens33, enp0s3等）
+  
+  # SSL 证书配置
+  # Docker: 使用环境变量 VPN_CERT 和 VPN_KEY 覆盖
+  # 本地: 使用相对路径或设置环境变量
+  certfile: "./certs/server.crt"
+  keyfile: "./certs/server.key"
+  
+  # OpenConnect 协议配置（推荐）
+  enableopenconnect: true        # 是否启用 OpenConnect
+  openconnectport: "443"        # HTTPS 端口（VPN 客户端连接）
+  enabledtls: true               # 启用 DTLS (UDP) 加速
+  dtlsport: "443"               # DTLS UDP 端口（与 TCP 保持一致）
+  
+  # CSTP/DTLS 连接保活配置
+  cstpdpd: 30                    # CSTP 死连接检测间隔（秒，默认：30）
+  cstpkeepalive: 20             # CSTP 保活间隔（秒，默认：20）
+  
+  # DNS拦截器和域名动态拆分隧道（DNS拦截器始终启用）
+  dnsport: "53"                 # DNS服务器端口
+  upstreamdns: "8.8.8.8:53,8.8.4.4:53"  # 上游DNS服务器（逗号分隔）
+
+# ==================== JWT 配置 ====================
+jwt:
+  secret: "your-secret-key-change-this-in-production"  # 生产环境必须修改！
+  expiration: 24  # Token 过期时间（小时）

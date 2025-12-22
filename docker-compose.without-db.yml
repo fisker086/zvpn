@@ -1,0 +1,65 @@
+services:
+  zvpn:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: zvpn-backend
+    restart: unless-stopped
+    # 如需 host 网络（仅 Linux），可改为 network_mode: host 并移除 ports
+    networks:
+      - zvpn-network
+    ports:
+      - "18080:18080"       # HTTP REST API + 内置前端
+      - "443:443"         # OpenConnect SSL/TLS (主连接)
+      - "443:443/udp"     # OpenConnect DTLS (可选，低延迟)
+
+    privileged: true
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_ADMIN
+      - BPF
+      - SYS_RESOURCE
+
+    volumes:
+      - /sys/fs/bpf:/sys/fs/bpf:rw
+      - ./certs:/app/certs:rw
+      - ./data:/app/data:rw
+      - /dev/net/tun:/dev/net/tun
+      # 如需自定义配置，可挂载：
+      # - ./config.yaml:/app/config.yaml:ro
+
+    environment:
+      SERVER_HOST: ${SERVER_HOST:-0.0.0.0}
+      SERVER_PORT: ${SERVER_PORT:-18080}
+      GIN_MODE: ${GIN_MODE:-release}
+
+      # 外部数据库连接（请显式设置 DB_DSN 指向外部 MySQL/PostgreSQL）
+      DB_TYPE: ${DB_TYPE:-mysql}
+      DB_DSN: ${DB_DSN:?set external DB_DSN, e.g. user:pass@tcp(dbhost:3306)/zvpn?charset=utf8mb4&parseTime=True&loc=Local}
+
+      VPN_INTERFACE: ${VPN_INTERFACE:-zvpn0}
+      VPN_NETWORK: ${VPN_NETWORK:-10.8.0.0/24}
+      VPN_MTU: ${VPN_MTU:-1400}
+      VPN_ENABLE_OPENCONNECT: ${VPN_ENABLE_OPENCONNECT:-true}
+      VPN_OPENCONNECT_PORT: ${VPN_OPENCONNECT_PORT:-443}
+      VPN_ENABLE_DTLS: ${VPN_ENABLE_DTLS:-true}
+      VPN_DTLS_PORT: ${VPN_DTLS_PORT:-443}
+      VPN_CERT: ${VPN_CERT:-/app/certs/server.crt}
+      VPN_KEY: ${VPN_KEY:-/app/certs/server.key}
+      VPN_EBPF_INTERFACE: ${VPN_EBPF_INTERFACE:-eth0}
+
+      JWT_SECRET: ${JWT_SECRET:-your-secret-key-change-this-in-production}
+      TZ: ${TZ:-Asia/Shanghai}
+
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:18080/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+networks:
+  zvpn-network:
+    driver: bridge
+

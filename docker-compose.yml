@@ -1,0 +1,126 @@
+services:
+  # MySQL 数据库
+  mysql:
+    image: mysql:8.0
+    container_name: zvpn-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:-123456}
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-zvpn}
+      TZ: Asia/Shanghai
+    ports:
+      - "${MYSQL_PORT:-3306}:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./docker/mysql/init:/docker-entrypoint-initdb.d:ro
+    command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p$$MYSQL_ROOT_PASSWORD"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - zvpn-network
+
+  # ZVPN 应用
+  zvpn:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: zvpn-backend
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    # 网络配置
+    # Linux 服务器：使用 host 模式（最佳性能，推荐用于生产环境）
+    # macOS/Windows：使用 bridge 模式（见下方配置）
+    
+    # 方式 1: Host 网络（仅 Linux）- 取消注释使用
+    # 注意：Host 模式下，数据库连接需要使用 127.0.0.1:3306 而不是 mysql:3306
+    # network_mode: host
+    
+    # 方式 2: Bridge 网络（跨平台）- 默认启用
+    networks:
+      - zvpn-network
+    ports:
+      - "18080:18080"        # HTTP REST API
+      - "443:443/tcp"        # OpenConnect SSL/TLS (主连接)
+      - "443:443/udp"        # OpenConnect DTLS (UDP 加速，低延迟)
+    
+    # 特权模式（eBPF 和 TUN/TAP 需要）
+    privileged: true
+    
+    # 额外的 capabilities（如果需要）
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_ADMIN
+      - BPF
+      - SYS_RESOURCE
+    
+    # 挂载点
+    volumes:
+      # eBPF 文件系统（如果启用 eBPF）
+      - /sys/fs/bpf:/sys/fs/bpf:rw
+      # 证书目录
+      - ./certs:/app/certs:rw
+      # 数据目录
+      - ./data:/app/data:rw
+      # TUN 设备（必需）
+      - /dev/net/tun:/dev/net/tun
+      # 配置文件（可选，如果需要自定义配置而不重新构建镜像）
+      # - ./config.yaml:/app/config.yaml:ro
+    
+    environment:
+      # 服务器配置
+      SERVER_HOST: ${SERVER_HOST:-0.0.0.0}
+      SERVER_PORT: ${SERVER_PORT:-18080}
+      GIN_MODE: ${GIN_MODE:-release}
+      
+      # 数据库配置
+      # Bridge 网络：使用服务名（默认，跨平台）
+      # Host 网络：使用 127.0.0.1（仅 Linux）
+      DB_TYPE: mysql
+      DB_DSN: ${DB_DSN:-root:123456@tcp(mysql:3306)/zvpn?charset=utf8mb4&parseTime=True&loc=Local}
+      
+      # VPN 配置
+      VPN_INTERFACE: ${VPN_INTERFACE:-zvpn0}
+      VPN_NETWORK: ${VPN_NETWORK:-10.8.0.0/24}
+      VPN_MTU: ${VPN_MTU:-1400}
+      
+      # OpenConnect 配置
+      VPN_ENABLE_OPENCONNECT: ${VPN_ENABLE_OPENCONNECT:-true}
+      VPN_OPENCONNECT_PORT: ${VPN_OPENCONNECT_PORT:-443}
+      VPN_ENABLE_DTLS: ${VPN_ENABLE_DTLS:-true}
+      VPN_DTLS_PORT: ${VPN_DTLS_PORT:-443}
+      
+      # 证书配置
+      VPN_CERT: ${VPN_CERT:-/app/certs/server.crt}
+      VPN_KEY: ${VPN_KEY:-/app/certs/server.key}
+      
+      # eBPF 配置（必需）
+      VPN_EBPF_INTERFACE: ${VPN_EBPF_INTERFACE:-eth0}
+      
+      # JWT 配置
+      JWT_SECRET: ${JWT_SECRET:-your-secret-key-change-this-in-production}
+      
+      # 时区
+      TZ: ${TZ:-Asia/Shanghai}
+    
+    # 健康检查
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:18080/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  mysql_data:
+    driver: local
+
+networks:
+  zvpn-network:
+    driver: bridge
+
