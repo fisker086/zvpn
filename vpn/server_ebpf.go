@@ -13,11 +13,17 @@ import (
 
 // loadEBPFTCNATImpl loads eBPF TC program for NAT masquerading
 // This is the actual implementation when eBPF is compiled
-func loadEBPFTCNATImpl(ifName string, publicIP net.IP) (interface{}, error) {
+func loadEBPFTCNATImpl(ifName string, publicIP net.IP, vpnNetwork string) (interface{}, error) {
 	// Load TC program
 	tcProg, err := ebpf.LoadTCProgram(ifName)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load eBPF TC program: %w", err)
+	}
+
+	// Set VPN network configuration
+	if err := tcProg.SetVPNNetwork(vpnNetwork); err != nil {
+		tcProg.Close()
+		return nil, fmt.Errorf("failed to set VPN network in TC program: %w", err)
 	}
 
 	// Set public IP in TC program

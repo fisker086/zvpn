@@ -3,9 +3,13 @@ package openconnect
 import (
 	"bytes"
 	"crypto/hmac"
+	"crypto/sha1"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"encoding/xml"
 	"fmt"
 	"image"
@@ -14,6 +18,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -27,28 +32,73 @@ import (
 	"github.com/pquerna/otp/totp"
 )
 
-// GetConfig 返回 OpenConnect 初始配置（响应 POST /）
-func (h *Handler) GetConfig(c *gin.Context) {
-	// OpenConnect 协议：返回支持的认证方法
-	// 添加 profile-url 让客户端下载配置文件
-	serverURL := "https://" + c.Request.Host
+func validateSecureHeaders(c *gin.Context) bool {
+	xAggregateAuth := c.Request.Header.Get("X-Aggregate-Auth")
+	xTranscendVersion := c.Request.Header.Get("X-Transcend-Version")
 
-	xml := `<?xml version="1.0" encoding="UTF-8"?>
-<config-auth client="vpn" type="auth-request" aggregate-auth-version="2">
-    <version who="sg">0.1(1)0</version>
-    <auth id="main">
-        <title>ZVPN Login</title>
-        <message>Please enter your username and password.</message>
-        <form method="post" action="/auth">
-            <input type="text" name="username" label="Username:" />
-            <input type="password" name="password" label="Password:" />
-        </form>
-    </auth>
-    <config>
-        <profile-url>` + serverURL + `/profile.xml</profile-url>
-    </config>
-</config-auth>`
-	c.Data(http.StatusOK, "text/xml; charset=utf-8", []byte(xml))
+	if xAggregateAuth != "1" || xTranscendVersion != "1" {
+		log.Printf("OpenConnect: Security header validation failed - X-Aggregate-Auth: %s, X-Transcend-Version: %s (from %s)",
+			xAggregateAuth, xTranscendVersion, c.ClientIP())
+		c.AbortWithStatus(http.StatusForbidden)
+		return false
+	}
+
+	return true
+}
+
+func (h *Handler) GetConfig(c *gin.Context) {
+	connection := strings.ToLower(c.GetHeader("Connection"))
+	userAgent := strings.ToLower(c.GetHeader("User-Agent"))
+	if connection == "close" && (strings.Contains(userAgent, "anyconnect") || strings.Contains(userAgent, "openconnect")) {
+		log.Printf("OpenConnect: Rejecting short connection (Connection: close) from %s", c.ClientIP())
+		c.Header("Connection", "close")
+		c.AbortWithStatus(http.StatusBadRequest)
+		return
+	}
+
+	// 安全验证：验证 X-Aggregate-Auth 和 X-Transcend-Version 头部
+	if !validateSecureHeaders(c) {
+		return
+	}
+
+	// 读取请求体
+	bodyBytes, err := c.GetRawData()
+	if err != nil {
+		log.Printf("OpenConnect: Failed to read request body: %v", err)
+		h.sendAuthForm(c)
+		return
+	}
+
+	c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+	var authReq AuthRequest
+	requestType := "init" // 默认类型
+
+	if len(bodyBytes) > 0 {
+		// 尝试解析 XML
+		if bytes.HasPrefix(bytes.TrimSpace(bodyBytes), []byte("<?xml")) {
+			if err := xml.Unmarshal(bodyBytes, &authReq); err == nil {
+				requestType = authReq.Type
+			}
+		}
+	}
+
+	switch requestType {
+	case "init":
+		h.sendAuthForm(c)
+		return
+
+	case "logout":
+		h.handleLogout(c)
+		return
+
+	case "auth-reply":
+		h.Authenticate(c)
+		return
+
+	default:
+		h.sendAuthForm(c)
+		return
+	}
 }
 
 // AuthResponse OpenConnect 认证响应
@@ -67,7 +117,11 @@ type AuthResponse struct {
 type AuthRequest struct {
 	XMLName xml.Name `xml:"config-auth"`
 	Type    string   `xml:"type,attr"` // auth-reply, auth-request等
-	Auth    struct {
+	Opaque  struct {
+		TunnelGroup string `xml:"tunnel-group"` // Cisco Secure Client 的 default_group 参数
+		GroupSelect string `xml:"group-select"` // 客户端选择的组（Cisco Secure Client 和 OpenConnect 都支持）
+	} `xml:"opaque"`
+	Auth struct {
 		Username      string `xml:"username"`
 		Password      string `xml:"password"`       // 第一步：密码
 		PasswordToken string `xml:"password-token"` // 第二步：密码验证token
@@ -77,6 +131,10 @@ type AuthRequest struct {
 
 // Authenticate 处理认证请求
 func (h *Handler) Authenticate(c *gin.Context) {
+	if !validateSecureHeaders(c) {
+		return // validateSecureHeaders 已经设置了 403 响应
+	}
+
 	clientIP := c.ClientIP()
 
 	// 检查密码爆破防护
@@ -91,10 +149,6 @@ func (h *Handler) Authenticate(c *gin.Context) {
 
 	var username, password string
 
-	contentType := c.Request.Header.Get("Content-Type")
-	log.Printf("OpenConnect: Auth request - Content-Type: %s, Method: %s", contentType, c.Request.Method)
-
-	// 读取原始请求体（只能读一次，需要保存）
 	bodyBytes, err := c.GetRawData()
 	if err != nil {
 		log.Printf("OpenConnect: Failed to read request body: %v", err)
@@ -105,74 +159,36 @@ func (h *Handler) Authenticate(c *gin.Context) {
 	// 恢复请求体，供后续解析使用
 	c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 
-	if len(bodyBytes) > 0 {
-		bodyPreview := bodyBytes
-		if len(bodyPreview) > 200 {
-			bodyPreview = bodyPreview[:200]
-		}
-		log.Printf("OpenConnect: Request body (first %d bytes): %s", len(bodyPreview), string(bodyPreview))
-	}
-
 	// 1. 首先尝试解析 XML（即使 Content-Type 不是 xml，OpenConnect 也可能发送 XML）
-	// 检查请求体是否以 XML 开头
 	var authReq AuthRequest
 	var xmlParsed bool
 	if len(bodyBytes) > 0 && bytes.HasPrefix(bytes.TrimSpace(bodyBytes), []byte("<?xml")) {
-		log.Printf("OpenConnect: Detected XML format in request body")
-		log.Printf("OpenConnect: Full XML body: %s", string(bodyBytes))
-
-		if err := xml.Unmarshal(bodyBytes, &authReq); err != nil {
-			log.Printf("OpenConnect: Failed to parse XML: %v", err)
-			log.Printf("OpenConnect: XML body content: %s", string(bodyBytes))
-			// 如果 XML 解析失败，继续尝试其他方法
-		} else {
+		if err := xml.Unmarshal(bodyBytes, &authReq); err == nil {
 			xmlParsed = true
 			username = authReq.Auth.Username
 			password = authReq.Auth.Password
-			// 如果是第二步认证，可能只有password-token，没有password
 			passwordTokenFromXML := authReq.Auth.PasswordToken
-			log.Printf("OpenConnect: XML parsed - type: '%s', username: '%s', password length: %d, has password-token: %v",
-				authReq.Type, username, len(password), passwordTokenFromXML != "")
 
 			// 检查是否是初始化请求（type="init" 或 type="auth-reply"但没有凭证）
 			if (authReq.Type == "init" || authReq.Type == "auth-reply") && username == "" && password == "" && passwordTokenFromXML == "" {
-				log.Printf("OpenConnect: Initial request detected (type=%s, no credentials), returning auth form", authReq.Type)
-				// 返回认证表单，让客户端输入用户名和密码
 				h.sendAuthForm(c)
 				return
 			}
-
-			if username != "" && (password != "" || passwordTokenFromXML != "") {
-				log.Printf("OpenConnect: ✓ Parsed XML successfully - username: %s", username)
-			} else {
-				log.Printf("OpenConnect: ⚠️  XML parsed but username or credentials is empty")
-			}
 		}
-	} else {
-		log.Printf("OpenConnect: Request body does not start with <?xml, trying form parsing")
 	}
 
 	// 2. 如果 XML 解析失败或没有解析到，尝试表单解析
 	if username == "" || password == "" {
-		// 恢复请求体用于表单解析
 		c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-
-		// 尝试从 POST 表单获取（application/x-www-form-urlencoded）
 		if err := c.Request.ParseForm(); err == nil {
 			username = c.Request.PostForm.Get("username")
 			password = c.Request.PostForm.Get("password")
-			if username != "" || password != "" {
-				log.Printf("OpenConnect: ✓ Parsed from POST form - username: %s", username)
-			}
 		}
 
 		// 如果表单为空，尝试从 URL 查询参数获取
 		if username == "" || password == "" {
 			username = c.Query("username")
 			password = c.Query("password")
-			if username != "" || password != "" {
-				log.Printf("OpenConnect: ✓ Parsed from query - username: %s", username)
-			}
 		}
 	}
 
@@ -182,25 +198,18 @@ func (h *Handler) Authenticate(c *gin.Context) {
 		if ok {
 			username = u
 			password = p
-			log.Printf("OpenConnect: ✓ Using Basic Auth - username: %s", username)
 		}
 	}
 
 	// 检查是否有凭证（password或password-token）
-	// 如果是第二步认证，可能只有password-token，没有password
-	// 使用之前解析的XML数据（避免重复解析）
 	var hasPasswordToken bool
 	if xmlParsed {
 		hasPasswordToken = authReq.Auth.PasswordToken != ""
-		// 如果XML中有username但之前没提取到，现在提取
 		if username == "" && authReq.Auth.Username != "" {
 			username = authReq.Auth.Username
-			log.Printf("OpenConnect: Extracted username from XML: %s", username)
 		}
-		// 如果XML中有password但之前没提取到，现在提取
 		if password == "" && authReq.Auth.Password != "" {
 			password = authReq.Auth.Password
-			log.Printf("OpenConnect: Extracted password from XML (length: %d)", len(password))
 		}
 	}
 	// 如果XML中没有，检查表单
@@ -208,12 +217,18 @@ func (h *Handler) Authenticate(c *gin.Context) {
 		c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 		if err := c.Request.ParseForm(); err == nil {
 			hasPasswordToken = c.Request.PostForm.Get("password-token") != ""
-			// 如果表单中有username但之前没提取到，现在提取
 			if username == "" {
 				formUsername := c.Request.PostForm.Get("username")
 				if formUsername != "" {
 					username = formUsername
-					log.Printf("OpenConnect: Extracted username from form: %s", username)
+				}
+			}
+			// 如果表单中有password但之前没提取到，现在提取
+			if password == "" {
+				formPassword := c.Request.PostForm.Get("password")
+				if formPassword != "" {
+					password = formPassword
+					log.Printf("OpenConnect: Extracted password from form (length: %d)", len(password))
 				}
 			}
 			// 如果表单中有password但之前没提取到，现在提取
@@ -281,13 +296,10 @@ func (h *Handler) Authenticate(c *gin.Context) {
 	// 3. 系统根据Source字段自动识别账户类型，无需密码格式判断
 	// 4. LDAP用户登录使用uid（英文账户名），系统账户可以使用任意用户名
 	if ldapAuth != nil && ldapConfig.Enabled {
-		// 先检查用户是否存在于数据库中
 		var existingUser models.User
 		userExistsInDB := database.DB.Where("username = ?", username).First(&existingUser).Error == nil
 
-		// 如果用户存在，检查是LDAP用户还是系统账户
 		if userExistsInDB {
-			// 根据Source字段判断用户类型
 			if existingUser.Source == models.UserSourceLDAP {
 				// LDAP用户，使用LDAP认证
 				// 检查是否是OTP多步骤认证的第二步（有OTP代码和密码token）
@@ -350,9 +362,7 @@ func (h *Handler) Authenticate(c *gin.Context) {
 					isLDAPAuth = true
 					log.Printf("OpenConnect: ✓ LDAP user %s authenticated (password correct, OTP correct)", username)
 					// OTP验证成功，继续后续的认证成功流程
-					// 注意：这里跳过了LDAP密码认证部分，因为已经在第一步完成了
 				} else {
-					// 第一步：先进行LDAP密码认证
 					// 如果用户启用了OTP但没有提供OTP代码，说明是第一步，只验证密码
 					ldapUser, err := ldapAuth.Authenticate(username, password)
 					if err == nil {
@@ -368,9 +378,7 @@ func (h *Handler) Authenticate(c *gin.Context) {
 								Source:   models.UserSourceLDAP, // 标记为LDAP用户
 								LDAPDN:   ldapUser.DN,
 								FullName: ldapUser.FullName,
-								// PasswordHash 留空，LDAP用户不需要存储密码（认证由LDAP服务器完成）
 							}
-							// 序列化LDAP原始属性为JSON（用于扩展）
 							if len(ldapUser.Attributes) > 0 {
 								if attrsJSON, err := json.Marshal(ldapUser.Attributes); err == nil {
 									user.LDAPAttributes = string(attrsJSON)
@@ -501,8 +509,6 @@ func (h *Handler) Authenticate(c *gin.Context) {
 						}
 						// LDAP认证成功（密码正确，如果启用了OTP则OTP也正确）
 					} else {
-						// LDAP 认证失败，用户是LDAP用户，不应该fallback到本地认证
-						// 因为LDAP用户的密码存储在LDAP服务器中，本地数据库没有密码
 						auditLogger := policy.GetAuditLogger()
 						if auditLogger != nil {
 							auditLogger.LogAuthWithIP(existingUser.ID, username, models.AuditLogActionLogin, "failed",
@@ -532,7 +538,6 @@ func (h *Handler) Authenticate(c *gin.Context) {
 			var ldapPassword = password
 			ldapUser, err := ldapAuth.Authenticate(username, ldapPassword)
 			if err == nil {
-				// LDAP 认证成功，创建新用户
 				user = models.User{
 					Username: username,
 					Email:    ldapUser.Email,
@@ -543,7 +548,6 @@ func (h *Handler) Authenticate(c *gin.Context) {
 					FullName: ldapUser.FullName,
 					// PasswordHash 留空，LDAP用户不需要存储密码（认证由LDAP服务器完成）
 				}
-				// 序列化LDAP原始属性为JSON（用于扩展）
 				if len(ldapUser.Attributes) > 0 {
 					if attrsJSON, err := json.Marshal(ldapUser.Attributes); err == nil {
 						user.LDAPAttributes = string(attrsJSON)
@@ -845,10 +849,33 @@ func (h *Handler) Authenticate(c *gin.Context) {
 	}
 
 	// 多端并发登录控制：如果禁用且用户已连接，拒绝新的登录
+	// 但是，如果用户标记为已连接但实际上没有活跃连接，自动重置状态
 	if !h.config.VPN.AllowMultiClientLogin && user.Connected {
-		log.Printf("OpenConnect: User %s already connected, multi-client login disabled", username)
-		h.sendAuthError(c, "该账号已在线，已禁止多端同时登录")
-		return
+		// 检查是否真的有活跃连接
+		if h.vpnServer != nil {
+			_, hasActiveConnection := h.vpnServer.GetClient(user.ID)
+			if !hasActiveConnection {
+				// 用户标记为已连接，但实际上没有活跃连接，重置状态
+				log.Printf("OpenConnect: User %s marked as connected but no active connection found, resetting status", username)
+				user.Connected = false
+				user.VPNIP = ""
+				if err := database.DB.Model(&user).Select("connected", "vpn_ip", "updated_at").Updates(user).Error; err != nil {
+					log.Printf("OpenConnect: Failed to reset user connection status: %v", err)
+				} else {
+					log.Printf("OpenConnect: User %s connection status reset successfully", username)
+				}
+			} else {
+				// 确实有活跃连接，拒绝新登录
+				log.Printf("OpenConnect: User %s already connected, multi-client login disabled", username)
+				h.sendAuthError(c, "该账号已在线，已禁止多端同时登录")
+				return
+			}
+		} else {
+			// VPN服务器未初始化，无法检查，直接拒绝
+			log.Printf("OpenConnect: User %s already connected, multi-client login disabled (VPN server not initialized)", username)
+			h.sendAuthError(c, "该账号已在线，已禁止多端同时登录")
+			return
+		}
 	}
 
 	// 认证成功 - 分配 VPN IP（但不设置 Connected，等连接真正建立后再设置）
@@ -935,19 +962,24 @@ func (h *Handler) Authenticate(c *gin.Context) {
 		log.Printf("OpenConnect: User %s route %d: %s", user.Username, i+1, route.Network)
 	}
 	if user.PolicyID != 0 && len(user.Policy.Routes) > 0 {
-		// Split-tunnel mode: 只添加策略路由，不包含VPN网络本身
-		for _, route := range user.Policy.Routes {
-			// 跳过VPN网络本身，只添加策略路由
-			if route.Network != h.config.VPN.Network {
-				splitIncludeRoutes = append(splitIncludeRoutes, route.Network)
-			}
-		}
-		log.Printf("OpenConnect: User %s - Split tunnel mode with %d policy routes (excluding VPN network): %v", user.Username, len(splitIncludeRoutes), splitIncludeRoutes)
-	} else {
-		// 没有策略路由
-		log.Printf("OpenConnect: User %s - No policy routes configured", user.Username)
-	}
+		// 首先添加VPN网络本身的路由，确保基本连通性（服务器、网关、DNS拦截器等）
+		// 这对于ping服务器、访问DNS拦截器等基础功能是必需的
+		splitIncludeRoutes = append(splitIncludeRoutes, h.config.VPN.Network)
+		log.Printf("OpenConnect: User %s - Auto-added VPN network route: %s (for basic connectivity)", user.Username, h.config.VPN.Network)
 
+		// Split-tunnel mode: 添加策略路由（包含VPN网络本身）
+		for _, route := range user.Policy.Routes {
+			// 添加策略路由（包含VPN网络本身，用户可能有多个网段策略）
+			splitIncludeRoutes = append(splitIncludeRoutes, route.Network)
+			log.Printf("OpenConnect: User %s - Added policy route: %s", user.Username, route.Network)
+		}
+		log.Printf("OpenConnect: User %s - Split tunnel mode with %d total routes (VPN network + %d policy routes): %v",
+			user.Username, len(splitIncludeRoutes), len(user.Policy.Routes), splitIncludeRoutes)
+	} else {
+		// 没有策略路由，但仍有VPN网络路由确保基本连通性
+		splitIncludeRoutes = append(splitIncludeRoutes, h.config.VPN.Network)
+		log.Printf("OpenConnect: User %s - No policy routes, using VPN network only: %s", user.Username, h.config.VPN.Network)
+	}
 	// 构建 split-include XML（每个路由一行，正确的缩进）
 	// 注意：不包含VPN网络本身（10.8.0.0/24），只包含数据库中的策略路由
 	// 格式要求：IP + 掩码分开写
@@ -1038,19 +1070,60 @@ func (h *Handler) Authenticate(c *gin.Context) {
 		}
 	}
 
+	// 检测客户端类型，用于日志记录和可能的 XML 格式调整
+	clientType := h.clientDetector.Detect(c)
+	isAnyConnect := clientType == ClientTypeAnyConnect
+
 	// 构建完整的 XML 响应
+	// 注意：使用 type="complete" 而不是 type="auth"
+	// 计算证书 hash（用于 vpn-base-config）
+	certHash := h.getServerCertHash()
+	if certHash == "" {
+		certHash = "0000000000000000000000000000000000000000" // 默认值（如果无法读取证书）
+	}
+
+	// 从 sessionID 中提取 session-id（格式：webvpn-username-userID）
+	sessionIDOnly := sessionID
+	if parts := strings.Split(sessionID, "-"); len(parts) >= 3 {
+		// 使用时间戳作为 session-id
+		sessionIDOnly = strconv.FormatInt(time.Now().Unix(), 10)
+	}
+
+	// 计算 profile.xml 的 SHA1 hash（仅当 AnyConnect 客户端时需要）
+	// OpenConnect 客户端不需要 profile.xml，跳过下载以优化连接速度
+	var profileHash string
+	var profileManifestXML string
+	if isAnyConnect {
+		// AnyConnect 客户端需要 profile.xml，计算 hash 并包含 manifest
+		profileHash = h.getProfileHash(c)
+		profileManifestXML = `
+		<vpn-profile-manifest>
+			<vpn rev="1.0">
+				<file type="profile" service-type="user">
+					<uri>/profile.xml</uri>
+					<hash type="sha1">` + profileHash + `</hash>
+				</file>
+			</vpn>
+		</vpn-profile-manifest>`
+	}
+
 	xml := `<?xml version="1.0" encoding="UTF-8"?>
-<config-auth client="vpn" type="auth" aggregate-auth-version="2">
+<config-auth client="vpn" type="complete" aggregate-auth-version="2">
+	<session-id>` + sessionIDOnly + `</session-id>
 	<session-token>` + sessionID + `</session-token>
-
-	<auth>
-		<banner>欢迎连接 ZVPN</banner>
-	</auth>
-
 	<auth id="success">
-		<banner>认证成功，正在建立隧道...</banner>
+		<banner>欢迎连接 ZVPN</banner>
+		<message id="0" param1="" param2=""></message>
 	</auth>
-
+	<capabilities>
+		<crypto-supported>ssl-dhe</crypto-supported>
+	</capabilities>
+	<config client="vpn" type="private">
+		<vpn-base-config>
+			<server-cert-hash>` + certHash + `</server-cert-hash>
+		</vpn-base-config>
+		<opaque is-for="vpn-client"></opaque>` + profileManifestXML + `
+	</config>
 	<cstp:config xmlns:cstp="http://www.cisco.com/cstp">
 		<!-- IP 地址配置 -->
 		<cstp:address-pool>
@@ -1079,71 +1152,246 @@ func (h *Handler) Authenticate(c *gin.Context) {
 		<!-- DTLS 配置（启用以提升性能） -->` + getDTLSConfig(h.config, c.Request.Host) + `
 
 		<!-- 心跳和保活 -->
-		<cstp:keepalive>20</cstp:keepalive>
-		<cstp:dpd>20</cstp:dpd>
+		<!-- 从配置读取，与 HTTP header 中的 X-CSTP-Keepalive 和 X-CSTP-DPD 保持一致 -->
+		<!-- Keepalive: 防止 NAT/防火墙/代理设备关闭连接，默认 20 秒（AnyConnect 标准） -->
+		<!-- DPD: 死连接检测，默认 30 秒 -->
+		<!-- 注意：read timeout 应该略大于 keepalive 值，以便在超时前发送 keepalive -->
+		<!-- TCP keepalive 由 X-CSTP-TCP-Keepalive 控制，XML 中不设置 -->
+		<cstp:keepalive>` + func() string {
+		cstpKeepalive := h.config.VPN.CSTPKeepalive
+		if cstpKeepalive == 0 {
+			cstpKeepalive = 20 // 默认值：20秒（AnyConnect 标准）
+		}
+		return strconv.Itoa(cstpKeepalive)
+	}() + `</cstp:keepalive>
+		<cstp:dpd>` + func() string {
+		cstpDPD := h.config.VPN.CSTPDPD
+		if cstpDPD == 0 {
+			cstpDPD = 30 // 默认值：30秒
+		}
+		return strconv.Itoa(cstpDPD)
+	}() + `</cstp:dpd>
 
 		<!-- 压缩 -->
 		<cstp:compression>` + getCompressionType(h.config) + `</cstp:compression>
 	</cstp:config>
 </config-auth>`
 
-	// 打印完整的XML响应（用于调试路由策略问题）
-	log.Printf("OpenConnect: Full XML response for user %s:", user.Username)
-	log.Println(xml)
-	log.Printf("OpenConnect: Sending auth response to user %s (IP: %s, routes: %v)", user.Username, user.VPNIP, splitIncludeRoutes)
+	c.Writer.Header().Del("Server")
+	c.Writer.Header().Del("X-Powered-By")
+	c.Header("Content-Type", "text/xml; charset=utf-8")
+	c.Header("Content-Length", strconv.Itoa(len(xml)))
+	c.Header("Connection", h.getConnectionHeader(c))
+	c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
+	c.Header("Pragma", "no-cache")
+	c.Header("Expires", "0")
 
 	c.Data(http.StatusOK, "text/xml; charset=utf-8", []byte(xml))
+}
+
+// handleLogout 处理退出登录请求
+func (h *Handler) handleLogout(c *gin.Context) {
+	// 清除会话 cookie
+	c.SetCookie("webvpn", "", -1, "/", "", true, true)
+
+	// 返回退出登录确认
+	xml := `<?xml version="1.0" encoding="UTF-8"?>
+<config-auth client="vpn" type="complete" aggregate-auth-version="2">
+	<logout>
+		<message>Logout successful</message>
+	</logout>
+</config-auth>`
+
+	c.Writer.Header().Del("Server")
+	c.Writer.Header().Del("X-Powered-By")
+	c.Header("Content-Type", "text/xml; charset=utf-8")
+	c.Header("Content-Length", strconv.Itoa(len(xml)))
+	c.Header("Connection", h.getConnectionHeader(c))
+	c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
+	c.Header("Pragma", "no-cache")
+	c.Header("Expires", "0")
+
+	c.Data(http.StatusOK, "text/xml; charset=utf-8", []byte(xml))
+}
+
+func (h *Handler) getConnectionHeader(c *gin.Context) string {
+	return "keep-alive"
+}
+
+// checkConnectionHeader 检查客户端是否使用短链接，如果是则拒绝
+func (h *Handler) checkConnectionHeader(c *gin.Context) bool {
+	clientConnection := strings.ToLower(c.Request.Header.Get("Connection"))
+	if clientConnection == "close" {
+		log.Printf("OpenConnect: Rejecting short connection (Connection: close) from %s", c.ClientIP())
+		c.AbortWithStatus(http.StatusBadRequest)
+		return false
+	}
+	return true
 }
 
 // sendAuthForm 发送认证表单（用于初始化请求）
 func (h *Handler) sendAuthForm(c *gin.Context) {
 	serverURL := "https://" + c.Request.Host
+	// 检查客户端是否发送了 group-select 参数（Cisco Secure Client 的 default_group）
+	// 如果客户端发送了 group-select，使用客户端选择的组；否则使用 "default"
+	tunnelGroup := "default"
+	groupAlias := "default"
 
-	xml := `<?xml version="1.0" encoding="UTF-8"?>
-<config-auth client="vpn" type="auth-request" aggregate-auth-version="2">
-    <version who="sg">0.1(1)0</version>
-    <auth id="main">
-        <title>ZVPN Login</title>
-        <message>Please enter your username and password.</message>
-        <form method="post" action="/auth">
-            <input type="text" name="username" label="Username:" />
-            <input type="password" name="password" label="Password:" />
-        </form>
-    </auth>
-    <config>
-        <profile-url>` + serverURL + `/profile.xml</profile-url>
-    </config>
-</config-auth>`
+	// 尝试从请求体中解析 group-select（如果客户端发送了）
+	// 支持两种方式：
+	// 1. XML 格式：<opaque><group-select>xxx</group-select></opaque>（Cisco Secure Client）
+	// 2. 表单格式：group_list=xxx（OpenConnect 客户端使用 --authgroup 参数）
+	bodyBytes, _ := c.GetRawData()
+	if len(bodyBytes) > 0 {
+		var authReq AuthRequest
+		if bytes.HasPrefix(bytes.TrimSpace(bodyBytes), []byte("<?xml")) {
+			// XML 格式：解析 group-select 或 tunnel-group
+			if err := xml.Unmarshal(bodyBytes, &authReq); err == nil {
+				// 客户端发送了 group-select 或 tunnel-group
+				if authReq.Opaque.GroupSelect != "" {
+					tunnelGroup = authReq.Opaque.GroupSelect
+					groupAlias = authReq.Opaque.GroupSelect
+					log.Printf("OpenConnect: Client requested group-select (XML): %s", tunnelGroup)
+				} else if authReq.Opaque.TunnelGroup != "" {
+					tunnelGroup = authReq.Opaque.TunnelGroup
+					groupAlias = authReq.Opaque.TunnelGroup
+					log.Printf("OpenConnect: Client requested tunnel-group (XML): %s", tunnelGroup)
+				}
+			}
+		}
+		// 恢复请求体，供后续使用
+		c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+	}
+
+	// XML 格式参考标准 AnyConnect，保持兼容性
+	// 使用客户端选择的组（如果有），否则使用 "default"
+	// 生成唯一的 aggauth-handle 和 config-hash（基于时间戳）
+	aggauthHandle := fmt.Sprintf("%d", time.Now().UnixNano()%1000000000)
+	configHash := fmt.Sprintf("%d", time.Now().UnixNano()%10000000000)
+
+	xmlContent := "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+	xmlContent += "<config-auth client=\"vpn\" type=\"auth-request\" aggregate-auth-version=\"2\">\n"
+	xmlContent += "    <opaque is-for=\"sg\">\n"
+	xmlContent += "        <tunnel-group>" + tunnelGroup + "</tunnel-group>\n"
+	xmlContent += "        <group-alias>" + groupAlias + "</group-alias>\n"
+	xmlContent += "        <aggauth-handle>" + aggauthHandle + "</aggauth-handle>\n"
+	xmlContent += "        <config-hash>" + configHash + "</config-hash>\n"
+	xmlContent += "        <auth-method>password</auth-method>\n"
+	xmlContent += "    </opaque>\n"
+	xmlContent += "    <auth id=\"main\">\n"
+	xmlContent += "        <form>\n"
+	xmlContent += "            <input type=\"text\" name=\"username\" label=\"Username:\"></input>\n"
+	xmlContent += "            <input type=\"password\" name=\"password\" label=\"Password:\"></input>\n"
+	xmlContent += "            <select name=\"group_list\" label=\"GROUP:\">\n"
+	xmlContent += "                <option selected=\"true\">" + groupAlias + "</option>\n"
+	xmlContent += "            </select>\n"
+	xmlContent += "        </form>\n"
+	xmlContent += "    </auth>\n"
+	xmlContent += "    <config>\n"
+	xmlContent += "        <profile-url>" + serverURL + "/profile.xml</profile-url>\n"
+	xmlContent += "    </config>\n"
+	xmlContent += "</config-auth>"
+
+	c.Writer.Header().Del("Server")
+	c.Writer.Header().Del("X-Powered-By")
+
+	responseConnection := h.getConnectionHeader(c)
+
 	c.Header("Content-Type", "text/xml; charset=utf-8")
-	c.Data(http.StatusOK, "text/xml; charset=utf-8", []byte(xml))
+	c.Header("Content-Length", strconv.Itoa(len(xmlContent)))
+	c.Header("Connection", responseConnection)
+	c.Header("Cache-Control", "no-cache, no-store, must-revalidate")
+	c.Header("Pragma", "no-cache")
+	c.Header("Expires", "0")
+	c.Header("X-Frame-Options", "DENY")
+	c.Header("X-Content-Type-Options", "nosniff")
+
+	c.Data(http.StatusOK, "text/xml; charset=utf-8", []byte(xmlContent))
+
+	if flusher, ok := c.Writer.(http.Flusher); ok {
+		flusher.Flush()
+	}
+
+	// CRITICAL: Do not close the connection here
+	// The client may send additional requests (like CONNECT) on the same connection
+	// Gin will handle connection management automatically based on Connection header
+	// If we return here, Gin will keep the connection open for keep-alive requests
 }
 
 // sendAuthError 发送认证错误
+// 在 auth-request 中包含错误信息，而不是使用 auth-fail
 func (h *Handler) sendAuthError(c *gin.Context, message string) {
 	// 返回符合 OpenConnect 协议的 XML 错误响应
 	// 使用字符串构建，确保格式完全正确
 	serverURL := "https://" + c.Request.Host
 
-	xml := `<?xml version="1.0" encoding="UTF-8"?>
-<config-auth client="vpn" type="auth-fail" aggregate-auth-version="2">
-    <version who="sg">0.1(1)0</version>
-    <auth id="main">
-        <title>Authentication Failed</title>
-        <message>` + message + `</message>
-        <form method="post" action="/auth">
-            <input type="text" name="username" label="Username:" />
-            <input type="password" name="password" label="Password:" />
-        </form>
-    </auth>
-    <config>
-        <profile-url>` + serverURL + `/profile.xml</profile-url>
-    </config>
-</config-auth>`
+	// XML 格式：在 auth-request 中包含错误信息
+	xml := "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+	xml += "<config-auth client=\"vpn\" type=\"auth-request\" aggregate-auth-version=\"2\">\n"
+	xml += "    <opaque is-for=\"sg\">\n"
+	xml += "        <tunnel-group>default</tunnel-group>\n"
+	xml += "        <group-alias>default</group-alias>\n"
+	xml += "        <aggauth-handle>168179266</aggauth-handle>\n"
+	xml += "        <config-hash>1595829378234</config-hash>\n"
+	xml += "        <auth-method>password</auth-method>\n"
+	xml += "    </opaque>\n"
+	xml += "    <auth id=\"main\">\n"
+	xml += "        <title>Authentication Failed</title>\n"
+	xml += "        <message>" + message + "</message>\n"
+	xml += "        <banner></banner>\n"
+	xml += "        <form method=\"post\" action=\"/\">\n"
+	xml += "            <input type=\"text\" name=\"username\" label=\"Username:\" />\n"
+	xml += "            <input type=\"password\" name=\"password\" label=\"Password:\" />\n"
+	xml += "        </form>\n"
+	xml += "    </auth>\n"
+	xml += "    <config>\n"
+	xml += "        <profile-url>" + serverURL + "/profile.xml</profile-url>\n"
+	xml += "    </config>\n"
+	xml += "</config-auth>"
 
-	// 设置正确的 Content-Type，避免客户端误认为是 Basic Auth
+	// 根据客户端的 Connection header 设置响应头
+	// 对于 AnyConnect 客户端，强制使用 keep-alive（即使客户端发送了 close）
+	responseConnection := h.getConnectionHeader(c)
+
 	c.Header("Content-Type", "text/xml; charset=utf-8")
-	// 不要返回 401，返回 200 但 type="auth-fail"，这样客户端不会认为是 Basic Auth
+	c.Header("Content-Length", strconv.Itoa(len(xml)))
+	c.Header("Connection", responseConnection)
+
+	// 使用 Gin 的标准响应方法，确保连接管理正确
 	c.Data(http.StatusOK, "text/xml; charset=utf-8", []byte(xml))
+}
+
+// getServerCertHash 计算服务器证书的 SHA1 hash（用于 vpn-base-config）
+func (h *Handler) getServerCertHash() string {
+	// 尝试加载证书文件
+	certFile := h.config.VPN.CertFile
+	if certFile == "" {
+		certFile = "./certs/server.crt"
+	}
+
+	certPEM, err := os.ReadFile(certFile)
+	if err != nil {
+		log.Printf("OpenConnect: Failed to read certificate file %s: %v, using empty hash", certFile, err)
+		return ""
+	}
+
+	// 解析 PEM 格式的证书
+	block, _ := pem.Decode(certPEM)
+	if block == nil {
+		log.Printf("OpenConnect: Failed to decode certificate PEM")
+		return ""
+	}
+
+	// 解析 X.509 证书
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		log.Printf("OpenConnect: Failed to parse certificate: %v", err)
+		return ""
+	}
+
+	// 计算 SHA1 hash（AnyConnect 使用 SHA1）
+	hash := sha1.Sum(cert.Raw)
+	return strings.ToUpper(hex.EncodeToString(hash[:]))
 }
 
 // generatePasswordToken 生成密码验证token（用于多步骤认证）
@@ -1151,9 +1399,8 @@ func (h *Handler) generatePasswordToken(username string) string {
 	timestamp := time.Now().Unix()
 	message := fmt.Sprintf("%s:%d", username, timestamp)
 
-	// 使用默认密钥（用于生成密码验证token）
-	// 在生产环境中，应该使用配置的密钥
-	secret := "zvpn-default-secret-key-change-in-production"
+	// 使用 JWT secret 作为密钥（与 JWT token 使用相同的密钥）
+	secret := h.config.JWT.Secret
 
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write([]byte(message))
@@ -1193,8 +1440,7 @@ func (h *Handler) verifyPasswordToken(token string, username string) bool {
 		return false
 	}
 
-	// 验证签名（使用默认密钥，生产环境应使用配置的密钥）
-	secret := "zvpn-default-secret-key-change-in-production"
+	secret := h.config.JWT.Secret
 
 	message := fmt.Sprintf("%s:%s", tokenUsername, timestampStr)
 	mac := hmac.New(sha256.New, []byte(secret))
@@ -1216,24 +1462,39 @@ func (h *Handler) sendOTPRequest(c *gin.Context, username string, errorMessage s
 		message = errorMessage
 	}
 
-	xml := `<?xml version="1.0" encoding="UTF-8"?>
-<config-auth client="vpn" type="auth-request" aggregate-auth-version="2">
-    <version who="sg">0.1(1)0</version>
-    <auth id="otp">
-        <title>OTP Authentication</title>
-        <message>` + message + `</message>
-        <form method="post" action="/auth">
-            <input type="hidden" name="username" value="` + username + `" />
-            <input type="hidden" name="password-token" value="` + passwordToken + `" />
-            <input type="text" name="otp-code" label="OTP Code (6 digits):" />
-        </form>
-    </auth>
-    <config>
-        <profile-url>` + serverURL + `/profile.xml</profile-url>
-    </config>
-</config-auth>`
+	// XML 格式：保持与其他响应一致的格式
+	xml := "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+	xml += "<config-auth client=\"vpn\" type=\"auth-request\" aggregate-auth-version=\"2\">\n"
+	xml += "    <opaque is-for=\"sg\">\n"
+	xml += "        <tunnel-group>default</tunnel-group>\n"
+	xml += "        <group-alias>default</group-alias>\n"
+	xml += "        <aggauth-handle>168179266</aggauth-handle>\n"
+	xml += "        <config-hash>1595829378234</config-hash>\n"
+	xml += "        <auth-method>password</auth-method>\n"
+	xml += "    </opaque>\n"
+	xml += "    <auth id=\"otp\">\n"
+	xml += "        <title>OTP Authentication</title>\n"
+	xml += "        <message>" + message + "</message>\n"
+	xml += "        <form method=\"post\" action=\"/\">\n"
+	xml += "            <input type=\"hidden\" name=\"username\" value=\"" + username + "\" />\n"
+	xml += "            <input type=\"hidden\" name=\"password-token\" value=\"" + passwordToken + "\" />\n"
+	xml += "            <input type=\"text\" name=\"otp-code\" label=\"OTP Code (6 digits):\" />\n"
+	xml += "        </form>\n"
+	xml += "    </auth>\n"
+	xml += "    <config>\n"
+	xml += "        <profile-url>" + serverURL + "/profile.xml</profile-url>\n"
+	xml += "    </config>\n"
+	xml += "</config-auth>"
+
+	// 根据客户端的 Connection header 设置响应头
+	// 对于 AnyConnect 客户端，强制使用 keep-alive（即使客户端发送了 close）
+	responseConnection := h.getConnectionHeader(c)
 
 	c.Header("Content-Type", "text/xml; charset=utf-8")
+	c.Header("Content-Length", strconv.Itoa(len(xml)))
+	c.Header("Connection", responseConnection)
+
+	// 使用 Gin 的标准响应方法，确保连接管理正确
 	c.Data(http.StatusOK, "text/xml; charset=utf-8", []byte(xml))
 }
 
@@ -1272,10 +1533,8 @@ func (h *Handler) sendOTPSetupRequest(c *gin.Context, username string) {
 			h.sendAuthError(c, "Failed to generate OTP key")
 			return
 		}
-		// 使用用户现有的secret（不更新）
 		secret = user.OTPSecret
 	} else {
-		// 生成新的OTP密钥
 		key, err = totp.Generate(totp.GenerateOpts{
 			Issuer:      "ZVPN",
 			AccountName: user.Username,
@@ -1288,8 +1547,6 @@ func (h *Handler) sendOTPSetupRequest(c *gin.Context, username string) {
 		secret = key.Secret()
 	}
 
-	// 生成二维码图片
-	// 注意：如果用户已有secret，生成的二维码可能不匹配，但验证时会使用正确的secret
 	img, err := key.Image(200, 200)
 	if err != nil {
 		log.Printf("OpenConnect: Failed to generate QR code for user %s: %v", username, err)
@@ -1297,7 +1554,6 @@ func (h *Handler) sendOTPSetupRequest(c *gin.Context, username string) {
 		return
 	}
 
-	// 将图片转换为base64
 	var buf strings.Builder
 	buf.WriteString("data:image/png;base64,")
 	encoder := base64.NewEncoder(base64.StdEncoding, &buf)
@@ -1309,9 +1565,7 @@ func (h *Handler) sendOTPSetupRequest(c *gin.Context, username string) {
 	encoder.Close()
 	qrCode := buf.String()
 
-	// 临时保存OTP密钥到用户（但不启用，等用户验证OTP后再启用）
 	user.OTPSecret = secret
-	// 注意：这里不设置OTPEnabled为true，等用户验证OTP代码后再启用
 	if err := database.DB.Save(&user).Error; err != nil {
 		log.Printf("OpenConnect: Failed to save OTP secret for user %s: %v", username, err)
 		h.sendAuthError(c, "Failed to save OTP secret")
@@ -1320,26 +1574,41 @@ func (h *Handler) sendOTPSetupRequest(c *gin.Context, username string) {
 
 	message := "Please scan the QR code with your authenticator app (e.g., Google Authenticator), then enter the OTP code to complete setup."
 
-	xml := `<?xml version="1.0" encoding="UTF-8"?>
-<config-auth client="vpn" type="auth-request" aggregate-auth-version="2">
-    <version who="sg">0.1(1)0</version>
-    <auth id="otp-setup">
-        <title>OTP Setup Required</title>
-        <message>` + message + `</message>
-        <banner>Scan this QR code with your authenticator app:</banner>
-        <img src="` + qrCode + `" alt="OTP QR Code" style="max-width: 200px; display: block; margin: 10px auto;" />
-        <form method="post" action="/auth">
-            <input type="hidden" name="username" value="` + username + `" />
-            <input type="hidden" name="password-token" value="` + passwordToken + `" />
-            <input type="hidden" name="otp-setup" value="true" />
-            <input type="text" name="otp-code" label="OTP Code (6 digits):" />
-        </form>
-    </auth>
-    <config>
-        <profile-url>` + serverURL + `/profile.xml</profile-url>
-    </config>
-</config-auth>`
+	// XML 格式：保持与其他响应一致的格式
+	xml := "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+	xml += "<config-auth client=\"vpn\" type=\"auth-request\" aggregate-auth-version=\"2\">\n"
+	xml += "    <opaque is-for=\"sg\">\n"
+	xml += "        <tunnel-group>default</tunnel-group>\n"
+	xml += "        <group-alias>default</group-alias>\n"
+	xml += "        <aggauth-handle>168179266</aggauth-handle>\n"
+	xml += "        <config-hash>1595829378234</config-hash>\n"
+	xml += "        <auth-method>password</auth-method>\n"
+	xml += "    </opaque>\n"
+	xml += "    <auth id=\"otp-setup\">\n"
+	xml += "        <title>OTP Setup Required</title>\n"
+	xml += "        <message>" + message + "</message>\n"
+	xml += "        <banner>Scan this QR code with your authenticator app:</banner>\n"
+	xml += "        <img src=\"" + qrCode + "\" alt=\"OTP QR Code\" style=\"max-width: 200px; display: block; margin: 10px auto;\" />\n"
+	xml += "        <form method=\"post\" action=\"/\">\n"
+	xml += "            <input type=\"hidden\" name=\"username\" value=\"" + username + "\" />\n"
+	xml += "            <input type=\"hidden\" name=\"password-token\" value=\"" + passwordToken + "\" />\n"
+	xml += "            <input type=\"hidden\" name=\"otp-setup\" value=\"true\" />\n"
+	xml += "            <input type=\"text\" name=\"otp-code\" label=\"OTP Code (6 digits):\" />\n"
+	xml += "        </form>\n"
+	xml += "    </auth>\n"
+	xml += "    <config>\n"
+	xml += "        <profile-url>" + serverURL + "/profile.xml</profile-url>\n"
+	xml += "    </config>\n"
+	xml += "</config-auth>"
+
+	// 根据客户端的 Connection header 设置响应头
+	// 对于 AnyConnect 客户端，强制使用 keep-alive（即使客户端发送了 close）
+	responseConnection := h.getConnectionHeader(c)
 
 	c.Header("Content-Type", "text/xml; charset=utf-8")
+	c.Header("Content-Length", strconv.Itoa(len(xml)))
+	c.Header("Connection", responseConnection)
+
+	// 使用 Gin 的标准响应方法，确保连接管理正确
 	c.Data(http.StatusOK, "text/xml; charset=utf-8", []byte(xml))
 }

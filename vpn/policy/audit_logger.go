@@ -1,13 +1,16 @@
 package policy
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/fisker/zvpn/database"
 	"github.com/fisker/zvpn/models"
+	"gorm.io/gorm"
 )
 
 // AuditLogger handles audit logging for policy execution
@@ -20,6 +23,17 @@ type AuditLogger struct {
 
 var globalAuditLogger *AuditLogger
 var auditLoggerOnce sync.Once
+
+// auditLogProtocolCache caches enabled protocols to avoid frequent DB queries
+var auditLogProtocolCache struct {
+	protocols  map[string]bool
+	lastUpdate time.Time
+	lock       sync.RWMutex
+	loading    bool // Flag to prevent concurrent DB queries
+}
+
+const auditLogSettingKey = "audit_log_settings"
+const auditLogCacheTTL = 5 * time.Minute // Cache for 5 minutes to reduce DB queries
 
 // GetAuditLogger returns the global audit logger instance
 func GetAuditLogger() *AuditLogger {
@@ -173,6 +187,11 @@ func (al *AuditLogger) LogAccess(ctx *Context, hook Hook, action Action, result 
 		protocol = inferApplicationProtocol(protocol, ctx.DstPort)
 	}
 	// If protocol is already an application protocol (http, https, ssh, etc.), use it as-is
+
+	// 根据设置决定是否记录该协议的日志
+	if !ShouldLogProtocol(protocol, ctx.DstPort) {
+		return
+	}
 
 	// 构建更详细的资源路径信息，清晰显示访问的目标对象
 	resourcePath := ctx.DstIP
@@ -366,7 +385,7 @@ func (al *AuditLogger) LogAuthWithIP(userID uint, username string, action models
 	}
 
 	al.writeLog(auditLog)
-	
+
 	// For authentication events (especially failures), try to flush immediately
 	// This ensures critical auth logs are written even if the buffer hasn't reached threshold
 	// Use async flush to avoid blocking the authentication flow
@@ -441,5 +460,141 @@ func convertActionToAuditAction(action Action) models.AuditLogAction {
 		return models.AuditLogActionAllow // Redirect is treated as allow
 	default:
 		return models.AuditLogActionAllow
+	}
+}
+
+// ShouldLogProtocol checks if a protocol should be logged based on settings
+// This is exported so other packages can use it
+func ShouldLogProtocol(protocol string, dstPort uint16) bool {
+	// Get enabled protocols from cache or DB
+	enabledProtocols := getEnabledAuditLogProtocols()
+
+	// Check if protocol is enabled
+	if enabled, ok := enabledProtocols[protocol]; ok {
+		return enabled
+	}
+
+	// For DNS, also check by port
+	if dstPort == 53 && protocol != "dns" {
+		// This is likely DNS traffic, check DNS setting
+		if enabled, ok := enabledProtocols["dns"]; ok {
+			return enabled
+		}
+	}
+
+	// Default: if protocol not in settings, allow logging (backward compatibility)
+	// But for known high-frequency protocols, default to false
+	if protocol == "dns" || protocol == "icmp" {
+		return false
+	}
+
+	return true
+}
+
+// ClearAuditLogProtocolCache clears the cache to force reload on next access
+// This should be called when settings are updated
+func ClearAuditLogProtocolCache() {
+	auditLogProtocolCache.lock.Lock()
+	defer auditLogProtocolCache.lock.Unlock()
+	auditLogProtocolCache.protocols = nil
+	auditLogProtocolCache.lastUpdate = time.Time{} // Reset to zero time
+	auditLogProtocolCache.loading = false
+}
+
+// getEnabledAuditLogProtocols returns the map of enabled protocols
+func getEnabledAuditLogProtocols() map[string]bool {
+	auditLogProtocolCache.lock.RLock()
+	// Check if cache is still valid
+	if time.Since(auditLogProtocolCache.lastUpdate) < auditLogCacheTTL && auditLogProtocolCache.protocols != nil {
+		protocols := auditLogProtocolCache.protocols
+		auditLogProtocolCache.lock.RUnlock()
+		return protocols
+	}
+	auditLogProtocolCache.lock.RUnlock()
+
+	// Cache expired or not set, reload from DB
+	auditLogProtocolCache.lock.Lock()
+
+	// Double check after acquiring write lock
+	if time.Since(auditLogProtocolCache.lastUpdate) < auditLogCacheTTL && auditLogProtocolCache.protocols != nil {
+		protocols := auditLogProtocolCache.protocols
+		auditLogProtocolCache.lock.Unlock()
+		return protocols
+	}
+
+	// Prevent concurrent DB queries - if another goroutine is already loading, wait and return current cache
+	if auditLogProtocolCache.loading {
+		// Another goroutine is loading, return current cache or defaults
+		if auditLogProtocolCache.protocols != nil {
+			protocols := auditLogProtocolCache.protocols
+			auditLogProtocolCache.lock.Unlock()
+			return protocols
+		}
+		protocols := getDefaultAuditLogProtocols()
+		auditLogProtocolCache.lock.Unlock()
+		return protocols
+	}
+
+	// Mark as loading
+	auditLogProtocolCache.loading = true
+	auditLogProtocolCache.lock.Unlock()
+
+	// Load from DB (without holding lock to avoid blocking)
+	// Check if database is initialized
+	var newProtocols map[string]bool
+	if database.DB == nil {
+		// Database not initialized yet, use defaults
+		log.Printf("Database not initialized, using default audit log protocols")
+		newProtocols = getDefaultAuditLogProtocols()
+	} else {
+		var setting models.SystemSetting
+		err := database.DB.Where("`key` = ?", auditLogSettingKey).First(&setting).Error
+
+		if err != nil {
+			if err == gorm.ErrRecordNotFound {
+				// Use defaults
+				newProtocols = getDefaultAuditLogProtocols()
+			} else {
+				log.Printf("Failed to load audit log settings: %v", err)
+				// Use defaults on error
+				newProtocols = getDefaultAuditLogProtocols()
+			}
+		} else {
+			// Parse JSON
+			var settings struct {
+				EnabledProtocols map[string]bool `json:"enabled_protocols"`
+			}
+			if err := json.Unmarshal([]byte(setting.Value), &settings); err != nil {
+				log.Printf("Failed to parse audit log settings: %v", err)
+				newProtocols = getDefaultAuditLogProtocols()
+			} else {
+				newProtocols = settings.EnabledProtocols
+			}
+		}
+	}
+
+	// Update cache with write lock
+	auditLogProtocolCache.lock.Lock()
+	auditLogProtocolCache.protocols = newProtocols
+	auditLogProtocolCache.lastUpdate = time.Now()
+	auditLogProtocolCache.loading = false
+	auditLogProtocolCache.lock.Unlock()
+
+	return newProtocols
+}
+
+// getDefaultAuditLogProtocols returns default enabled protocols
+func getDefaultAuditLogProtocols() map[string]bool {
+	return map[string]bool{
+		"tcp":   true,
+		"udp":   true,
+		"http":  true,
+		"https": true,
+		"ssh":   true,
+		"ftp":   true,
+		"smtp":  true,
+		"mysql": true,
+		"dns":   false, // DNS queries are too frequent
+		"icmp":  false, // ICMP (ping) is too frequent
 	}
 }

@@ -11,6 +11,7 @@ import (
 	"github.com/fisker/zvpn/models"
 	"github.com/fisker/zvpn/vpn"
 	"github.com/fisker/zvpn/vpn/ebpf"
+	"github.com/fisker/zvpn/vpn/policy"
 	"github.com/fisker/zvpn/vpn/security"
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
@@ -231,6 +232,92 @@ func (h *SettingsHandler) UpdateDistributedSyncSettings(c *gin.Context) {
 		"change_check_interval":   req.ChangeCheckInterval,
 		"message":                 "Distributed sync settings updated",
 	})
+}
+
+// AuditLogSettingsRequest for audit log protocol filtering
+type AuditLogSettingsRequest struct {
+	EnabledProtocols map[string]bool `json:"enabled_protocols"` // protocol -> enabled
+}
+
+// GetAuditLogSettings returns audit log protocol settings
+func (h *SettingsHandler) GetAuditLogSettings(c *gin.Context) {
+	settings := AuditLogSettingsRequest{
+		EnabledProtocols: getDefaultAuditLogProtocols(),
+	}
+	if err := h.loadAuditLogFromDB(&settings); err != nil && err != gorm.ErrRecordNotFound {
+		log.Printf("Failed to load audit log settings from DB: %v", err)
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"enabled_protocols": settings.EnabledProtocols,
+	})
+}
+
+// UpdateAuditLogSettings updates audit log protocol settings
+func (h *SettingsHandler) UpdateAuditLogSettings(c *gin.Context) {
+	var req AuditLogSettingsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Persist
+	if err := h.saveAuditLogToDB(&req); err != nil {
+		log.Printf("Failed to persist audit log settings: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save settings"})
+		return
+	}
+
+	// Clear cache in policy and eBPF packages to force reload on next access
+	// This ensures that settings changes take effect immediately without waiting for cache TTL
+	policy.ClearAuditLogProtocolCache()
+	// Clear eBPF cache (stub implementation when eBPF is not compiled)
+	ebpf.ClearEBPFAuditLogProtocolCache()
+	log.Println("Audit log settings updated - caches cleared, new settings will be loaded on next access")
+
+	c.JSON(http.StatusOK, gin.H{
+		"enabled_protocols": req.EnabledProtocols,
+		"message":           "Audit log settings updated",
+	})
+}
+
+// getDefaultAuditLogProtocols returns default enabled protocols
+// Default: TCP, UDP, HTTP, HTTPS enabled; DNS, ICMP disabled
+func getDefaultAuditLogProtocols() map[string]bool {
+	return map[string]bool{
+		"tcp":   true,
+		"udp":   true,
+		"http":  true,
+		"https": true,
+		"ssh":   true,
+		"ftp":   true,
+		"smtp":  true,
+		"mysql": true,
+		"dns":   false, // DNS queries are too frequent
+		"icmp":  false, // ICMP (ping) is too frequent
+	}
+}
+
+func (h *SettingsHandler) saveAuditLogToDB(req *AuditLogSettingsRequest) error {
+	data, err := json.Marshal(req)
+	if err != nil {
+		return err
+	}
+	return database.DB.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "key"}},
+		DoUpdates: clause.AssignmentColumns([]string{"value", "updated_at"}),
+	}).Create(&models.SystemSetting{Key: auditLogSettingKey, Value: string(data)}).Error
+}
+
+func (h *SettingsHandler) loadAuditLogFromDB(out *AuditLogSettingsRequest) error {
+	var setting models.SystemSetting
+	err := database.DB.Where("`key` = ?", auditLogSettingKey).First(&setting).Error
+	if err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return err
+		}
+		return err
+	}
+	return json.Unmarshal([]byte(setting.Value), out)
 }
 
 // UpdateSecuritySettings updates security and protection settings
@@ -480,6 +567,7 @@ const (
 	perfSettingKey     = "performance_settings"
 	securitySettingKey = "security_settings"
 	distributedSyncKey = "distributed_sync_settings"
+	auditLogSettingKey = "audit_log_settings"
 )
 
 func (h *SettingsHandler) savePerformanceToDB(req *PerformanceSettingsRequest) error {

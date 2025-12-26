@@ -3,6 +3,7 @@ package openconnect
 import (
 	"encoding/json"
 	"net"
+	"strconv"
 	"strings"
 
 	"github.com/fisker/zvpn/config"
@@ -68,10 +69,32 @@ func getDTLSConfig(cfg *config.Config, clientHost string) string {
 		clientHost = clientHost[:colonPos]
 	}
 
-	// 构建完整的 DTLS 配置
+	// 构建完整的 DTLS 配置（增强版本）
 	dtlsConfig := "\n\t\t<cstp:dtls-enabled>true</cstp:dtls-enabled>"
 	dtlsConfig += "\n\t\t<cstp:dtls-host>" + clientHost + "</cstp:dtls-host>"
 	dtlsConfig += "\n\t\t<cstp:dtls-port>" + dtlsPort + "</cstp:dtls-port>"
+
+	// 新增：添加MTU配置（与CSTP保持一致）
+	dtlsConfig += "\n\t\t<cstp:dtls-mtu>" + strconv.Itoa(cfg.VPN.MTU) + "</cstp:dtls-mtu>"
+
+	// 新增：添加超时和保活配置（与 CSTP 保持一致）
+	cstpKeepalive := cfg.VPN.CSTPKeepalive
+	if cstpKeepalive == 0 {
+		cstpKeepalive = 20 // 默认值：20秒（AnyConnect 标准）
+	}
+	cstpDPD := cfg.VPN.CSTPDPD
+	if cstpDPD == 0 {
+		cstpDPD = 30 // 默认值：30秒
+	}
+	dtlsConfig += "\n\t\t<cstp:dtls-keepalive>" + strconv.Itoa(cstpKeepalive) + "</cstp:dtls-keepalive>"
+	dtlsConfig += "\n\t\t<cstp:dtls-dpd>" + strconv.Itoa(cstpDPD) + "</cstp:dtls-dpd>"
+
+	// 新增：添加重传和握手超时配置
+	dtlsConfig += "\n\t\t<cstp:dtls-retrans-timeout>60</cstp:dtls-retrans-timeout>"
+	dtlsConfig += "\n\t\t<cstp:dtls-handshake-timeout>30</cstp:dtls-handshake-timeout>"
+
+	// 新增：添加压缩配置（与CSTP一致）
+	dtlsConfig += "\n\t\t<cstp:dtls-compression>" + getCompressionType(cfg) + "</cstp:dtls-compression>"
 
 	return dtlsConfig
 }

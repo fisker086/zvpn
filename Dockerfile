@@ -138,7 +138,7 @@ RUN dnf install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
         ca-certificates \
         libbpf \
         iproute kmod bash openssl nc wget \
-        iptables nftables \
+        nftables tcpdump \
         kernel-tools || true && \
     dnf clean all && \
     rm -rf /var/cache/dnf /tmp/* /var/tmp/*

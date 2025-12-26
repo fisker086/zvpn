@@ -83,6 +83,25 @@ struct {
     __type(value, __u32);    // Server egress IP for NAT
 } server_egress_ip SEC(".maps");
 
+// Map to store VPN network configuration
+// key 0: VPN network address (e.g., 10.8.0.0)
+// key 1: VPN network mask (e.g., 0xFFFFFF00 for /24)
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 2);
+    __type(key, __u32);
+    __type(value, __u32);
+} vpn_network_config SEC(".maps");
+
+// Map to store policy chain status (optimization: check if chain is empty)
+// key: hook_point, value: 0 = empty/no policies, 1 = has policies
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 5);  // 5 hook points
+    __type(key, __u32);
+    __type(value, __u8);
+} policy_chain_status SEC(".maps");
+
 // Map to store network interfaces by name
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -265,6 +284,13 @@ static __always_inline int match_protocol(__u8 protocol, __u8 policy_protocol, _
 // Execute policy chain for a hook point
 static __always_inline int execute_policy_chain(__u32 hook_point, struct iphdr *ip, 
                                                  void *data_end, __u32 *action) {
+    // OPTIMIZATION: Fast path - check if policy chain is empty for this hook point
+    __u8 *has_policies = bpf_map_lookup_elem(&policy_chain_status, &hook_point);
+    if (!has_policies || *has_policies == 0) {
+        // No policies configured for this hook point, skip policy check
+        return 0;  // No policy matched, allow by default
+    }
+    
     // Iterate through policies in the chain (index from 0 to 63)
     for (__u32 i = 0; i < 64; i++) {
         // Create composite key for the hash map
@@ -390,11 +416,26 @@ static __always_inline int execute_policy_chain(__u32 hook_point, struct iphdr *
     return 0;  // No policy matched
 }
 
-// Helper function to check if IP is in VPN network
+// Helper function to check if IP is in VPN network (read from eBPF map)
 static __always_inline int is_vpn_network(__u32 ip) {
-    __u32 vpn_network = 0x0A080000; // 10.8.0.0
-    __u32 vpn_mask = 0xFFFFFF00;    // /24
-    return (ip & vpn_mask) == vpn_network;
+    // Read VPN network address from map (key 0)
+    __u32 key = 0;
+    __u32 *vpn_net = bpf_map_lookup_elem(&vpn_network_config, &key);
+    if (!vpn_net) {
+        // Fallback to default 10.8.0.0/24 if map not configured
+        return (ip & 0xFFFFFF00) == 0x0A080000;
+    }
+    
+    // Read VPN network mask from map (key 1)
+    key = 1;
+    __u32 *vpn_mask = bpf_map_lookup_elem(&vpn_network_config, &key);
+    if (!vpn_mask) {
+        // Fallback to default /24 mask if map not configured
+        return (ip & 0xFFFFFF00) == *vpn_net;
+    }
+    
+    // Check if IP is in VPN network
+    return (ip & *vpn_mask) == *vpn_net;
 }
 
 // Rate limiting: token bucket algorithm
@@ -671,6 +712,24 @@ int xdp_vpn_forward(struct xdp_md *ctx)
     if ((void *)ip + (ip->ihl * 4) > data_end)
         return XDP_PASS;
     
+    // CRITICAL: Always allow TCP control packets (FIN, RST, SYN) to pass through
+    // Dropping these packets can cause connection state inconsistencies and RST storms
+    // TCP control packets are essential for proper connection establishment and teardown
+    if (ip->protocol == IPPROTO_TCP) {
+        struct tcphdr *tcp = (struct tcphdr *)(ip + 1);
+        // Ensure we can access at least the minimum TCP header (20 bytes)
+        if ((void *)(tcp + 1) <= data_end) {
+            // Check TCP flags using bitfield access (Linux kernel style)
+            // TCP flags: FIN (bit 0), SYN (bit 1), RST (bit 2)
+            // These are critical control packets that must not be dropped
+            if (tcp->fin || tcp->rst || tcp->syn) {
+                // TCP control packet - always pass to maintain connection state
+                // This prevents connection state desynchronization that can cause RST storms
+                return XDP_PASS;
+            }
+        }
+    }
+    
     // Fast path: VPN网络内部流量不应该到达eth0，如果到达了，直接PASS让内核处理
     if (is_vpn_network(ip->saddr) && is_vpn_network(ip->daddr)) {
         // VPN内部流量，应该由zvpn0处理，不应该到达eth0
@@ -680,6 +739,7 @@ int xdp_vpn_forward(struct xdp_md *ctx)
     
     // Security checks: blocked IPs (bruteforce protection), rate limiting, and DDoS protection
     // Check blocked IPs first (highest priority - kernel-level blocking)
+    // Note: TCP control packets are already handled above, so blocked IPs won't affect them
     if (!check_blocked_ip(ip->saddr)) {
         key = 4; // Blocked IP stat (bruteforce protection)
         value = bpf_map_lookup_elem(&stats, &key);
@@ -706,7 +766,8 @@ int xdp_vpn_forward(struct xdp_md *ctx)
         return XDP_DROP;
     }
     
-    // Check if this is a packet from a VPN client accessing external network
+    // OPTIMIZATION: Check if this is a packet from a VPN client accessing external network
+    // This check is done early to optimize VPN client traffic handling
     __u32 vpn_ip = ip->saddr;
     __u32 *client_ip = bpf_map_lookup_elem(&vpn_clients, &vpn_ip);
     
@@ -717,7 +778,8 @@ int xdp_vpn_forward(struct xdp_md *ctx)
         if (value)
             (*value)++;
         
-        // 执行PRE_ROUTING策略检查
+        // OPTIMIZATION: Only execute policy checks if policies are configured
+        // 执行PRE_ROUTING策略检查（仅在策略链非空时）
         if (execute_policy_chain(HOOK_PRE_ROUTING, ip, data_end, &action)) {
             if (action == POLICY_ACTION_DENY) {
                 key = 1;
@@ -731,7 +793,8 @@ int xdp_vpn_forward(struct xdp_md *ctx)
             return XDP_PASS; // 匹配到非 ALLOW 动作，停止后续 hook 点（洋葱模型）
         }
 
-        // 出站流量可视为 POST_ROUTING 阶段，再检查一次
+        // OPTIMIZATION: Skip POST_ROUTING check if no policies configured
+        // 出站流量可视为 POST_ROUTING 阶段，再检查一次（仅在策略链非空时）
         if (execute_policy_chain(HOOK_POST_ROUTING, ip, data_end, &action)) {
             if (action == POLICY_ACTION_DENY) {
                 key = 1;
@@ -747,12 +810,18 @@ int xdp_vpn_forward(struct xdp_md *ctx)
         // 1. XDP 只能看到 ingress 流量（进入 eth0）
         // 2. VPN 客户端访问外部的流量是从 TUN 设备出去的（egress）
         // 3. NAT 应该由 TC (TUN egress) 处理
-        // 4. 这里只做策略检查，然后 PASS 让内核路由
+        // 4. 这里只做策略检查，然后 PASS 让内核路由（快速路径）
         return XDP_PASS;
     }
     
-    // Check if destination IP is the server's own VPN IP (10.8.0.1)
-    __u32 server_vpn_ip = 0x0A080001; // 10.8.0.1 in network byte order
+    // Check if destination IP is the server's own VPN IP (first IP in VPN network)
+    // Server VPN IP = VPN network address + 1
+    key = 0;  // Reuse existing key variable
+    __u32 *vpn_net = bpf_map_lookup_elem(&vpn_network_config, &key);
+    __u32 server_vpn_ip = 0x0A080001; // Default fallback: 10.8.0.1
+    if (vpn_net) {
+        server_vpn_ip = *vpn_net + 1; // First IP in VPN network
+    }
     if (ip->daddr == server_vpn_ip) {
         // 外部访问服务器VPN IP - 更新统计（只统计VPN相关流量）
         key = 0;
@@ -775,7 +844,8 @@ int xdp_vpn_forward(struct xdp_md *ctx)
         return XDP_PASS;
     }
     
-    // Check if destination is VPN network (external -> VPN client)
+    // OPTIMIZATION: Check if destination is VPN network (external -> VPN client)
+    // This check is done early to optimize VPN network traffic handling
     if (is_vpn_network(ip->daddr)) {
         // 外部访问VPN网络 - 更新统计（只统计VPN相关流量）
         key = 0;
@@ -783,7 +853,8 @@ int xdp_vpn_forward(struct xdp_md *ctx)
         if (value)
             (*value)++;
         
-        // 执行PRE_ROUTING策略检查
+        // OPTIMIZATION: Only execute policy checks if policies are configured
+        // 执行PRE_ROUTING策略检查（仅在策略链非空时）
         if (execute_policy_chain(HOOK_PRE_ROUTING, ip, data_end, &action)) {
             if (action == POLICY_ACTION_DENY) {
                 key = 1;
@@ -796,7 +867,8 @@ int xdp_vpn_forward(struct xdp_md *ctx)
             return XDP_PASS; // 匹配到非 ALLOW 动作，停止后续 hook 点
         }
 
-        // 转发到 VPN 客户端的流量，可视为 FORWARD 阶段
+        // OPTIMIZATION: Skip FORWARD check if no policies configured
+        // 转发到 VPN 客户端的流量，可视为 FORWARD 阶段（仅在策略链非空时）
         if (execute_policy_chain(HOOK_FORWARD, ip, data_end, &action)) {
             if (action == POLICY_ACTION_DENY) {
                 key = 1;
@@ -808,11 +880,32 @@ int xdp_vpn_forward(struct xdp_md *ctx)
             return XDP_PASS; // 匹配到非 ALLOW 动作，停止后续 hook 点
         }
         
-        // PASS让内核路由到zvpn0（虚拟网卡会转发给VPN客户端）
+        // PASS让内核路由到zvpn0（虚拟网卡会转发给VPN客户端）（快速路径）
         return XDP_PASS;
     }
     
-    // 其他外部流量 - 执行策略检查
+    // CRITICAL: Check if destination is server's public IP (egress IP)
+    // External clients connect to server's public IP (e.g., 172.21.0.3) to establish VPN connections
+    // These connections should ALWAYS be allowed, regardless of policy rules
+    // This prevents eBPF from blocking VPN server connections
+    // OPTIMIZATION: Check server public IP early to avoid unnecessary policy checks
+    key = 0;
+    __u32 *server_public_ip = bpf_map_lookup_elem(&server_egress_ip, &key);
+    if (server_public_ip && *server_public_ip != 0 && ip->daddr == *server_public_ip) {
+        // External client connecting to server's public IP - always allow
+        // This is necessary for VPN clients to establish connections
+        // Update statistics
+        key = 0;
+        value = bpf_map_lookup_elem(&stats, &key);
+        if (value)
+            (*value)++;
+        // Directly PASS to kernel - no policy check needed (fast path)
+        return XDP_PASS;
+    }
+    
+    // OPTIMIZATION: For non-VPN traffic, only check policies if configured
+    // This avoids unnecessary policy chain iteration when all public IPs are allowed
+    // 其他外部流量 - 执行策略检查（仅在策略链非空时）
     if (execute_policy_chain(HOOK_PRE_ROUTING, ip, data_end, &action)) {
         if (action == POLICY_ACTION_DENY) {
             key = 1;
@@ -825,6 +918,7 @@ int xdp_vpn_forward(struct xdp_md *ctx)
         return XDP_PASS; // 匹配到非 ALLOW 动作，停止后续 hook 点
     }
 
+    // OPTIMIZATION: Skip OUTPUT hook check for non-VPN traffic if no policies configured
     // 对非 VPN 相关的入站流量，在 OUTPUT 阶段再检查一次（近似）
     if (execute_policy_chain(HOOK_OUTPUT, ip, data_end, &action)) {
         if (action == POLICY_ACTION_DENY) {
@@ -837,7 +931,7 @@ int xdp_vpn_forward(struct xdp_md *ctx)
         return XDP_PASS; // 匹配到非 ALLOW 动作，停止后续 hook 点
     }
     
-    // 默认：PASS让内核正常路由
+    // 默认：PASS让内核正常路由（快速路径）
     return XDP_PASS;
 }
 

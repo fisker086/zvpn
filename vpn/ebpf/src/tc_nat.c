@@ -32,6 +32,16 @@ struct {
     __type(value, __u32);    // Server egress IP for NAT
 } server_egress_ip SEC(".maps");
 
+// Map to store VPN network configuration
+// key 0: VPN network address (e.g., 10.8.0.0)
+// key 1: VPN network mask (e.g., 0xFFFFFF00 for /24)
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 2);
+    __type(key, __u32);
+    __type(value, __u32);
+} vpn_network_config SEC(".maps");
+
 // Map to store VPN client IP to real IP mapping
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
@@ -77,6 +87,9 @@ static __always_inline void recalculate_ip_checksum(struct iphdr *ip, void *data
     
     // Sum all 16-bit words in IP header (IP header length is in 4-byte units)
     // Access fields directly to help verifier understand bounds
+    // NOTE: IP header fields are already in network byte order, so we sum them directly
+    // without byte order conversion. The checksum calculation works correctly with
+    // network byte order data.
     __u16 *ptr = (__u16 *)ip;
     __u16 num_words = ip_header_len / 2;
     
@@ -86,7 +99,8 @@ static __always_inline void recalculate_ip_checksum(struct iphdr *ip, void *data
         __u16 *word_ptr = ptr + i;
         // Bounds check: ensure we can access this word
         if ((void *)(word_ptr + 1) <= data_end) {
-            sum += bpf_ntohs(*word_ptr);
+            // Sum directly without byte order conversion - IP header is network byte order
+            sum += *word_ptr;
         }
     }
     
@@ -132,11 +146,26 @@ static __always_inline void recalculate_transport_checksum(struct iphdr *ip, voi
     }
 }
 
-// Check if IP is in VPN network (10.8.0.0/24)
+// Check if IP is in VPN network (read from eBPF map)
 static __always_inline int is_vpn_network(__u32 ip) {
-    // 10.8.0.0/24 in network byte order: 0x0A080000
-    // Mask: 0xFFFFFF00
+    // Read VPN network address from map (key 0)
+    __u32 key = 0;
+    __u32 *vpn_net = bpf_map_lookup_elem(&vpn_network_config, &key);
+    if (!vpn_net) {
+        // Fallback to default 10.8.0.0/24 if map not configured
     return (ip & 0xFFFFFF00) == 0x0A080000;
+    }
+    
+    // Read VPN network mask from map (key 1)
+    key = 1;
+    __u32 *vpn_mask = bpf_map_lookup_elem(&vpn_network_config, &key);
+    if (!vpn_mask) {
+        // Fallback to default /24 mask if map not configured
+        return (ip & 0xFFFFFF00) == *vpn_net;
+    }
+    
+    // Check if IP is in VPN network
+    return (ip & *vpn_mask) == *vpn_net;
 }
 
 // TC egress hook: Perform NAT masquerading for packets from VPN clients to external networks

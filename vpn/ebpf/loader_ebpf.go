@@ -28,6 +28,8 @@ type XDPProgram struct {
 	blockedIPs         *ebpf.Map // Blocked IPs for bruteforce protection
 	rateLimitConfigMap *ebpf.Map // Rate limit and DDoS protection configuration
 	serverEgressIPMap  *ebpf.Map // Server egress IP for NAT masquerading
+	vpnNetworkConfig   *ebpf.Map // VPN network configuration
+	policyChainStatus  *ebpf.Map // Policy chain status (optimization: check if chain is empty)
 }
 
 // LoadXDPProgram loads and attaches the XDP program to a network interface
@@ -68,6 +70,19 @@ func LoadXDPProgram(ifName string) (*XDPProgram, error) {
 	// The key is a composite of hook_point and index
 	policyChains := objs.PolicyChains
 
+	// Initialize policy chain status map (optimization: track if chains are empty)
+	policyChainStatus := objs.PolicyChainStatus
+
+	// Initialize all hook points as empty (0 = no policies)
+	// This ensures fast path works correctly when no policies are configured
+	for hookPoint := uint32(0); hookPoint < 5; hookPoint++ {
+		emptyStatus := uint8(0)
+		if err := policyChainStatus.Put(hookPoint, emptyStatus); err != nil {
+			objs.Close()
+			return nil, fmt.Errorf("failed to initialize policy chain status: %w", err)
+		}
+	}
+
 	return &XDPProgram{
 		objs:              objs,
 		link:               xdpLink,
@@ -81,6 +96,8 @@ func LoadXDPProgram(ifName string) (*XDPProgram, error) {
 		blockedIPs:         objs.BlockedIpsMap,
 		rateLimitConfigMap: objs.RateLimitConfigMap,
 		serverEgressIPMap:  objs.ServerEgressIp,
+		vpnNetworkConfig:   objs.VpnNetworkConfig,
+		policyChainStatus:  policyChainStatus,
 	}, nil
 }
 
@@ -297,6 +314,15 @@ func (x *XDPProgram) AddPolicy(policyID uint32, hookPoint uint32, action uint32,
 		}
 	}
 
+	// Update policy chain status (optimization: mark chain as non-empty if policies exist)
+	hasPolicies := uint8(0)
+	if len(existingPolicies) > 0 {
+		hasPolicies = 1
+	}
+	if err := x.policyChainStatus.Put(hookPoint, hasPolicies); err != nil {
+		return fmt.Errorf("failed to update policy chain status: %w", err)
+	}
+
 	return nil
 }
 
@@ -489,6 +515,15 @@ func (x *XDPProgram) AddPolicyWithMask(policyID uint32, hookPoint uint32, action
 		x.policyChains.Delete(key)
 	}
 
+	// Update policy chain status (optimization: mark chain as non-empty if policies exist)
+	hasPolicies := uint8(0)
+	if len(existingPolicies) > 0 {
+		hasPolicies = 1
+	}
+	if err := x.policyChainStatus.Put(hookPoint, hasPolicies); err != nil {
+		return fmt.Errorf("failed to update policy chain status: %w", err)
+	}
+
 	return nil
 }
 
@@ -562,6 +597,24 @@ func (x *XDPProgram) RemovePolicy(policyID uint32) error {
 				break
 			}
 		}
+
+		// Update policy chain status after removal
+		// Check if chain is now empty
+		hasPolicies := uint8(0)
+		for i := uint32(0); i < 64; i++ {
+			key := chainKey{
+				HookPoint: hookPoint,
+				Index:     i,
+			}
+			var existingID uint32
+			if err := x.policyChains.Lookup(key, &existingID); err == nil && existingID != 0 {
+				hasPolicies = 1
+				break
+			}
+		}
+		if err := x.policyChainStatus.Put(hookPoint, hasPolicies); err != nil {
+			return fmt.Errorf("failed to update policy chain status: %w", err)
+		}
 	}
 
 	// Remove from all policy chains
@@ -588,6 +641,28 @@ func (x *XDPProgram) RemovePolicy(policyID uint32) error {
 					break
 				}
 			}
+		}
+
+		// Update policy chain status after removal (for each hook point)
+		// Check if chain is now empty
+		hasPolicies := uint8(0)
+		for i := uint32(0); i < 64; i++ {
+			type chainKey struct {
+				HookPoint uint32
+				Index     uint32
+			}
+			key := chainKey{
+				HookPoint: hookPoint,
+				Index:     i,
+			}
+			var existingID uint32
+			if err := x.policyChains.Lookup(key, &existingID); err == nil && existingID != 0 {
+				hasPolicies = 1
+				break
+			}
+		}
+		if err := x.policyChainStatus.Put(hookPoint, hasPolicies); err != nil {
+			return fmt.Errorf("failed to update policy chain status: %w", err)
 		}
 	}
 
@@ -750,6 +825,45 @@ func ipToUint32(ip net.IP) uint32 {
 		return 0
 	}
 	return binary.BigEndian.Uint32(ip)
+}
+
+// SetVPNNetwork sets the VPN network configuration in XDP eBPF map
+func (x *XDPProgram) SetVPNNetwork(vpnNetwork string) error {
+	if x == nil || x.vpnNetworkConfig == nil {
+		return fmt.Errorf("XDP program not loaded or vpn_network_config map not found")
+	}
+
+	// Parse VPN network CIDR
+	_, ipNet, err := net.ParseCIDR(vpnNetwork)
+	if err != nil {
+		return fmt.Errorf("invalid VPN network CIDR: %w", err)
+	}
+
+	// Convert network address to network byte order (uint32)
+	ipBytes := ipNet.IP.To4()
+	if ipBytes == nil {
+		return fmt.Errorf("VPN network must be IPv4")
+	}
+	networkUint32 := uint32(ipBytes[0])<<24 | uint32(ipBytes[1])<<16 | uint32(ipBytes[2])<<8 | uint32(ipBytes[3])
+
+	// Convert mask to uint32
+	maskBytes := ipNet.Mask
+	maskUint32 := uint32(maskBytes[0])<<24 | uint32(maskBytes[1])<<16 | uint32(maskBytes[2])<<8 | uint32(maskBytes[3])
+
+	// Store network address (key 0)
+	key := uint32(0)
+	if err := x.vpnNetworkConfig.Put(key, networkUint32); err != nil {
+		return fmt.Errorf("failed to set VPN network address in XDP eBPF map: %w", err)
+	}
+
+	// Store network mask (key 1)
+	key = 1
+	if err := x.vpnNetworkConfig.Put(key, maskUint32); err != nil {
+		return fmt.Errorf("failed to set VPN network mask in XDP eBPF map: %w", err)
+	}
+
+	log.Printf("✅ XDP eBPF: VPN network configured: %s (network: 0x%08X, mask: 0x%08X)", vpnNetwork, networkUint32, maskUint32)
+	return nil
 }
 
 // Helper function to convert IP to uint32 (used in stub)

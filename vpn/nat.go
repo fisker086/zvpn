@@ -7,8 +7,6 @@ import (
 	"net"
 	"os/exec"
 	"strings"
-
-	"github.com/coreos/go-iptables/iptables"
 )
 
 // calculateIPChecksum calculates the IP header checksum
@@ -111,14 +109,6 @@ func (s *VPNServer) PerformUserSpaceNAT(packet []byte) bool {
 
 // checkNATRuleExists checks if NAT rule already exists (set by docker-entrypoint.sh)
 func checkNATRuleExists(vpnNetwork, egressInterface string) bool {
-	// Check iptables rule
-	if ipt, err := iptables.New(); err == nil {
-		natRule := []string{"-s", vpnNetwork, "-o", egressInterface, "-j", "MASQUERADE"}
-		if exists, err := ipt.Exists("nat", "POSTROUTING", natRule...); err == nil && exists {
-			return true
-		}
-	}
-
 	// Check nftables rule (if nft command exists)
 	if _, err := exec.LookPath("nft"); err == nil {
 		cmd := exec.Command("nft", "list", "ruleset")
@@ -134,42 +124,45 @@ func checkNATRuleExists(vpnNetwork, egressInterface string) bool {
 	return false
 }
 
-// setupIPTablesNAT configures NAT masquerading using nftables (preferred) or iptables (fallback)
+// setupNftablesNATConfig configures NAT masquerading using nftables
 // This allows VPN clients to access external networks by masquerading their IP addresses
 // Note: This is a fallback mechanism. The docker-entrypoint.sh script should have already
 // set up the rules. If NAT rule exists, we skip adding it but still perform other checks
-// (kernel modules, FORWARD rules, verification, etc.)
+// (FORWARD rules, verification, etc.)
+// Note: Function name kept as setupIPTablesNAT for backward compatibility with existing code
 func setupIPTablesNAT(vpnNetwork, egressInterface string) error {
 	// Check if NAT rule already exists (set by docker-entrypoint.sh)
 	natRuleExists := checkNATRuleExists(vpnNetwork, egressInterface)
 
 	if natRuleExists {
 		log.Printf("NAT: ✅ NAT masquerade 规则已存在（docker-entrypoint.sh 已设置）")
-		log.Printf("NAT: 继续执行其他必要检查（内核模块、FORWARD 规则、验证等）...")
+		log.Printf("NAT: 继续执行其他必要检查（FORWARD 规则、验证等）...")
 	} else {
 		log.Printf("NAT: 未检测到 NAT 规则，开始完整配置（docker-entrypoint.sh 可能未执行或失败）...")
 	}
 
-	// Try nftables first (modern Linux systems)
+	// Use nftables (modern Linux systems)
 	err := setupNftablesNAT(vpnNetwork, egressInterface, natRuleExists)
-	if err == nil {
+	if err != nil {
+		return fmt.Errorf("nftables configuration failed: %w", err)
+	}
+
 		if !natRuleExists {
 			log.Printf("NAT: ✅ NAT 规则已配置（使用 nftables，作为兜底）")
 		} else {
 			log.Printf("NAT: ✅ nftables NAT 规则验证完成（规则已存在）")
 		}
-		return nil
-	}
-	log.Printf("NAT: nftables 配置失败: %v, 回退到 iptables", err)
 
-	// Fallback to iptables (works with iptables-nft backend)
-	err = setupIPTablesNATLegacy(vpnNetwork, egressInterface, natRuleExists)
-	if err != nil {
-		return fmt.Errorf("both nftables and iptables failed: nftables=%v, iptables=%w", err, err)
+	// Add FORWARD rule using nftables
+	if err := setupNftablesForwardRule(); err != nil {
+		log.Printf("NAT: ⚠️  警告: 无法添加 FORWARD 规则: %v (NAT 可能仍然工作)", err)
 	}
-	if !natRuleExists {
-		log.Printf("NAT: ✅ NAT 规则已配置（使用 iptables，作为兜底）")
+
+	// Add INPUT rule using nftables (allow ICMP and other packets to server VPN IP)
+	if err := setupNftablesInputRule(); err != nil {
+		log.Printf("NAT: ⚠️  警告: 无法添加 INPUT 规则: %v (ICMP ping 可能失败)", err)
 	}
+
 	return nil
 }
 
@@ -181,8 +174,7 @@ func setupNftablesNAT(vpnNetwork, egressInterface string, natRuleExists bool) er
 		return fmt.Errorf("nftables not available: %w", err)
 	}
 
-	// For systems using iptables-nft backend, we need to use ip table instead of inet
-	// Try "ip nat" first (compatible with iptables-nft), then "inet nat"
+	// Try "ip nat" first (standard nftables table), then "inet nat"
 	tableNames := []string{"ip nat", "inet nat"}
 	var tableName string
 	var chainName = "POSTROUTING"
@@ -193,7 +185,7 @@ func setupNftablesNAT(vpnNetwork, egressInterface string, natRuleExists bool) er
 			outputStr := string(output)
 			// Check if table already exists (this is fine, we can continue)
 			if strings.Contains(outputStr, "exists") || strings.Contains(outputStr, "File exists") || strings.Contains(outputStr, "managed by") {
-				// Table exists or is managed by iptables-nft, use it
+				// Table exists, use it
 				tableName = tn
 				break
 			}
@@ -269,124 +261,143 @@ func loadKernelModule(moduleName string) error {
 	return nil
 }
 
-// setupIPTablesNATLegacy configures NAT using iptables (fallback)
-// natRuleExists indicates if NAT rule already exists (set by docker-entrypoint.sh)
-func setupIPTablesNATLegacy(vpnNetwork, egressInterface string, natRuleExists bool) error {
-	// Always load necessary kernel modules
-	// This is important for NAT to work correctly, especially in containers
-	// Even if rule exists, modules might not be loaded
-	log.Printf("NAT: 加载内核模块（iptables NAT 支持）...")
-	loadKernelModule("iptable_filter")
-	loadKernelModule("iptable_nat")
-
-	// Create iptables client
-	ipt, err := iptables.New()
-	if err != nil {
-		return fmt.Errorf("failed to create iptables client: %w", err)
+// setupNftablesForwardRule configures FORWARD chain rule using nftables
+func setupNftablesForwardRule() error {
+	// Check if nftables is available
+	if _, err := exec.LookPath("nft"); err != nil {
+		return fmt.Errorf("nftables not available: %w", err)
 	}
 
-	// Add NAT masquerade rule (only if it doesn't exist)
-	natRule := []string{"-s", vpnNetwork, "-o", egressInterface, "-j", "MASQUERADE"}
-	if !natRuleExists {
-		// First check if rule already exists (double-check)
-		exists, err := ipt.Exists("nat", "POSTROUTING", natRule...)
-		if err != nil {
-			log.Printf("NAT: Warning: Failed to check if NAT rule exists: %v", err)
-			// Continue anyway, try to add the rule
-			exists = false
-		}
+	// Try "ip filter" first, then "inet filter"
+	tableNames := []string{"ip filter", "inet filter"}
+	var tableName string
+	var chainName = "FORWARD"
 
-		if !exists {
-			// Try to insert at position 1 (highest priority), if that fails, append
-			err = ipt.Insert("nat", "POSTROUTING", 1, natRule...)
-			if err != nil {
-				// If insert fails (e.g., position conflict), try append
-				log.Printf("NAT: Insert at position 1 failed: %v, trying append...", err)
-				err = ipt.Append("nat", "POSTROUTING", natRule...)
-				if err != nil {
-					log.Printf("NAT: Failed to add NAT rule: %v", err)
-					return fmt.Errorf("failed to add NAT rule: %w", err)
-				}
-				log.Printf("NAT: ✅ 已添加 NAT masquerade 规则（追加）: -s %s -o %s -j MASQUERADE", vpnNetwork, egressInterface)
-			} else {
-				log.Printf("NAT: ✅ 已添加 NAT masquerade 规则（位置 1）: -s %s -o %s -j MASQUERADE", vpnNetwork, egressInterface)
-			}
-		} else {
-			log.Printf("NAT: ✅ NAT masquerade 规则已存在: -s %s -o %s -j MASQUERADE", vpnNetwork, egressInterface)
-		}
-	} else {
-		log.Printf("NAT: 跳过添加 NAT masquerade 规则（docker-entrypoint.sh 已设置）")
-	}
-
-	// Add FORWARD chain rule to allow forwarding
-	// This is important for packets to be forwarded through the VPN
-	// Note: In Docker containers, FORWARD chain might have default DROP policy
-	forwardRule := []string{"-j", "ACCEPT"}
-	forwardExists, err := ipt.Exists("filter", "FORWARD", forwardRule...)
-	if err != nil {
-		log.Printf("NAT: Warning: Failed to check if FORWARD rule exists: %v", err)
-		forwardExists = false
-	}
-
-	if !forwardExists {
-		err = ipt.Insert("filter", "FORWARD", 1, forwardRule...)
-		if err != nil {
-			// Try append if insert fails
-			err = ipt.Append("filter", "FORWARD", forwardRule...)
-			if err != nil {
-				log.Printf("NAT: Warning: Failed to add FORWARD rule: %v (NAT may still work)", err)
-				// Don't return error, as FORWARD rule might not be critical in all cases
-			} else {
-				log.Printf("NAT: Successfully appended FORWARD rule to allow packet forwarding")
-			}
-		} else {
-			log.Printf("NAT: Successfully inserted FORWARD rule to allow packet forwarding")
-		}
-	} else {
-		log.Printf("NAT: FORWARD rule already exists")
-	}
-
-	// Verify rules were added correctly
-	natRules, err := ipt.List("nat", "POSTROUTING")
-	if err == nil {
-		log.Printf("NAT: Current NAT POSTROUTING rules:")
-		for i, rule := range natRules {
-			log.Printf("NAT:   [%d] %s", i, rule)
-		}
-		// Check if our rule is in the list
-		ruleFound := false
-		for _, rule := range natRules {
-			if strings.Contains(rule, vpnNetwork) && strings.Contains(rule, egressInterface) && strings.Contains(rule, "MASQUERADE") {
-				ruleFound = true
-				log.Printf("NAT: ✅ Verified: NAT rule found in POSTROUTING chain")
+	for _, tn := range tableNames {
+		// Try to add table (ignore error if it already exists)
+		if output, err := exec.Command("nft", "add", "table", tn).CombinedOutput(); err != nil {
+			outputStr := string(output)
+			// Check if table already exists (this is fine)
+			if strings.Contains(outputStr, "exists") || strings.Contains(outputStr, "File exists") {
+				tableName = tn
 				break
 			}
+			continue
 		}
-		if !ruleFound {
-			log.Printf("NAT: ⚠️  警告: NAT 规则在 POSTROUTING 链中未找到（可能 docker-entrypoint.sh 已设置但格式不同）")
-			log.Printf("NAT: 检查命令: iptables -t nat -L POSTROUTING -n -v")
-			// Try to add again as a last resort (兜底机制)
-			log.Printf("NAT: 尝试再次添加规则（兜底机制）...")
-			if err := ipt.Append("nat", "POSTROUTING", natRule...); err != nil {
-				log.Printf("NAT: ⚠️  兜底添加失败: %v（如果 docker-entrypoint.sh 已设置规则，可忽略此错误）", err)
-				// 不返回错误，因为规则可能已经通过其他方式存在
-			} else {
-				log.Printf("NAT: ✅ 规则已通过兜底机制添加成功")
+		tableName = tn
+		break
+		}
+
+	if tableName == "" {
+		return fmt.Errorf("failed to create or find nftables filter table")
+	}
+
+	// Try to add chain (ignore error if it already exists)
+	chainCmd := exec.Command("nft", "add", "chain", tableName, chainName, "{ type filter hook forward priority 0; }")
+	if output, err := chainCmd.CombinedOutput(); err != nil {
+		outputStr := string(output)
+		// Check if chain already exists (this is fine)
+		if !strings.Contains(outputStr, "exists") && !strings.Contains(outputStr, "File exists") {
+			return fmt.Errorf("failed to create nftables FORWARD chain: %w, output: %s", err, outputStr)
+			}
+	}
+
+	// Check if accept rule already exists
+	cmd := exec.Command("nft", "list", "ruleset")
+	if output, err := cmd.CombinedOutput(); err == nil {
+		outputStr := string(output)
+		if strings.Contains(outputStr, "chain "+chainName) && strings.Contains(outputStr, "accept") {
+			log.Printf("NAT: FORWARD accept rule already exists")
+			return nil
+		}
+	}
+
+	// Add accept rule
+	ruleCmd := exec.Command("nft", "add", "rule", tableName, chainName, "accept")
+	if output, err := ruleCmd.CombinedOutput(); err != nil {
+		outputStr := string(output)
+		if !strings.Contains(outputStr, "File exists") && !strings.Contains(outputStr, "exists") {
+			return fmt.Errorf("failed to add nftables FORWARD rule: %w, output: %s", err, outputStr)
+			}
+		log.Printf("NAT: FORWARD accept rule already exists")
+	} else {
+		log.Printf("NAT: Successfully added nftables FORWARD accept rule")
+	}
+
+	return nil
+	}
+
+// setupNftablesInputRule configures INPUT chain rule using nftables
+// This is important for allowing ICMP echo requests to reach the server VPN IP
+func setupNftablesInputRule() error {
+	// Check if nftables is available
+	if _, err := exec.LookPath("nft"); err != nil {
+		return fmt.Errorf("nftables not available: %w", err)
+	}
+
+	// Try "ip filter" first, then "inet filter"
+	tableNames := []string{"ip filter", "inet filter"}
+	var tableName string
+	var chainName = "INPUT"
+
+	for _, tn := range tableNames {
+		// Try to add table (ignore error if it already exists)
+		if output, err := exec.Command("nft", "add", "table", tn).CombinedOutput(); err != nil {
+			outputStr := string(output)
+			// Check if table already exists (this is fine)
+			if strings.Contains(outputStr, "exists") || strings.Contains(outputStr, "File exists") {
+				tableName = tn
+				break
+			}
+			continue
+		}
+		tableName = tn
+		break
+	}
+
+	if tableName == "" {
+		return fmt.Errorf("failed to create or find nftables filter table")
+	}
+
+	// Try to add chain (ignore error if it already exists)
+	chainCmd := exec.Command("nft", "add", "chain", tableName, chainName, "{ type filter hook input priority 0; }")
+	if output, err := chainCmd.CombinedOutput(); err != nil {
+		outputStr := string(output)
+		// Check if chain already exists (this is fine)
+		if !strings.Contains(outputStr, "exists") && !strings.Contains(outputStr, "File exists") {
+			return fmt.Errorf("failed to create nftables INPUT chain: %w, output: %s", err, outputStr)
+		}
+	}
+
+	// Check if accept rule already exists
+	cmd := exec.Command("nft", "list", "ruleset")
+	if output, err := cmd.CombinedOutput(); err == nil {
+		outputStr := string(output)
+		// Check if there's already an accept rule in INPUT chain
+		if strings.Contains(outputStr, "chain "+chainName) {
+			// Check if there's a specific rule for TUN device or VPN network
+			// If INPUT chain exists and has rules, assume it's configured
+			if strings.Contains(outputStr, "iifname") || strings.Contains(outputStr, "accept") {
+				log.Printf("NAT: INPUT chain already has rules, skipping")
+				return nil
 			}
 		}
-	} else {
-		log.Printf("NAT: Warning: Failed to list NAT POSTROUTING rules: %v", err)
-		log.Printf("NAT: Cannot verify rule, but assuming it was added successfully")
 	}
 
-	forwardRules, err := ipt.List("filter", "FORWARD")
-	if err == nil {
-		log.Printf("NAT: Current FILTER FORWARD rules:")
-		for i, rule := range forwardRules {
-			log.Printf("NAT:   [%d] %s", i, rule)
+	// Add accept rule for packets to TUN device (server VPN IP)
+	// This allows ICMP echo requests and other packets to reach the server
+	// Note: We accept all INPUT packets because the kernel will handle routing
+	// and the TUN device is configured with the server VPN IP
+	ruleCmd := exec.Command("nft", "add", "rule", tableName, chainName, "accept")
+	if output, err := ruleCmd.CombinedOutput(); err != nil {
+		outputStr := string(output)
+		if !strings.Contains(outputStr, "File exists") && !strings.Contains(outputStr, "exists") {
+			return fmt.Errorf("failed to add nftables INPUT rule: %w, output: %s", err, outputStr)
 		}
+		log.Printf("NAT: INPUT accept rule already exists")
+	} else {
+		log.Printf("NAT: Successfully added nftables INPUT accept rule")
 	}
 
-	log.Printf("NAT: ✅ iptables NAT configuration completed successfully")
 	return nil
 }

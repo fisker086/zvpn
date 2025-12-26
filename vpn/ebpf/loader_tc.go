@@ -25,6 +25,7 @@ type TCProgram struct {
 	serverEgressIPMap *ebpf.Map
 	vpnClients        *ebpf.Map
 	natStats          *ebpf.Map
+	vpnNetworkConfig  *ebpf.Map
 }
 
 // LoadTCProgram loads and attaches the TC egress program to a network interface
@@ -67,7 +68,7 @@ func LoadTCProgram(ifName string) (*TCProgram, error) {
 		clsactLink, err := attachTCClsact(ifName, iface.Index, objs.TcNatEgress)
 		if err != nil {
 			objs.Close()
-			return nil, fmt.Errorf("failed to attach TC program: %w (tried TCX and traditional TC clsact, system will use iptables/nftables MASQUERADE as fallback)", err)
+			return nil, fmt.Errorf("failed to attach TC program: %w (tried TCX and traditional TC clsact, system will use nftables MASQUERADE as fallback)", err)
 		}
 		log.Printf("✅ TC egress NAT program attached using traditional TC clsact qdisc (compatible with kernel 4.1+)")
 		return &TCProgram{
@@ -78,6 +79,7 @@ func LoadTCProgram(ifName string) (*TCProgram, error) {
 			serverEgressIPMap: objs.ServerEgressIp,
 			vpnClients:        objs.VpnClients,
 			natStats:          objs.NatStats,
+			vpnNetworkConfig:  objs.VpnNetworkConfig,
 		}, nil
 	}
 
@@ -92,6 +94,7 @@ func LoadTCProgram(ifName string) (*TCProgram, error) {
 		serverEgressIPMap: objs.ServerEgressIp,
 		vpnClients:        objs.VpnClients,
 		natStats:          objs.NatStats,
+		vpnNetworkConfig:  objs.VpnNetworkConfig,
 	}, nil
 }
 
@@ -116,6 +119,45 @@ func (t *TCProgram) SetPublicIP(publicIP net.IP) error {
 	}
 
 	log.Printf("✅ TC eBPF NAT: Server egress IP set to %s", publicIP.String())
+	return nil
+}
+
+// SetVPNNetwork sets the VPN network configuration in TC eBPF map
+func (t *TCProgram) SetVPNNetwork(vpnNetwork string) error {
+	if t == nil || t.vpnNetworkConfig == nil {
+		return fmt.Errorf("TC program not loaded or vpn_network_config map not found")
+	}
+
+	// Parse VPN network CIDR
+	_, ipNet, err := net.ParseCIDR(vpnNetwork)
+	if err != nil {
+		return fmt.Errorf("invalid VPN network CIDR: %w", err)
+	}
+
+	// Convert network address to network byte order (uint32)
+	ipBytes := ipNet.IP.To4()
+	if ipBytes == nil {
+		return fmt.Errorf("VPN network must be IPv4")
+	}
+	networkUint32 := uint32(ipBytes[0])<<24 | uint32(ipBytes[1])<<16 | uint32(ipBytes[2])<<8 | uint32(ipBytes[3])
+
+	// Convert mask to uint32
+	maskBytes := ipNet.Mask
+	maskUint32 := uint32(maskBytes[0])<<24 | uint32(maskBytes[1])<<16 | uint32(maskBytes[2])<<8 | uint32(maskBytes[3])
+
+	// Store network address (key 0)
+	key := uint32(0)
+	if err := t.vpnNetworkConfig.Put(key, networkUint32); err != nil {
+		return fmt.Errorf("failed to set VPN network address in TC eBPF map: %w", err)
+	}
+
+	// Store network mask (key 1)
+	key = 1
+	if err := t.vpnNetworkConfig.Put(key, maskUint32); err != nil {
+		return fmt.Errorf("failed to set VPN network mask in TC eBPF map: %w", err)
+	}
+
+	log.Printf("✅ TC eBPF NAT: VPN network configured: %s (network: 0x%08X, mask: 0x%08X)", vpnNetwork, networkUint32, maskUint32)
 	return nil
 }
 

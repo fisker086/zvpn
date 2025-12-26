@@ -22,6 +22,7 @@ type DNSInterceptor struct {
 	domainCache map[string]*DomainInfo // 域名到IP的缓存
 	cacheLock   sync.RWMutex
 	auditLogger *policy.AuditLogger
+	upstreamDNS []string // 上游DNS服务器列表（从配置读取）
 }
 
 // DomainInfo 存储域名解析信息
@@ -40,14 +41,52 @@ func NewDNSInterceptor(server *VPNServer) *DNSInterceptor {
 		domainCache: make(map[string]*DomainInfo),
 		auditLogger: policy.GetAuditLogger(),
 	}
+	// 从配置中获取上游DNS服务器列表
+	interceptor.upstreamDNS = interceptor.getUpstreamDNS()
 	return interceptor
+}
+
+// getUpstreamDNS 从配置中获取上游DNS服务器列表
+func (di *DNSInterceptor) getUpstreamDNS() []string {
+	if di.server == nil {
+		// 默认使用国内DNS
+		return []string{"114.114.114.114:53"}
+	}
+
+	cfg := di.server.GetConfig()
+	if cfg == nil || cfg.VPN.UpstreamDNS == "" {
+		// 默认使用国内DNS
+		return []string{"114.114.114.114:53"}
+	}
+
+	// 解析逗号分隔的DNS服务器列表
+	dnsList := strings.Split(cfg.VPN.UpstreamDNS, ",")
+	var upstreamDNS []string
+	for _, dns := range dnsList {
+		dns = strings.TrimSpace(dns)
+		if dns == "" {
+			continue
+		}
+		// 确保包含端口号
+		if !strings.Contains(dns, ":") {
+			dns += ":53"
+		}
+		upstreamDNS = append(upstreamDNS, dns)
+	}
+
+	if len(upstreamDNS) == 0 {
+		// 如果解析后为空，使用默认值
+		return []string{"114.114.114.114:53"}
+	}
+
+	return upstreamDNS
 }
 
 // Start 启动DNS拦截器（监听UDP 53端口）
 func (di *DNSInterceptor) Start() error {
-	// DNS端口固定为53，上游DNS固定为114.114.114.114和8.8.8.8
+	// DNS端口固定为53，上游DNS从配置文件读取（vpn.upstreamdns）
 	const dnsPort = "53"
-	
+
 	// 尝试绑定端口以检查权限
 	addr := ":" + dnsPort
 	conn, err := net.ListenPacket("udp", addr)
@@ -191,23 +230,37 @@ func (di *DNSInterceptor) handleDNS(w dns.ResponseWriter, r *dns.Msg) {
 		}
 	}
 
-	// 上游DNS服务器固定为114.114.114.114和8.8.8.8
-	upstreamDNS := []string{"114.114.114.114:53", "8.8.8.8:53"}
+	// 从配置中获取上游DNS服务器列表
+	upstreamDNS := di.getUpstreamDNS()
 
 	var resp *dns.Msg
 	var err error
+	var lastErr error
 
-	// 尝试使用上游DNS解析
+	// 尝试使用上游DNS解析（增加超时时间，添加重试）
 	for _, dnsServer := range upstreamDNS {
-		client := &dns.Client{Timeout: 5 * time.Second}
+		client := &dns.Client{Timeout: 10 * time.Second} // 增加超时时间到10秒
 		resp, _, err = client.Exchange(r, dnsServer)
 		if err == nil && resp != nil && len(resp.Answer) > 0 {
 			break
 		}
+		if err != nil {
+			lastErr = err
+			// 如果是超时错误，尝试下一个DNS服务器
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				log.Printf("DNS Interceptor: DNS server %s timeout for %s, trying next server", dnsServer, domain)
+				continue
+			}
+		}
 	}
 
 	if err != nil || resp == nil || len(resp.Answer) == 0 {
-		log.Printf("DNS Interceptor: Failed to resolve %s: %v", domain, err)
+		// 使用更详细的错误信息
+		if lastErr != nil {
+			log.Printf("DNS Interceptor: Failed to resolve %s: %v (tried %d DNS servers)", domain, lastErr, len(upstreamDNS))
+		} else {
+			log.Printf("DNS Interceptor: Failed to resolve %s: no answer from DNS servers", domain)
+		}
 		// 如果域名在域名管理列表中但解析失败，仍然更新访问统计
 		if foundInDomainList {
 			now := time.Now()
@@ -265,6 +318,12 @@ func (di *DNSInterceptor) handleDNS(w dns.ResponseWriter, r *dns.Msg) {
 // logDNSQuery 记录DNS查询审计日志
 func (di *DNSInterceptor) logDNSQuery(req *dns.Msg, domain string, clientAddr net.Addr) {
 	if di.auditLogger == nil || !di.auditLogger.IsEnabled() {
+		return
+	}
+
+	// 根据设置决定是否记录DNS查询日志
+	// 使用 policy 包的函数检查DNS是否应该记录
+	if !policy.ShouldLogProtocol("dns", 53) {
 		return
 	}
 
@@ -465,7 +524,10 @@ func (di *DNSInterceptor) findMatchingDomain(queryDomain string) *models.Domain 
 		}
 	}
 
-	log.Printf("DNS Interceptor: No matching domain found for %s", queryDomain)
+	// 对于本地域名（.local），不记录日志以减少噪音
+	if !strings.HasSuffix(strings.ToLower(queryDomain), ".local") {
+		log.Printf("DNS Interceptor: No matching domain found for %s", queryDomain)
+	}
 	return nil
 }
 
@@ -524,27 +586,40 @@ func (di *DNSInterceptor) ResolveDomain(domain string) ([]net.IP, error) {
 		return ips, nil
 	}
 
-	// 上游DNS服务器固定为114.114.114.114和8.8.8.8
-	upstreamDNS := []string{"114.114.114.114:53", "8.8.8.8:53"}
+	// 从配置中获取上游DNS服务器列表
+	upstreamDNS := di.getUpstreamDNS()
 
 	// 执行DNS查询
 	m := new(dns.Msg)
 	m.SetQuestion(dns.Fqdn(domain), dns.TypeA)
 
-	client := &dns.Client{Timeout: 5 * time.Second}
+	client := &dns.Client{Timeout: 10 * time.Second} // 增加超时时间到10秒
 	var resp *dns.Msg
 	var err error
+	var lastErr error
 
-	// 尝试使用上游DNS解析
+	// 尝试使用上游DNS解析（添加重试）
 	for _, dnsServer := range upstreamDNS {
 		resp, _, err = client.Exchange(m, dnsServer)
 		if err == nil && resp != nil && len(resp.Answer) > 0 {
 			break
 		}
+		if err != nil {
+			lastErr = err
+			// 如果是超时错误，尝试下一个DNS服务器
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				log.Printf("DNS Interceptor: DNS server %s timeout for %s, trying next server", dnsServer, domain)
+				continue
+			}
+		}
 	}
 
 	if err != nil || resp == nil || len(resp.Answer) == 0 {
-		return nil, fmt.Errorf("failed to resolve domain %s: %v", domain, err)
+		// 使用更详细的错误信息
+		if lastErr != nil {
+			return nil, fmt.Errorf("failed to resolve domain %s: %v (tried %d DNS servers)", domain, lastErr, len(upstreamDNS))
+		}
+		return nil, fmt.Errorf("failed to resolve domain %s: no answer from DNS servers", domain)
 	}
 
 	var ips []net.IP

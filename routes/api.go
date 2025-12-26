@@ -213,6 +213,7 @@ func registerReadOnlyRoutes(
 		settings.GET("/performance", settingsHandler.GetPerformanceSettings)
 		settings.GET("/security", settingsHandler.GetSecuritySettings)
 		settings.GET("/distributed-sync", settingsHandler.GetDistributedSyncSettings)
+		settings.GET("/audit-log", settingsHandler.GetAuditLogSettings)
 	}
 }
 
@@ -295,6 +296,7 @@ func registerAdminRoutes(
 		settings.POST("/performance", settingsHandler.UpdatePerformanceSettings)
 		settings.POST("/security", settingsHandler.UpdateSecuritySettings)
 		settings.POST("/distributed-sync", settingsHandler.UpdateDistributedSyncSettings)
+		settings.POST("/audit-log", settingsHandler.UpdateAuditLogSettings)
 		// 密码爆破防护管理
 		settings.GET("/bruteforce/stats", settingsHandler.GetBruteforceStats)
 		settings.GET("/bruteforce/blocked", settingsHandler.GetBlockedIPs)

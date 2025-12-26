@@ -6,13 +6,14 @@ toolchain go1.24.10
 
 require (
 	github.com/cilium/ebpf v0.20.0
-	github.com/coreos/go-iptables v0.8.0
 	github.com/gin-gonic/gin v1.10.0
 	github.com/go-ldap/ldap/v3 v3.4.10
 	github.com/golang-jwt/jwt/v5 v5.2.1
 	github.com/google/uuid v1.6.0
 	github.com/miekg/dns v1.1.68
 	github.com/pierrec/lz4/v4 v4.1.22
+	github.com/pion/dtls/v2 v2.2.12
+	github.com/pion/logging v0.2.2
 	github.com/pquerna/otp v1.5.0
 	github.com/spf13/viper v1.19.0
 	github.com/vishvananda/netlink v1.2.1-beta.2
@@ -56,8 +57,6 @@ require (
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
 	github.com/pelletier/go-toml/v2 v2.2.2 // indirect
-	github.com/pion/dtls/v2 v2.2.12 // indirect
-	github.com/pion/logging v0.2.2 // indirect
 	github.com/pion/transport/v2 v2.2.4 // indirect
 	github.com/sagikazarmark/locafero v0.4.0 // indirect
 	github.com/sagikazarmark/slog-shim v0.1.0 // indirect

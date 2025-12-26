@@ -20,6 +20,18 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// connectHandler 自定义 HTTP Handler，用于拦截 CONNECT 请求
+type connectHandler struct {
+	ginHandler http.Handler
+	ocHandler  *openconnect.Handler
+}
+
+// ServeHTTP 实现 http.Handler 接口
+func (h *connectHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// 所有请求都交给 Gin 处理
+	h.ginHandler.ServeHTTP(w, r)
+}
+
 // Server 服务器管理器
 type Server struct {
 	cfg              *config.Config
@@ -28,14 +40,19 @@ type Server struct {
 	httpsServer      *http.Server
 	ocHandler        *openconnect.Handler
 	shutdownComplete chan struct{}
+	ctx              context.Context
+	cancel           context.CancelFunc
 }
 
 // New 创建新的服务器实例
 func New(cfg *config.Config, vpnServer *vpn.VPNServer) *Server {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Server{
 		cfg:              cfg,
 		vpnServer:        vpnServer,
 		shutdownComplete: make(chan struct{}),
+		ctx:              ctx,
+		cancel:           cancel,
 	}
 }
 
@@ -57,20 +74,11 @@ func (s *Server) Start() error {
 
 	// 启动 DTLS UDP 服务器（如果启用）
 	if s.cfg.VPN.EnableDTLS {
-		log.Printf("========================================")
-		log.Printf("DTLS is enabled in config, attempting to start DTLS UDP server...")
-		log.Printf("DTLS will listen on UDP port: %s (same as TCP port)", s.cfg.VPN.OpenConnectPort)
 		if err := s.ocHandler.StartDTLSServer(); err != nil {
-			log.Printf("ERROR: Failed to start DTLS server: %v", err)
-			log.Printf("DTLS will be disabled. Clients will use SSL/TLS only.")
-			log.Printf("========================================")
+			log.Printf("Failed to start DTLS server: %v (clients will use SSL/TLS only)", err)
 		} else {
-			log.Printf("DTLS UDP server started successfully")
-			log.Printf("DTLS is ready to accept connections on UDP port %s", s.cfg.VPN.OpenConnectPort)
-			log.Printf("========================================")
+			log.Printf("DTLS server started on UDP port %s", s.cfg.VPN.OpenConnectPort)
 		}
-	} else {
-		log.Printf("DTLS is disabled in config (enabledtls: false)")
 	}
 
 	// 等待中断信号
@@ -84,15 +92,25 @@ func (s *Server) startAuditLogFlusher() {
 	ticker := time.NewTicker(30 * time.Second) // 每30秒刷新一次
 	defer ticker.Stop()
 
+	// 刷新审计日志的辅助函数
+	flushAuditLogs := func() {
+		auditLogger := policy.GetAuditLogger()
+		if auditLogger != nil {
+			if err := auditLogger.Flush(); err != nil {
+				log.Printf("Failed to flush audit logs: %v", err)
+			}
+		}
+	}
+
+	// 使用 for range 简化循环，同时监听关闭信号
 	for {
 		select {
 		case <-ticker.C:
-			auditLogger := policy.GetAuditLogger()
-			if auditLogger != nil {
-				if err := auditLogger.Flush(); err != nil {
-					log.Printf("Failed to flush audit logs: %v", err)
-				}
-			}
+			flushAuditLogs()
+		case <-s.ctx.Done():
+			// 服务器关闭时，执行最后一次刷新确保数据不丢失
+			flushAuditLogs()
+			return
 		}
 	}
 }
@@ -117,42 +135,56 @@ func (s *Server) startHTTPServer() {
 // startHTTPSServer 启动 HTTPS OpenConnect 服务器
 func (s *Server) startHTTPSServer() {
 	router := gin.Default()
-
 	// CORS 中间件
 	router.Use(middleware.CorsMiddleware())
 
 	// 注册 OpenConnect 路由
 	s.ocHandler.SetupRoutes(router)
 
-	// 我们不需要自定义处理器来处理CONNECT请求
-	// 相反，我们应该在OpenConnect的路由设置中处理它
-	// 让Gin处理所有请求，包括CONNECT请求
-	// 我们会在OpenConnect的Handler中正确处理CONNECT请求
-	customHandler := router
+	router.NoRoute(func(c *gin.Context) {
+		c.String(http.StatusNotFound, "Not Found")
+	})
 
-	// 配置 TLS 以支持现代加密套件并减少日志噪音
+	// 创建自定义 HTTP Handler 来拦截 CONNECT 请求
+	// 因为 Gin 可能不支持 CONNECT 方法，我们需要在 HTTP 层面处理
+	customHandler := &connectHandler{
+		ginHandler: router,
+		ocHandler:  s.ocHandler,
+	}
+
+	// 配置 TLS 以支持现代加密套件并兼容 AnyConnect 客户端
+	// AnyConnect 客户端要求：
+	// - TLS 1.2+ (AnyConnect 4.2+)
+	// - TLS 1.3 (AnyConnect 5.0+)
+	// - 支持 ECDHE 密码套件（推荐）和 RSA 密码套件（兼容性）
+	// 注意：OpenConnect/AnyConnect 协议只使用 HTTP/1.1，不支持 HTTP/2
 	tlsConfig := &tls.Config{
-		MinVersion: tls.VersionTLS12, // 只支持 TLS 1.2+
-		MaxVersion: tls.VersionTLS13, // 支持 TLS 1.3
-		// 使用 Go 默认的现代加密套件（安全且兼容性好）
+		MinVersion: tls.VersionTLS12, // TLS 1.2+ (AnyConnect 4.2+ 要求)
+		MaxVersion: tls.VersionTLS13, // TLS 1.3 (AnyConnect 5.0+ 支持)
+		// 密码套件列表（按优先级排序）
+		// 优先使用 ECDHE（前向保密），同时保留 RSA 套件以兼容旧版客户端
 		CipherSuites: []uint16{
-			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,
-			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305,
+			// ECDHE 套件（推荐，支持前向保密）
+			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,   // 优先：256位 AES，更强的安全性
+			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,   // 128位 AES，性能更好
+			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, // ECDSA 证书
+			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, // ECDSA 证书
+			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,    // ChaCha20-Poly1305（移动设备优化）
+			// RSA 套件（兼容性，某些旧版客户端可能需要）
+			tls.TLS_RSA_WITH_AES_256_GCM_SHA384, // RSA 密钥交换（无前向保密，但兼容性好）
+			tls.TLS_RSA_WITH_AES_128_GCM_SHA256, // RSA 密钥交换
 		},
-		PreferServerCipherSuites: true,
-		NextProtos:               []string{"h2", "http/1.1"}, // 支持 HTTP/2 和 HTTP/1.1
+		PreferServerCipherSuites: true, // 优先使用服务器选择的密码套件
+		NextProtos:               []string{"http/1.1"},
 	}
 
 	s.httpsServer = &http.Server{
-		Addr:      s.cfg.Server.Host + ":" + s.cfg.VPN.OpenConnectPort,
-		Handler:   customHandler,
-		TLSConfig: tlsConfig,
-		// 自定义错误日志处理器，过滤掉扫描/攻击相关的错误
-		ErrorLog: log.New(&tlsErrorFilter{}, "", 0),
+		Addr:         s.cfg.Server.Host + ":" + s.cfg.VPN.OpenConnectPort,
+		Handler:      customHandler,
+		TLSConfig:    tlsConfig,
+		ReadTimeout:  0,
+		WriteTimeout: 0,
+		IdleTimeout:  300 * time.Second,
 	}
 
 	go func() {
@@ -173,6 +205,9 @@ func (s *Server) waitForShutdown() {
 	<-quit
 
 	log.Println("Shutting down server...")
+
+	// 通知所有后台 goroutine 停止（包括审计日志刷新器）
+	s.cancel()
 
 	// 优雅关闭
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

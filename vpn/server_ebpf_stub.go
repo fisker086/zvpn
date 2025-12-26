@@ -10,7 +10,7 @@ import (
 
 // loadEBPFTCNATImpl loads eBPF TC program for NAT masquerading
 // This is a stub implementation when eBPF is not compiled
-func loadEBPFTCNATImpl(ifName string, publicIP net.IP) (interface{}, error) {
+func loadEBPFTCNATImpl(ifName string, publicIP net.IP, vpnNetwork string) (interface{}, error) {
 	return nil, fmt.Errorf("eBPF not compiled. Build with -tags ebpf to enable eBPF TC NAT")
 }
 

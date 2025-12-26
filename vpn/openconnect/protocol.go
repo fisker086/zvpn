@@ -69,29 +69,50 @@ type TunnelClient struct {
 	VPNServer       *vpn.VPNServer
 	TUNDevice       *vpn.TUNDevice
 	parser          *CSTPParser
-	useLittleEndian bool // Whether client uses little-endian for length field (detected from incoming packets)
+	useLittleEndian bool  // Whether client uses little-endian for length field (detected from incoming packets)
+	lastDataTime    int64 // Last data packet time (Unix timestamp)
+	idleTimeout     int64 // Idle timeout in seconds (0 means disabled)
 }
 
 // NewTunnelClient creates a new tunnel client
 func NewTunnelClient(user *models.User, conn net.Conn, ip net.IP, vpnServer *vpn.VPNServer, tunDevice *vpn.TUNDevice) *TunnelClient {
-	return &TunnelClient{
-		User:      user,
-		Conn:      conn,
-		IP:        ip,
-		VPNServer: vpnServer,
-		TUNDevice: tunDevice,
+	now := time.Now().Unix()
+	tc := &TunnelClient{
+		User:         user,
+		Conn:         conn,
+		IP:           ip,
+		VPNServer:    vpnServer,
+		TUNDevice:    tunDevice,
+		lastDataTime: now,
+		idleTimeout:  0, // 默认禁用，从配置中读取
 		parser: &CSTPParser{
-			buf:    make([]byte, maxPacketSize*2), // 减少缓冲区大小，只需要足够处理最大数据包的两倍
+			buf:    make([]byte, maxPacketSize*2),
 			bufLen: 0,
 			state:  stateNeedHeader,
 		},
 	}
+
+	// 从配置中读取空闲超时（如果配置了）
+	if vpnServer != nil {
+		if cfg := vpnServer.GetConfig(); cfg != nil {
+			// 当前 X-CSTP-Idle-Timeout 设置为 0（禁用）
+			// 如果需要启用，可以从配置中读取
+			// tc.idleTimeout = int64(cfg.VPN.IdleTimeout)
+		}
+	}
+
+	return tc
 }
 
 // HandleTunnelData handles VPN tunnel data - main loop for processing CSTP packets
 // This function runs in a separate goroutine and handles all incoming CSTP packets from the client
+// NOTE: Connection closing is handled by the caller to ensure proper shutdown order:
+// 1. Stop WriteLoop goroutine first
+// 2. Then close the connection
+// This prevents RST packets when connection closes
 func (tc *TunnelClient) HandleTunnelData() error {
-	defer tc.Conn.Close()
+	// Connection closing is now handled by the caller (handler.go)
+	// This allows proper shutdown sequence: stop WriteLoop -> close connection
 
 	log.Printf("OpenConnect: Starting tunnel handler for user %s (IP: %s)", tc.User.Username, tc.IP.String())
 
@@ -99,9 +120,23 @@ func (tc *TunnelClient) HandleTunnelData() error {
 	timeoutCount := 0
 	const maxTimeouts = 3
 
+	// 获取 keepalive 配置，read timeout 应该略大于 keepalive 值（keepalive * 1.5）
+	// 这样可以在客户端发送 keepalive 之前，服务端先检测到超时并发送 keepalive
+	readTimeout := 30 * time.Second // 默认值
+	if tc.VPNServer != nil {
+		if cfg := tc.VPNServer.GetConfig(); cfg != nil {
+			cstpKeepalive := cfg.VPN.CSTPKeepalive
+			if cstpKeepalive == 0 {
+				cstpKeepalive = 20 // 默认值：20秒（AnyConnect 标准）
+			}
+			// read timeout = keepalive * 1.5，确保在客户端发送 keepalive 之前检测到超时
+			readTimeout = time.Duration(cstpKeepalive) * time.Second * 3 / 2
+		}
+	}
+
 	for {
-		// Set read timeout (30 seconds for normal packets)
-		if err := tc.Conn.SetReadDeadline(time.Now().Add(30 * time.Second)); err != nil {
+		// Set read timeout based on keepalive interval
+		if err := tc.Conn.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
 			return fmt.Errorf("failed to set read deadline: %w", err)
 		}
 
@@ -135,19 +170,13 @@ func (tc *TunnelClient) HandleTunnelData() error {
 		// Reset timeout count on successful read
 		timeoutCount = 0
 
-		// Log received data for debugging - 只在调试模式下启用
-		// if n > 0 {
-		//     previewLen := n
-		//     if previewLen > 64 {
-		//         previewLen = 64
-		//     }
-		//     log.Printf("OpenConnect: Received %d bytes from user %s (hex: %x)", n, tc.User.Username, readBuf[:previewLen])
-		// }
-
 		// Feed data to parser
 		if err := tc.parser.feed(readBuf[:n]); err != nil {
-			log.Printf("OpenConnect: Parser error: %v", err)
-			return err
+			log.Printf("OpenConnect: Parser feed error for user %s: %v", tc.User.Username, err)
+			// Parser feed errors are usually recoverable (buffer overflow, etc.)
+			// Reset parser and continue instead of closing connection
+			tc.parser.reset()
+			continue
 		}
 
 		// Process all complete packets
@@ -191,15 +220,33 @@ func (tc *TunnelClient) HandleTunnelData() error {
 
 			// Process packet
 			if err := tc.processPacket(packet.Type, packet.Payload); err != nil {
-				log.Printf("OpenConnect: Error processing packet type 0x%02x: %v", packet.Type, err)
-				// For disconnect packets or format errors, return to close connection
-				if packet.Type == PacketTypeDisconnect ||
-					strings.Contains(err.Error(), "unknown packet format") ||
-					strings.Contains(err.Error(), "reported unknown packet") {
-					log.Printf("OpenConnect: Client requested disconnect or reported format error")
+				// For disconnect packets, this is a normal operation, not an error
+				if packet.Type == PacketTypeDisconnect {
+					log.Printf("OpenConnect: Client %s requested disconnect (normal operation)", tc.User.Username)
 					return nil
 				}
-				// For other errors, continue processing
+				// For format errors, log as warning and continue
+				if strings.Contains(err.Error(), "unknown packet format") ||
+					strings.Contains(err.Error(), "reported unknown packet") {
+					log.Printf("OpenConnect: Client reported format error: %v", err)
+					// Continue processing other packets instead of closing connection
+					continue
+				}
+				// For source IP mismatch, this might be a transient issue, log and continue
+				if strings.Contains(err.Error(), "source IP mismatch") {
+					log.Printf("OpenConnect: Source IP mismatch for user %s: %v (continuing)", tc.User.Username, err)
+					// Continue processing other packets instead of closing connection
+					continue
+				}
+				// For other errors, log as error but continue processing
+				// Only close connection for critical errors (idle timeout, etc.)
+				if strings.Contains(err.Error(), "idle timeout") ||
+					strings.Contains(err.Error(), "connection timeout") {
+					log.Printf("OpenConnect: Critical error for user %s: %v (closing connection)", tc.User.Username, err)
+					return err
+				}
+				log.Printf("OpenConnect: Error processing packet type 0x%02x for user %s: %v (continuing)", packet.Type, tc.User.Username, err)
+				// Continue processing other packets instead of closing connection
 			}
 		}
 	}
@@ -465,20 +512,19 @@ func (p *CSTPParser) nextPacket() (*ParsedPacket, error) {
 				continue
 			}
 
-			// If we couldn't find a valid header and have data, log it
-			if offset > p.bufLen-cstpHeaderLen && p.bufLen >= 8 {
-				previewLen := p.bufLen
-				if previewLen > 16 {
-					previewLen = 16
-				}
-				log.Printf("OpenConnect: No valid CSTP header found in buffer (first %d bytes: %x)", previewLen, p.buf[:previewLen])
-			}
-
+			// If we couldn't find a valid header and have data
+			// This is normal for MTU detection data or other non-CSTP data packets
+			// We silently ignore these and reset the parser when buffer gets too large
 			if offset > p.bufLen-cstpHeaderLen {
 				// No valid header found in buffer
-				if p.bufLen > 1000 {
-					// Buffer too large, likely corrupted - reset
-					log.Printf("OpenConnect: No valid header found in %d bytes, resetting parser", p.bufLen)
+				// Reset only if buffer exceeds maximum packet size (maxPacketSize = 2000)
+				// This ensures normal large packets won't be incorrectly reset
+				// Buffer size is maxPacketSize*2 (4000), so we reset when it exceeds maxPacketSize
+				// to allow room for packet fragmentation and assembly
+				if p.bufLen > maxPacketSize {
+					// Buffer exceeds maximum packet size without finding valid header
+					// This is likely MTU detection data or corrupted/non-CSTP data - reset silently
+					// This is normal behavior during MTU detection, no need to log
 					p.reset()
 				}
 				return nil, io.EOF
@@ -508,59 +554,151 @@ func (p *CSTPParser) nextPacket() (*ParsedPacket, error) {
 			}
 
 			// For data packets (type 0x00), payload is IP packet
+			// Some clients may add padding before the IP header, so we need to find the actual IP header
+			var actualPayloadStart int = payloadStart
 			if p.packetType == PacketTypeData && p.bufLen >= payloadStart+20 {
 				// Verify IP header starts correctly (IPv4: 0x45, IPv6: 0x60)
 				if p.buf[payloadStart] == 0x45 {
 					// IPv4 packet detected - no logging needed for normal operation
-					// IPv4 header detected - no logging needed for normal operation
+					actualPayloadStart = payloadStart
 				} else if (p.buf[payloadStart] & 0xf0) == 0x60 {
 					// IPv6 header detected - no logging needed for normal operation
+					actualPayloadStart = payloadStart
 				} else {
 					// Some packets may have padding or non-standard format
-					// Only log if we're sure this is a data packet and the data looks suspicious
 					// Try to find IP header at nearby offsets (some clients add padding)
-					foundIPHeader := false
-					for offset := payloadStart; offset < payloadStart+4 && offset < p.bufLen-20; offset++ {
-						if p.buf[offset] == 0x45 || (p.buf[offset]&0xf0) == 0x60 {
-							foundIPHeader = true
-							// IP header found at different offset (padding) - no logging needed
-							break
-						}
-					}
-					// Calculate expected payload length to check if it's a data packet
+					// Search up to 16 bytes ahead for IP header (some clients add significant padding)
+					// But make sure we don't search beyond the actual packet length
 					expectedPayloadLen := int(p.packetLen) - payloadStart
-					if !foundIPHeader && expectedPayloadLen > 20 && p.packetType == PacketTypeData {
-						// Only log if we can't find IP header nearby, payload is large enough, and it's a data packet
-						previewLen := min(16, p.bufLen-payloadStart)
-						log.Printf("OpenConnect: Unexpected data at payload start (offset %d): %x (expected IPv4 0x45 or IPv6 0x60)", payloadStart, p.buf[payloadStart:payloadStart+previewLen])
+
+					// Only search if we have enough payload space (at least 20 bytes for IP header)
+					// If packetLen is too small (e.g., 8 bytes = header only), skip IP header search
+					if expectedPayloadLen >= 20 {
+						// Only search within the actual packet boundary
+						maxSearchOffset := min(payloadStart+min(16, expectedPayloadLen), int(p.packetLen))
+						foundIPHeader := false
+						for offset := payloadStart; offset < maxSearchOffset && offset <= p.bufLen-20; offset++ {
+							// Critical: ensure offset is within current packet boundary
+							if offset >= int(p.packetLen) {
+								break // Don't search beyond current packet
+							}
+
+							if p.buf[offset] == 0x45 || (p.buf[offset]&0xf0) == 0x60 {
+								// Verify this is actually an IP header by checking the IP header length field
+								// IPv4: byte 0 bits 0-3 = IHL (Internet Header Length), should be >= 5 (20 bytes minimum)
+								// IPv6: fixed 40 bytes header
+								isValidIPHeader := false
+								if p.buf[offset] == 0x45 {
+									// IPv4: check IHL (should be 5 for standard 20-byte header)
+									ihl := int(p.buf[offset] & 0x0F)
+									if ihl >= 5 && ihl <= 15 {
+										// Verify the IP header is within packet boundary
+										ipHeaderLen := ihl * 4
+										if offset+ipHeaderLen <= int(p.packetLen) && offset+ipHeaderLen <= p.bufLen {
+											// Additional check: verify version field and total length field make sense
+											if offset+4 <= p.bufLen {
+												totalLen := int(binary.BigEndian.Uint16(p.buf[offset+2 : offset+4]))
+												// Total length should be reasonable (at least IP header length, at most 65535)
+												// AND the entire IP packet must fit within current packet boundary
+												if totalLen >= ipHeaderLen && totalLen <= 65535 && offset+totalLen <= int(p.packetLen) {
+													isValidIPHeader = true
+												}
+											}
+										}
+									}
+								} else if (p.buf[offset] & 0xf0) == 0x60 {
+									// IPv6: fixed header, just check we have enough bytes within packet
+									if offset+40 <= int(p.packetLen) && offset+40 <= p.bufLen {
+										isValidIPHeader = true
+									}
+								}
+
+								if isValidIPHeader {
+									foundIPHeader = true
+									actualPayloadStart = offset
+									// IP header found at different offset (padding) - log for debugging
+									if offset != payloadStart {
+										log.Printf("OpenConnect: Found IP header at offset %d (expected %d, padding: %d bytes)",
+											offset, payloadStart, offset-payloadStart)
+									}
+									break
+								}
+							}
+						}
+						if !foundIPHeader && expectedPayloadLen > 20 && p.packetType == PacketTypeData {
+							// Only log if we can't find IP header nearby, payload is large enough, and it's a data packet
+							previewLen := min(16, p.bufLen-payloadStart)
+							log.Printf("OpenConnect: Unexpected data at payload start (offset %d): %x (expected IPv4 0x45 or IPv6 0x60)", payloadStart, p.buf[payloadStart:payloadStart+previewLen])
+						}
+					} else {
+						// Packet too small to contain IP header, skip search
+						// This is normal for control packets (DPD, Keepalive, etc.)
 					}
 				}
 			}
 
 			// payloadLen = total packet size - header size
+			// Use actualPayloadStart to account for padding before IP header
+			// Note: p.packetLen is the total CSTP packet length from header start
+			// So payloadLen should be calculated from the CSTP header, not from actualPayloadStart
+			// But if there's padding, we need to adjust
 			payloadLen := int(p.packetLen) - payloadStart
+			if actualPayloadStart > payloadStart {
+				// There's padding before IP header, adjust payload length
+				// The padding is part of the payload from CSTP perspective, but not from IP perspective
+				// So we subtract the padding from the payload length
+				paddingLen := actualPayloadStart - payloadStart
+				payloadLen = payloadLen - paddingLen
+			}
 			if payloadLen < 0 {
-				log.Printf("OpenConnect: ERROR - Negative payload length: packetLen=%d, payloadStart=%d, payloadLen=%d, bufLen=%d",
-					p.packetLen, payloadStart, payloadLen, p.bufLen)
-				payloadLen = 0
+				log.Printf("OpenConnect: ERROR - Negative payload length: packetLen=%d, payloadStart=%d, actualPayloadStart=%d, payloadLen=%d, bufLen=%d",
+					p.packetLen, payloadStart, actualPayloadStart, payloadLen, p.bufLen)
+				// If payloadLen is negative, it means the IP header we found is beyond the packet boundary
+				// This shouldn't happen with our improved search, but handle it gracefully
+				actualPayloadStart = payloadStart
+				payloadLen = int(p.packetLen) - payloadStart
+				if payloadLen < 0 {
+					payloadLen = 0
+				}
 			}
 			payload := make([]byte, payloadLen)
 			if payloadLen > 0 && p.bufLen >= int(p.packetLen) {
-				copy(payload, p.buf[payloadStart:p.packetLen])
-				// Log ICMP packets for debugging
-				if p.packetType == PacketTypeData && len(payload) >= 28 && payload[9] == 1 {
-					icmpType := payload[20]
-					icmpTypeStr := "unknown"
-					switch icmpType {
-					case 0:
-						icmpTypeStr = "echo reply"
-					case 8:
-						icmpTypeStr = "echo request"
+				// Use explicit end index to ensure correct payload extraction
+				// Extract from actualPayloadStart to skip any padding before IP header
+				payloadEnd := actualPayloadStart + payloadLen
+				if payloadEnd > p.bufLen {
+					payloadEnd = p.bufLen
+				}
+				// Ensure we don't extract beyond packet boundary
+				if payloadEnd > int(p.packetLen) {
+					payloadEnd = int(p.packetLen)
+				}
+				if actualPayloadStart < payloadEnd {
+					copy(payload, p.buf[actualPayloadStart:payloadEnd])
+					// Adjust payload length if we truncated
+					if len(payload) > payloadEnd-actualPayloadStart {
+						payload = payload[:payloadEnd-actualPayloadStart]
 					}
-					srcIP := net.IP(payload[12:16])
-					dstIP := net.IP(payload[16:20])
-					log.Printf("OpenConnect: Extracted ICMP %s packet from payload: %s -> %s, payloadLen=%d",
-						icmpTypeStr, srcIP.String(), dstIP.String(), payloadLen)
+					// Log ICMP packets for debugging
+					if p.packetType == PacketTypeData && len(payload) >= 28 && payload[9] == 1 {
+						icmpType := payload[20]
+						icmpTypeStr := "unknown"
+						switch icmpType {
+						case 0:
+							icmpTypeStr = "echo reply"
+						case 8:
+							icmpTypeStr = "echo request"
+						}
+						srcIP := net.IP(payload[12:16])
+						dstIP := net.IP(payload[16:20])
+						log.Printf("OpenConnect: Extracted ICMP %s packet from payload: %s -> %s, payloadLen=%d, actualPayloadStart=%d, packetLen=%d",
+							icmpTypeStr, srcIP.String(), dstIP.String(), len(payload), actualPayloadStart, p.packetLen)
+					}
+				} else {
+					// Invalid extraction range
+					log.Printf("OpenConnect: WARNING - Invalid payload extraction range: actualPayloadStart=%d, payloadEnd=%d, packetLen=%d",
+						actualPayloadStart, payloadEnd, p.packetLen)
+					payload = nil
 				}
 			} else {
 				// DPD, Keepalive, and other control packets may have zero payload, which is normal
@@ -655,11 +793,26 @@ func (tc *TunnelClient) processPacket(packetType byte, payload []byte) error {
 	case PacketTypeData:
 		return tc.processDataPacket(payload)
 	case PacketTypeKeepalive:
-		// Keepalive received, reset timeout
+		// Keepalive received, check idle timeout
+		log.Printf("OpenConnect: recv LinkCstp Keepalive - user: %s, IP: %s, remote: %s",
+			tc.User.Username, tc.IP.String(), tc.Conn.RemoteAddr())
+
+		// 检查空闲超时（如果启用）
+		if tc.idleTimeout > 0 {
+			now := time.Now().Unix()
+			lastTime := tc.lastDataTime
+			if lastTime < (now - tc.idleTimeout) {
+				log.Printf("OpenConnect: IdleTimeout - user: %s, IP: %s, remote: %s, lastTime: %d",
+					tc.User.Username, tc.IP.String(), tc.Conn.RemoteAddr(), lastTime)
+				return fmt.Errorf("idle timeout")
+			}
+		}
+
 		return nil
 	case PacketTypeDisconnect:
-		// DISCONNECT (0x05) - terminate session
+		// DISCONNECT (0x05) - terminate session (normal operation, not an error)
 		// Note: PacketTypeError is also 0x05 but is handled separately in error detection
+		// Return a special error that will be handled gracefully by the caller
 		return fmt.Errorf("disconnect requested")
 	case PacketTypeDPD:
 		return tc.processDPDPacket(payload)
@@ -667,7 +820,9 @@ func (tc *TunnelClient) processPacket(packetType byte, payload []byte) error {
 		// DPD response from client; nothing to do
 		return nil
 	default:
+		// Log unknown packet types but don't crash - this could be DTLS protocol messages
 		log.Printf("OpenConnect: Unknown packet type: 0x%02x, length: %d", packetType, len(payload))
+		// For unknown packet types, silently skip
 		return nil
 	}
 }
@@ -750,30 +905,34 @@ func (tc *TunnelClient) processDataPacket(payload []byte) error {
 		return fmt.Errorf("source IP mismatch: expected %s, got %s", tc.IP.String(), srcIP.String())
 	}
 
-	// Always log ICMP packets for debugging ping issues
-	if protocol == 1 { // ICMP
-		icmpType := "unknown"
-		if len(payload) >= 28 {
-			icmpTypeCode := payload[20] // ICMP type is at offset 20 (after IP header)
-			switch icmpTypeCode {
-			case 0:
-				icmpType = "echo reply"
-			case 8:
-				icmpType = "echo request"
-			case 3:
-				icmpType = "destination unreachable"
-			case 11:
-				icmpType = "time exceeded"
-			default:
-				icmpType = fmt.Sprintf("type %d", icmpTypeCode)
-			}
-		}
-		vpn.LogPacketAlways("OpenConnect: Processing ICMP %s packet from %s to %s (length: %d)",
-			icmpType, srcIP.String(), dstIP.String(), len(payload))
-	} else {
-		vpn.LogPacket("OpenConnect: Processing data packet from %s to %s (protocol: %d, length: %d)",
-			srcIP.String(), dstIP.String(), protocol, len(payload))
-	}
+	// 更新最后数据包时间
+	tc.lastDataTime = time.Now().Unix()
+
+	// ICMP packet logging removed to reduce latency
+	// Uncomment for debugging if needed:
+	// if protocol == 1 { // ICMP
+	// 	icmpType := "unknown"
+	// 	if len(payload) >= 28 {
+	// 		icmpTypeCode := payload[20] // ICMP type is at offset 20 (after IP header)
+	// 		switch icmpTypeCode {
+	// 		case 0:
+	// 			icmpType = "echo reply"
+	// 		case 8:
+	// 			icmpType = "echo request"
+	// 		case 3:
+	// 			icmpType = "destination unreachable"
+	// 		case 11:
+	// 			icmpType = "time exceeded"
+	// 		default:
+	// 			icmpType = fmt.Sprintf("type %d", icmpTypeCode)
+	// 		}
+	// 	}
+	// 	vpn.LogPacketAlways("OpenConnect: Processing ICMP %s packet from %s to %s (length: %d)",
+	// 		icmpType, srcIP.String(), dstIP.String(), len(payload))
+	// } else {
+	// 	vpn.LogPacket("OpenConnect: Processing data packet from %s to %s (protocol: %d, length: %d)",
+	// 		srcIP.String(), dstIP.String(), protocol, len(payload))
+	// }
 
 	// OPTIMIZATION: Check if this is client-to-client communication
 	// If so, forward directly without going through TUN device (faster path)
@@ -848,43 +1007,43 @@ func (tc *TunnelClient) processDataPacket(payload []byte) error {
 	// The kernel will process the packet and generate response if needed
 	// Response will be read from TUN by listenTUNDevice and forwarded back
 	// NOTE: We do NOT perform user-space NAT here because it breaks kernel conntrack.
-	// Instead, we rely on kernel's conntrack and routing to handle NAT via iptables/nftables
+	// Instead, we rely on kernel's conntrack and routing to handle NAT via nftables
 	// or eBPF TC hook (if implemented). The kernel will automatically track connections
 	// and route response packets back to the VPN client.
 	if tc.TUNDevice != nil {
 		// Write packet to TUN device WITHOUT modifying it
 		// The kernel's conntrack will track the connection, and NAT will be handled
-		// by the kernel's netfilter subsystem (iptables/nftables) or eBPF TC hook
-		n, err := tc.TUNDevice.Write(payload)
+		// by the kernel's netfilter subsystem (nftables) or eBPF TC hook
+		_, err := tc.TUNDevice.Write(payload)
 		if err != nil {
 			log.Printf("OpenConnect: Failed to write to TUN device: %v", err)
 			return fmt.Errorf("failed to write to TUN: %w", err)
 		}
-		// Always log ICMP packets (important for debugging ping issues)
-		if protocol == 1 { // ICMP
-			// Check ICMP type for more detailed logging
-			icmpType := "unknown"
-			if len(payload) >= 20+8 {
-				icmpTypeCode := payload[20] // ICMP type is at offset 20 (after IP header)
-				switch icmpTypeCode {
-				case 0:
-					icmpType = "echo reply"
-				case 8:
-					icmpType = "echo request"
-				case 3:
-					icmpType = "destination unreachable"
-				case 11:
-					icmpType = "time exceeded"
-				default:
-					icmpType = fmt.Sprintf("type %d", icmpTypeCode)
-				}
-			}
-			vpn.LogPacketAlways("OpenConnect: Wrote %d bytes (ICMP %s) to TUN device (packet from %s to %s)",
-				n, icmpType, srcIP.String(), dstIP.String())
-		} else {
-			vpn.LogPacket("OpenConnect: Wrote %d bytes to TUN device (packet from %s to %s, protocol: %d)",
-				n, srcIP.String(), dstIP.String(), protocol)
-		}
+		// ICMP packet logging removed to reduce latency
+		// Uncomment for debugging if needed:
+		// if protocol == 1 { // ICMP
+		// 	icmpType := "unknown"
+		// 	if len(payload) >= 20+8 {
+		// 		icmpTypeCode := payload[20] // ICMP type is at offset 20 (after IP header)
+		// 		switch icmpTypeCode {
+		// 		case 0:
+		// 			icmpType = "echo reply"
+		// 		case 8:
+		// 			icmpType = "echo request"
+		// 		case 3:
+		// 			icmpType = "destination unreachable"
+		// 		case 11:
+		// 			icmpType = "time exceeded"
+		// 		default:
+		// 			icmpType = fmt.Sprintf("type %d", icmpTypeCode)
+		// 		}
+		// 	}
+		// 	vpn.LogPacketAlways("OpenConnect: Wrote %d bytes (ICMP %s) to TUN device (packet from %s to %s)",
+		// 		n, icmpType, srcIP.String(), dstIP.String())
+		// } else {
+		// 	vpn.LogPacket("OpenConnect: Wrote %d bytes to TUN device (packet from %s to %s, protocol: %d)",
+		// 		n, srcIP.String(), dstIP.String(), protocol)
+		// }
 	} else {
 		log.Printf("OpenConnect: TUN device is nil, cannot forward packet")
 	}
@@ -925,28 +1084,24 @@ func (tc *TunnelClient) performPolicyCheck(packet []byte) error {
 	}
 
 	ebpfProgram := tc.VPNServer.GetEBPFProgram()
-	protocol := packet[9]
-	protocolName := getProtocolName(protocol)
+	// protocol := packet[9] // Unused, removed to reduce latency
+	// protocolName := getProtocolName(protocol) // Unused, removed to reduce latency
 
-	// Log policy check for debugging (ICMP always, TCP/UDP for VPN internal traffic)
-	if protocol == 1 || (isVPNInternal && (protocol == 6 || protocol == 17)) { // ICMP or TCP/UDP VPN internal
-		log.Printf("OpenConnect: [POLICY CHECK] performPolicyCheck: Protocol=%s, Src=%s, Dst=%s, isVPNInternal=%v, ebpfProgram=%v",
-			protocolName, srcIP.String(), dstIP.String(), isVPNInternal, ebpfProgram != nil)
-	}
+	// Policy check logging removed to reduce latency
+	// Uncomment for debugging if needed:
+	// protocol := packet[9]
+	// protocolName := getProtocolName(protocol)
+	// if protocol == 1 || (isVPNInternal && (protocol == 6 || protocol == 17)) {
+	// 	log.Printf("OpenConnect: [POLICY CHECK] performPolicyCheck: Protocol=%s, Src=%s, Dst=%s, isVPNInternal=%v, ebpfProgram=%v",
+	// 		protocolName, srcIP.String(), dstIP.String(), isVPNInternal, ebpfProgram != nil)
+	// }
 	if ebpfProgram == nil || isVPNInternal {
 		// No eBPF, or VPN internal traffic (eBPF can't handle VPN internal traffic)
 		// Must check in user space for ALL protocols (ICMP, TCP, UDP, etc.)
-		if protocol == 1 || (isVPNInternal && (protocol == 6 || protocol == 17)) { // ICMP or TCP/UDP VPN internal
-			log.Printf("OpenConnect: [POLICY CHECK] Using user-space policy check (checkPolicy) for %s",
-				protocolName)
-		}
 		return tc.checkPolicy(packet)
 	} else {
 		// eBPF is enabled and this is external traffic - do lightweight check
 		// eBPF will handle policy checks for external traffic at kernel level
-		if protocol == 1 { // ICMP
-			log.Printf("OpenConnect: [POLICY CHECK] Using lightweight check (eBPF handles external traffic)")
-		}
 		return tc.checkPolicyLightweight(packet)
 	}
 }
@@ -1031,16 +1186,18 @@ func (tc *TunnelClient) checkPolicy(packet []byte) error {
 	}
 
 	// Check PRE_ROUTING hook (always checked)
-	// Log policy check for ICMP and VPN internal TCP/UDP packets (for debugging)
-	if protocol == 1 || (isClientToClient || isClientToServer) && (protocol == 6 || protocol == 17) { // ICMP or VPN internal TCP/UDP
-		log.Printf("OpenConnect: [POLICY CHECK] Checking PRE_ROUTING hook: User=%s, Src=%s, Dst=%s, Protocol=%s, isClientToClient=%v, isClientToServer=%v",
-			tc.User.Username, ctx.SrcIP, ctx.DstIP, ctx.Protocol, isClientToClient, isClientToServer)
-	}
+	// Policy check logging removed to reduce latency
+	// Uncomment for debugging if needed:
+	// if protocol == 1 || (isClientToClient || isClientToServer) && (protocol == 6 || protocol == 17) {
+	// 	log.Printf("OpenConnect: [POLICY CHECK] Checking PRE_ROUTING hook: User=%s, Src=%s, Dst=%s, Protocol=%s, isClientToClient=%v, isClientToServer=%v",
+	// 		tc.User.Username, ctx.SrcIP, ctx.DstIP, ctx.Protocol, isClientToClient, isClientToServer)
+	// }
 	action := policyMgr.ExecutePolicies(policy.HookPreRouting, ctx)
-	if protocol == 1 || (isClientToClient || isClientToServer) && (protocol == 6 || protocol == 17) { // ICMP or VPN internal TCP/UDP
-		log.Printf("OpenConnect: [POLICY CHECK] PRE_ROUTING hook result: action=%d (0=ALLOW, 1=DENY, 2=REDIRECT, 3=LOG)",
-			action)
-	}
+	// Uncomment for debugging if needed:
+	// if protocol == 1 || (isClientToClient || isClientToServer) && (protocol == 6 || protocol == 17) {
+	// 	log.Printf("OpenConnect: [POLICY CHECK] PRE_ROUTING hook result: action=%d (0=ALLOW, 1=DENY, 2=REDIRECT, 3=LOG)",
+	// 		action)
+	// }
 	if action == policy.ActionDeny {
 		// Log policy denial for debugging (all protocols)
 		if protocol == 6 || protocol == 17 { // TCP or UDP - include port info
@@ -1072,15 +1229,18 @@ func (tc *TunnelClient) checkPolicy(packet []byte) error {
 		}
 	} else if isClientToServer {
 		// Client-to-server: check INPUT hook
-		if protocol == 1 || protocol == 6 || protocol == 17 { // ICMP, TCP, or UDP
-			log.Printf("OpenConnect: [POLICY CHECK] Checking INPUT hook: User=%s, Src=%s, Dst=%s, Protocol=%s",
-				tc.User.Username, ctx.SrcIP, ctx.DstIP, ctx.Protocol)
-		}
+		// Policy check logging removed to reduce latency
+		// Uncomment for debugging if needed:
+		// if protocol == 1 || protocol == 6 || protocol == 17 {
+		// 	log.Printf("OpenConnect: [POLICY CHECK] Checking INPUT hook: User=%s, Src=%s, Dst=%s, Protocol=%s",
+		// 		tc.User.Username, ctx.SrcIP, ctx.DstIP, ctx.Protocol)
+		// }
 		inputAction := policyMgr.ExecutePolicies(policy.HookInput, ctx)
-		if protocol == 1 || protocol == 6 || protocol == 17 { // ICMP, TCP, or UDP
-			log.Printf("OpenConnect: [POLICY CHECK] INPUT hook result: action=%d (0=ALLOW, 1=DENY, 2=REDIRECT, 3=LOG)",
-				inputAction)
-		}
+		// Uncomment for debugging if needed:
+		// if protocol == 1 || protocol == 6 || protocol == 17 {
+		// 	log.Printf("OpenConnect: [POLICY CHECK] INPUT hook result: action=%d (0=ALLOW, 1=DENY, 2=REDIRECT, 3=LOG)",
+		// 		inputAction)
+		// }
 		if inputAction == policy.ActionDeny {
 			// Log policy denial for debugging (all protocols)
 			if protocol == 6 || protocol == 17 { // TCP or UDP - include port info
@@ -1214,20 +1374,20 @@ func getProtocolName(protocol uint8) string {
 }
 
 // inferApplicationProtocol infers application layer protocol from network protocol and port
+// Only includes protocols that are actually supported by the frontend for audit logging
 func inferApplicationProtocol(netProtocol string, dstPort uint16) string {
 	// If not TCP or UDP, return network protocol as-is
 	if netProtocol != "tcp" && netProtocol != "udp" {
 		return netProtocol
 	}
 
-	// Common port mappings for application protocols
+	// Only include protocols supported by frontend audit log configuration:
+	// tcp, udp, http, https, ssh, ftp, smtp, mysql, dns, icmp
 	switch dstPort {
 	case 20, 21:
 		return "ftp"
 	case 22:
 		return "ssh"
-	case 23:
-		return "telnet"
 	case 25:
 		return "smtp"
 	case 53:
@@ -1235,80 +1395,12 @@ func inferApplicationProtocol(netProtocol string, dstPort uint16) string {
 			return "dns"
 		}
 		return netProtocol // TCP DNS is less common
-	case 67, 68:
-		return "dhcp"
-	case 69:
-		return "tftp"
 	case 80:
 		return "http"
 	case 443:
 		return "https"
-	case 8080:
-		return "http-alt"
-	case 8443:
-		return "https-alt"
 	case 3306:
 		return "mysql"
-	case 5432:
-		return "postgresql"
-	case 6379:
-		return "redis"
-	case 27017:
-		return "mongodb"
-	case 3389:
-		return "rdp"
-	case 5900:
-		return "vnc"
-	case 1433:
-		return "mssql"
-	case 1521:
-		return "oracle"
-	case 389:
-		return "ldap"
-	case 636:
-		return "ldaps"
-	case 143:
-		return "imap"
-	case 993:
-		return "imaps"
-	case 110:
-		return "pop3"
-	case 995:
-		return "pop3s"
-	case 9092:
-		return "kafka"
-	case 9200:
-		return "elasticsearch"
-	case 9300:
-		return "elasticsearch-cluster"
-	case 2181:
-		return "zookeeper"
-	case 9042:
-		return "cassandra"
-	case 7000, 7001:
-		return "cassandra-cluster"
-	case 27018:
-		return "mongodb-shard"
-	case 5984:
-		return "couchdb"
-	case 11211:
-		return "memcached"
-	case 5672:
-		return "amqp"
-	case 15672:
-		return "rabbitmq-management"
-	case 5671:
-		return "amqps"
-	case 1883:
-		return "mqtt"
-	case 8883:
-		return "mqtts"
-	case 2379, 2380:
-		return "etcd"
-	case 10250:
-		return "kubelet"
-	case 6443:
-		return "kubernetes-api"
 	default:
 		// Return network protocol if no application protocol can be inferred
 		return netProtocol

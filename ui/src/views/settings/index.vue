@@ -359,6 +359,150 @@
             </a-form>
           </a-tab-pane>
 
+          <!-- 审计日志协议配置 -->
+          <a-tab-pane key="audit-log" title="审计日志">
+            <a-form :model="auditLogForm" layout="vertical" @submit="handleAuditLogSubmit">
+              <a-alert type="info" style="margin-bottom: 16px">
+                <template #title>审计日志协议设置</template>
+                <div style="font-size: 12px">
+                  <p>选择需要记录审计日志的协议类型。默认开启常用协议（TCP、UDP、HTTP、HTTPS等），DNS和ICMP默认关闭以减少日志量。</p>
+                  <p><strong>建议</strong>：根据实际需求开启协议，避免记录过多日志导致数据库压力过大。</p>
+                </div>
+              </a-alert>
+
+              <a-divider orientation="left">常用协议（默认开启）</a-divider>
+              <a-row :gutter="16">
+                <a-col :span="12">
+                  <a-form-item>
+                    <a-checkbox v-model="auditLogForm.enabled_protocols.tcp">TCP</a-checkbox>
+                    <template #extra>
+                      <a-typography-text type="secondary" style="font-size: 12px">
+                        传输控制协议
+                      </a-typography-text>
+                    </template>
+                  </a-form-item>
+                </a-col>
+                <a-col :span="12">
+                  <a-form-item>
+                    <a-checkbox v-model="auditLogForm.enabled_protocols.udp">UDP</a-checkbox>
+                    <template #extra>
+                      <a-typography-text type="secondary" style="font-size: 12px">
+                        用户数据报协议
+                      </a-typography-text>
+                    </template>
+                  </a-form-item>
+                </a-col>
+              </a-row>
+
+              <a-row :gutter="16">
+                <a-col :span="12">
+                  <a-form-item>
+                    <a-checkbox v-model="auditLogForm.enabled_protocols.http">HTTP</a-checkbox>
+                    <template #extra>
+                      <a-typography-text type="secondary" style="font-size: 12px">
+                        超文本传输协议
+                      </a-typography-text>
+                    </template>
+                  </a-form-item>
+                </a-col>
+                <a-col :span="12">
+                  <a-form-item>
+                    <a-checkbox v-model="auditLogForm.enabled_protocols.https">HTTPS</a-checkbox>
+                    <template #extra>
+                      <a-typography-text type="secondary" style="font-size: 12px">
+                        安全超文本传输协议
+                      </a-typography-text>
+                    </template>
+                  </a-form-item>
+                </a-col>
+              </a-row>
+
+              <a-divider orientation="left">其他协议</a-divider>
+              <a-row :gutter="16">
+                <a-col :span="12">
+                  <a-form-item>
+                    <a-checkbox v-model="auditLogForm.enabled_protocols.ssh">SSH</a-checkbox>
+                    <template #extra>
+                      <a-typography-text type="secondary" style="font-size: 12px">
+                        安全外壳协议
+                      </a-typography-text>
+                    </template>
+                  </a-form-item>
+                </a-col>
+                <a-col :span="12">
+                  <a-form-item>
+                    <a-checkbox v-model="auditLogForm.enabled_protocols.ftp">FTP</a-checkbox>
+                    <template #extra>
+                      <a-typography-text type="secondary" style="font-size: 12px">
+                        文件传输协议
+                      </a-typography-text>
+                    </template>
+                  </a-form-item>
+                </a-col>
+              </a-row>
+
+              <a-row :gutter="16">
+                <a-col :span="12">
+                  <a-form-item>
+                    <a-checkbox v-model="auditLogForm.enabled_protocols.smtp">SMTP</a-checkbox>
+                    <template #extra>
+                      <a-typography-text type="secondary" style="font-size: 12px">
+                        简单邮件传输协议
+                      </a-typography-text>
+                    </template>
+                  </a-form-item>
+                </a-col>
+                <a-col :span="12">
+                  <a-form-item>
+                    <a-checkbox v-model="auditLogForm.enabled_protocols.mysql">MySQL</a-checkbox>
+                    <template #extra>
+                      <a-typography-text type="secondary" style="font-size: 12px">
+                        MySQL数据库协议
+                      </a-typography-text>
+                    </template>
+                  </a-form-item>
+                </a-col>
+              </a-row>
+
+              <a-divider orientation="left">高频协议（默认关闭）</a-divider>
+              <a-alert type="warning" style="margin-bottom: 16px">
+                <template #title>注意</template>
+                <div style="font-size: 12px">
+                  <p>以下协议会产生大量日志，建议仅在需要时开启：</p>
+                </div>
+              </a-alert>
+
+              <a-row :gutter="16">
+                <a-col :span="12">
+                  <a-form-item>
+                    <a-checkbox v-model="auditLogForm.enabled_protocols.dns">DNS</a-checkbox>
+                    <template #extra>
+                      <a-typography-text type="secondary" style="font-size: 12px">
+                        域名系统查询（会产生大量日志）
+                      </a-typography-text>
+                    </template>
+                  </a-form-item>
+                </a-col>
+                <a-col :span="12">
+                  <a-form-item>
+                    <a-checkbox v-model="auditLogForm.enabled_protocols.icmp">ICMP</a-checkbox>
+                    <template #extra>
+                      <a-typography-text type="secondary" style="font-size: 12px">
+                        Ping/ICMP协议（会产生大量日志）
+                      </a-typography-text>
+                    </template>
+                  </a-form-item>
+                </a-col>
+              </a-row>
+
+              <a-form-item>
+                <a-button type="primary" @click="handleAuditLogSubmit" :loading="auditLogLoading">
+                  保存配置
+                </a-button>
+              </a-form-item>
+            </a-form>
+          </a-tab-pane>
+
           <!-- LDAP 认证配置 -->
           <a-tab-pane key="ldap" title="LDAP 认证">
             <a-form :model="formData" layout="vertical" @submit="handleSubmit">
@@ -689,6 +833,7 @@ const compressionLoading = ref(false)
 const performanceLoading = ref(false)
 const securityLoading = ref(false)
 const distributedLoading = ref(false)
+const auditLogLoading = ref(false)
 
 // 流量压缩配置
 const compressionForm = reactive({
@@ -726,6 +871,22 @@ const securityForm = reactive({
   max_login_attempts: 5,
   login_lockout_duration: 900, // 15 minutes
   login_attempt_window: 300, // 5 minutes
+})
+
+// 审计日志协议配置
+const auditLogForm = reactive({
+  enabled_protocols: {
+    tcp: true,
+    udp: true,
+    http: true,
+    https: true,
+    ssh: true,
+    ftp: true,
+    smtp: true,
+    mysql: true,
+    dns: false,
+    icmp: false,
+  } as Record<string, boolean>,
 })
 
 const formData = reactive<UpdateLDAPConfigRequest>({
@@ -846,6 +1007,22 @@ const fetchConfig = async () => {
       securityForm.max_login_attempts = 5
       securityForm.login_lockout_duration = 900
       securityForm.login_attempt_window = 300
+    }
+
+    // 获取审计日志协议配置
+    try {
+      const auditConfig = await request.get('/settings/audit-log')
+      if (auditConfig && auditConfig.enabled_protocols) {
+        // 合并默认值和服务器返回的值
+        Object.keys(auditLogForm.enabled_protocols).forEach((key) => {
+          if (auditConfig.enabled_protocols[key] !== undefined) {
+            auditLogForm.enabled_protocols[key] = auditConfig.enabled_protocols[key]
+          }
+        })
+      }
+    } catch (error) {
+      // 如果API失败，使用默认值
+      console.log('Audit log settings API not available, using defaults')
     }
   } catch (error) {
     Message.error('获取LDAP配置失败')
@@ -1127,6 +1304,22 @@ const handleSecuritySubmit = async () => {
     Message.error(error.response?.data?.error || '保存配置失败')
   } finally {
     securityLoading.value = false
+  }
+}
+
+// 保存审计日志协议配置
+const handleAuditLogSubmit = async () => {
+  auditLogLoading.value = true
+  try {
+    await request.post('/settings/audit-log', {
+      enabled_protocols: auditLogForm.enabled_protocols,
+    })
+    Message.success('审计日志协议配置保存成功')
+    await fetchConfig()
+  } catch (error: any) {
+    Message.error(error.response?.data?.error || '保存配置失败')
+  } finally {
+    auditLogLoading.value = false
   }
 }
 

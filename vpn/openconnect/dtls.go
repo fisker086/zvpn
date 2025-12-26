@@ -5,10 +5,10 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/tls"
-	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"strings"
@@ -339,11 +339,22 @@ func (h *Handler) startRealDTLSServer() error {
 		log.Printf("DTLS: Using MTU from config: %d", dtlsMTU)
 	}
 
+	// 确保密码套件配置正确 - 只使用与客户端兼容的密码套件
+	supportedCipherSuites := []dtls.CipherSuiteID{
+		dtls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384, // 0xC030
+		dtls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256, // 0xC02F
+	}
+
+	log.Printf("DTLS: Configuring with cipher suites:")
+	for i, cs := range supportedCipherSuites {
+		log.Printf("DTLS:   [%d] 0x%04X", i, cs)
+	}
+
 	// DTLS 配置
 	dtlsConfig := &dtls.Config{
 		Certificates:         []tls.Certificate{cert},
 		ExtendedMasterSecret: dtls.DisableExtendedMasterSecret, // OpenConnect 兼容（必须禁用）
-		CipherSuites:         priorityCipherSuites,
+		CipherSuites:         supportedCipherSuites,            // 使用明确的密码套件列表
 		LoggerFactory:        logf,
 		MTU:                  dtlsMTU,   // 使用配置文件中的 MTU
 		SessionStore:         sessStore, // 使用 session store
@@ -422,7 +433,7 @@ func (h *Handler) startRealDTLSServer() error {
 	return nil
 }
 
-// handleDTLSConnection 处理 DTLS 连接
+// handleDTLSConnection 处理 DTLS 连接（优化版本）
 func (h *Handler) handleDTLSConnection(conn net.Conn) {
 	defer conn.Close()
 
@@ -437,125 +448,234 @@ func (h *Handler) handleDTLSConnection(conn net.Conn) {
 		return
 	}
 
-	// 查找匹配的客户端（通过 UDP 地址或未连接的客户端）
 	h.dtlsLock.Lock()
 	var matchedClient *TunnelClient
+	var matchedClientKey string
 
-	// 首先尝试通过 UDP 地址匹配（最准确）
-	// 注意：客户端在注册时 UDPAddr 可能是 nil，所以这个匹配可能不会成功
-	for _, clientInfo := range h.dtlsClients {
-		if clientInfo.UDPAddr != nil && clientInfo.UDPAddr.IP.Equal(udpAddr.IP) && clientInfo.UDPAddr.Port == udpAddr.Port {
-			matchedClient = clientInfo.Client
-			clientInfo.DTLSConn = conn
-			clientInfo.UDPAddr = udpAddr
-			clientInfo.LastSeen = time.Now()
-			break
-		}
-	}
-
-	// 如果没有通过地址匹配，尝试通过第一个未连接的客户端匹配
-	// 这是最常见的场景：客户端刚建立 TCP 连接，现在尝试建立 DTLS 连接
-	if matchedClient == nil {
-		for _, clientInfo := range h.dtlsClients {
-			if clientInfo.Client != nil && clientInfo.DTLSConn == nil {
+	// 步骤1：优先使用DTLSSessionID进行快速匹配（最精确、最快速）
+	if sessionID != "" {
+		for vpnIP, clientInfo := range h.dtlsClients {
+			if clientInfo != nil && clientInfo.DTLSSessionID == sessionID {
 				matchedClient = clientInfo.Client
+				matchedClientKey = vpnIP
+				// 更新连接信息
 				clientInfo.DTLSConn = conn
 				clientInfo.UDPAddr = udpAddr
 				clientInfo.LastSeen = time.Now()
+				log.Printf("DTLS: 快速会话ID匹配成功 - 用户: %s, VPN IP: %s, 会话ID: %s",
+					clientInfo.Client.User.Username, vpnIP, sessionID[:16]+"...")
 				break
+			}
+		}
+	}
+
+	// 步骤2：如果会话ID匹配失败，回退到UDP地址匹配
+	if matchedClient == nil {
+		for vpnIP, clientInfo := range h.dtlsClients {
+			if clientInfo != nil && clientInfo.UDPAddr != nil &&
+				clientInfo.UDPAddr.IP.Equal(udpAddr.IP) && clientInfo.UDPAddr.Port == udpAddr.Port {
+				matchedClient = clientInfo.Client
+				matchedClientKey = vpnIP
+				// 更新会话ID映射（如果还没有的话）
+				if clientInfo.DTLSSessionID == "" && sessionID != "" {
+					clientInfo.DTLSSessionID = sessionID
+				}
+				// 更新连接信息
+				clientInfo.DTLSConn = conn
+				clientInfo.UDPAddr = udpAddr
+				clientInfo.LastSeen = time.Now()
+				log.Printf("DTLS: UDP地址匹配成功 - 用户: %s, VPN IP: %s, 会话ID: %s",
+					clientInfo.Client.User.Username, vpnIP, sessionID[:16]+"...")
+				break
+			}
+		}
+	}
+
+	// 步骤3：如果地址匹配也失败，回退到第一个未连接客户端匹配
+	if matchedClient == nil {
+		for vpnIP, clientInfo := range h.dtlsClients {
+			if clientInfo != nil && clientInfo.Client != nil && clientInfo.DTLSConn == nil {
+				matchedClient = clientInfo.Client
+				matchedClientKey = vpnIP
+				// 建立会话ID映射（用于后续快速匹配）
+				if sessionID != "" {
+					clientInfo.DTLSSessionID = sessionID
+				}
+				// 更新连接信息
+				clientInfo.DTLSConn = conn
+				clientInfo.UDPAddr = udpAddr
+				clientInfo.LastSeen = time.Now()
+				log.Printf("DTLS: 回退匹配成功 - 用户: %s, VPN IP: %s, 会话ID: %s",
+					clientInfo.Client.User.Username, vpnIP, sessionID[:16]+"...")
+				break
+			}
+		}
+	}
+
+	// 步骤4：关键更新 - 更新VPNServer中的DTLSConn引用
+	if matchedClient != nil && matchedClientKey != "" {
+		if matchedClient.VPNServer != nil {
+			if vpnClient, exists := matchedClient.VPNServer.GetClient(matchedClient.User.ID); exists && vpnClient != nil {
+				vpnClient.DTLSConn = conn
+				log.Printf("DTLS: 更新VPNClient DTLS连接 - 用户: %s (VPN IP: %s)",
+					matchedClient.User.Username, matchedClient.IP.String())
+
+				// 优化：DTLS 连接建立后，立即通过 DTLS 通道发送 DPD 响应
+				// 这可以触发客户端路由生效，而不需要等待客户端发送 DPD 请求
+				// 使用 goroutine 异步发送，避免阻塞 DTLS 连接处理
+				go func() {
+					// 等待一小段时间，确保 DTLS 连接已经完全建立
+					time.Sleep(100 * time.Millisecond)
+					// 通过 DTLS 通道发送 DPD 响应，触发客户端路由生效
+					// 注意：DPD 响应通过 DTLS 通道发送，而不是 TCP 通道
+					// 这样可以更快地触发客户端的路由生效
+					if conn != nil {
+						// 构建 DPD-RESP 包：第一个字节是包类型 (0x04)，后面是空的 payload
+						dpdResp := []byte{PacketTypeDPDResp}
+						if _, err := conn.Write(dpdResp); err != nil {
+							log.Printf("DTLS: 通过 DTLS 通道发送 DPD 响应以触发路由生效失败: %v", err)
+						} else {
+							log.Printf("DTLS: 已通过 DTLS 通道发送 DPD 响应以触发客户端路由生效 - 用户: %s", matchedClient.User.Username)
+						}
+					}
+				}()
 			}
 		}
 	}
 	h.dtlsLock.Unlock()
 
+	// 步骤5：如果所有匹配都失败，记录错误并关闭连接
 	if matchedClient == nil {
-		log.Printf("DTLS: No matching client found for session ID: %s, remote: %s", sessionID, udpAddr)
+		log.Printf("DTLS: 所有匹配方法都失败 - 会话ID: %s, 远程地址: %s, 当前客户端数量: %d",
+			sessionID[:16]+"...", udpAddr, len(h.dtlsClients))
 		return
 	}
 
 	// 处理 DTLS 数据流
-	// 使用配置的 MTU 值作为缓冲区大小（确保足够大以容纳 MTU 大小的数据包）
-	// 为了支持MTU检测，缓冲区需要至少1500字节（标准MTU）
-	bufSize := h.config.VPN.MTU
-	if bufSize <= 0 {
-		bufSize = BufferSize // 如果未配置，使用默认值（1500字节）
+	// DTLS 数据包格式：第一个字节是包类型，后面是数据
+	// 0x00 = DATA (IP包), 0x03 = DPD-REQ, 0x04 = DPD-RESP, 0x05 = DISCONNECT, 0x07 = KEEPALIVE, 0x08 = COMPRESSED
+	readBufSize := 4096 // 单次读取缓冲区
+	readBuf := make([]byte, readBufSize)
+
+	// 获取 keepalive 配置，read timeout 应该略大于 keepalive 值（keepalive * 1.5）
+	// 这样可以在客户端发送 keepalive 之前，服务端先检测到超时
+	readTimeout := 30 * time.Second // 默认值
+	if matchedClient != nil && matchedClient.VPNServer != nil {
+		if cfg := matchedClient.VPNServer.GetConfig(); cfg != nil {
+			cstpKeepalive := cfg.VPN.CSTPKeepalive
+			if cstpKeepalive == 0 {
+				cstpKeepalive = 20 // 默认值：20秒（AnyConnect 标准）
+			}
+			// read timeout = keepalive * 1.5，确保在客户端发送 keepalive 之前检测到超时
+			readTimeout = time.Duration(cstpKeepalive) * time.Second * 3 / 2
+		}
 	}
-	// 确保缓冲区足够大（至少1500字节以支持MTU检测）
-	if bufSize < 1500 {
-		bufSize = 1500
-	}
-	buf := make([]byte, bufSize)
+
 	for {
-		n, err := conn.Read(buf)
-		if err != nil {
-			log.Printf("DTLS: Read error: %v", err)
+		// 设置读取超时（基于 keepalive 配置）
+		if err := conn.SetReadDeadline(time.Now().Add(readTimeout)); err != nil {
+			log.Printf("DTLS: 设置读取超时失败: %v", err)
 			return
 		}
 
-		if n < 8 {
-			log.Printf("DTLS: Packet too short: %d bytes", n)
+		// 从 DTLS 连接读取数据（已经解密）
+		n, err := conn.Read(readBuf)
+		if err != nil {
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				// 超时 - DTLS keepalive 由客户端处理，我们只需要继续
+				continue
+			}
+
+			if err == io.EOF {
+				log.Printf("DTLS: 客户端关闭DTLS连接 - 会话 %s", sessionID[:16]+"...")
+				return
+			}
+
+			log.Printf("DTLS: 读取错误: %v", err)
+			return
+		}
+
+		// 调试：记录读取到的原始数据（仅在必要时记录，减少日志开销）
+		// 注释掉以减少延迟，需要调试时可以取消注释
+		// if n > 0 {
+		// 	previewLen := n
+		// 	if previewLen > 32 {
+		// 		previewLen = 32
+		// 	}
+		// 	log.Printf("DTLS: 从连接读取 %d 字节，前 %d 字节: %x", n, previewLen, readBuf[:previewLen])
+		// }
+
+		// DTLS 数据包格式
+		// 第一个字节是包类型：
+		// 0x00 = DATA (IP包)
+		// 0x03 = DPD-REQ
+		// 0x04 = DPD-RESP
+		// 0x05 = DISCONNECT
+		// 0x07 = KEEPALIVE
+		// 0x08 = COMPRESSED DATA
+
+		if n < 1 {
 			continue
 		}
 
-		// 查找 STF 前缀（OpenConnect 客户端总是发送 STF 前缀）
-		var packetType byte
-		var length uint16
-		var payload []byte
-		var payloadStart int
+		packetType := readBuf[0]
 
-		// 检查是否有 STF 前缀
-		if buf[0] == 'S' && buf[1] == 'T' && buf[2] == 'F' {
-			// 现代格式：STF(3) + Header(5) = 8 bytes, payload starts at offset 8
-			if n < 8 {
-				log.Printf("DTLS: Packet too short for STF prefix: %d bytes", n)
-				continue
-			}
+		switch packetType {
+		case PacketTypeKeepalive: // 0x07
+			// KEEPALIVE - do nothing
+			// 减少日志以减少延迟
+			continue
 
-			// 解析 CSTP 头（STF 前缀之后）
-			// Byte 3: Version (0x01)
-			// Byte 4-5: Length (BIG-ENDIAN) - payload length only, NOT including header
-			// Byte 6: Payload type
-			// Byte 7: Reserved (0x00)
-			if buf[3] != 0x01 {
-				log.Printf("DTLS: Invalid version byte after STF prefix: 0x%02x", buf[3])
-				continue
-			}
+		case PacketTypeDisconnect: // 0x05
+			// DISCONNECT - 客户端请求断开连接
+			log.Printf("DTLS: 收到 DISCONNECT 包，客户端 %s 请求断开 DTLS 连接", matchedClient.User.Username)
+			return
 
-			length = binary.BigEndian.Uint16(buf[4:6])
-			packetType = buf[6]
-			payloadStart = 8 // STF(3) + Header(5)
-		} else {
-			// 兼容旧格式：没有 STF 前缀，直接解析 CSTP 头
-			if n < 5 {
-				log.Printf("DTLS: Packet too short for legacy format: %d bytes", n)
-				continue
-			}
-
-			length = binary.BigEndian.Uint16(buf[1:3])
-			packetType = buf[3]
-			payloadStart = 5 // 直接是 CSTP 头
-		}
-
-		// 验证总长度
-		expectedLength := payloadStart + int(length)
-		if expectedLength != n {
-			log.Printf("DTLS: Invalid packet length: declared=%d, expected total=%d, actual=%d", length, expectedLength, n)
-			// 仍然尝试处理数据包，因为某些客户端可能发送不同格式
-			if n >= payloadStart {
-				payload = buf[payloadStart:n]
-				if err := matchedClient.processPacket(packetType, payload); err != nil {
-					log.Printf("DTLS: Error processing packet: %v", err)
-				}
+		case PacketTypeDPDReq: // 0x03
+			// DPD-REQ - 死连接检测请求
+			// 发送 DPD-RESP 响应（优化：直接修改第一个字节，避免复制）
+			readBuf[0] = PacketTypeDPDResp
+			if _, err := conn.Write(readBuf[:n]); err != nil {
+				log.Printf("DTLS: 发送 DPD-RESP 失败: %v", err)
 			}
 			continue
-		}
 
-		// 提取 payload
-		payload = buf[payloadStart:n]
+		case PacketTypeDPDResp: // 0x04
+			// DPD-RESP - 死连接检测响应
+			// 减少日志以减少延迟
+			continue
 
-		// 处理数据包
-		if err := matchedClient.processPacket(packetType, payload); err != nil {
-			log.Printf("DTLS: Error processing packet: %v", err)
+		case PacketTypeCompressed: // 0x08
+			// COMPRESSED DATA - 压缩的数据包
+			if n < 2 {
+				continue
+			}
+			// TODO: 实现解压逻辑（如果启用了压缩）
+			// 目前先尝试直接处理（可能客户端发送的是未压缩的数据）
+			// 减少日志以减少延迟
+			// 暂时当作 DATA 包处理（跳过第一个字节，直接使用剩余数据）
+			// compressedData := readBuf[1:n] // 未使用，直接 fallthrough 到 DATA 处理
+			fallthrough
+
+		case PacketTypeData: // 0x00
+			// DATA - IP 包（去掉第一个字节）
+			if n < 2 {
+				continue
+			}
+			// 优化：直接使用 readBuf[1:n] 作为 payload，避免内存分配和复制
+			// 注意：processPacket 会复制数据，所以这里可以安全地传递切片
+			payload := readBuf[1:n]
+
+			// 处理 IP 包
+			if err := matchedClient.processPacket(PacketTypeData, payload); err != nil {
+				log.Printf("DTLS: 处理 DATA 包时出错: %v", err)
+			}
+			continue
+
+		default:
+			// 未知的包类型
+			log.Printf("DTLS: 收到未知包类型: 0x%02x，长度: %d", packetType, n)
+			continue
 		}
 	}
 }

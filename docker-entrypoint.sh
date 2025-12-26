@@ -60,10 +60,21 @@ else
     echo "   请使用 --sysctl net.ipv4.ip_forward=1 启动容器"
 fi
 
-# NAT 配置：在启动脚本中预先设置 iptables/nftables 规则，程序代码作为兜底
-echo "🔧 配置 NAT (iptables/nftables MASQUERADE)..."
+# NAT 配置：在启动脚本中预先设置 nftables 规则，程序代码作为兜底
+echo "🔧 配置 NAT (nftables MASQUERADE)..."
 
+# 从环境变量或配置文件读取 VPN_NETWORK
+# 优先使用环境变量，如果没有则尝试从配置文件读取
+if [ -z "$VPN_NETWORK" ]; then
+    # 尝试从配置文件读取（如果配置文件存在）
+    # 支持格式: network: "10.8.0.0/24" 或 network: 10.8.0.0/24
+    if [ -f /app/config.yaml ]; then
+        VPN_NETWORK=$(grep -E "^\s*network:" /app/config.yaml | head -1 | sed -E 's/.*network:\s*["'\'']?([^"'\'']+)["'\'']?.*/\1/' | tr -d ' ')
+    fi
+    # 如果配置文件也没有，使用默认值
 VPN_NETWORK="${VPN_NETWORK:-10.8.0.0/24}"
+fi
+
 VPN_EGRESS_INTERFACE="${VPN_EBPF_INTERFACE:-eth0}"
 
 # 函数：检查规则是否存在
@@ -71,16 +82,14 @@ check_nat_rule_exists() {
     local vpn_net="$1"
     local egress_if="$2"
     
-    # 检查 iptables 规则
-    if command -v iptables >/dev/null 2>&1; then
-        if iptables -t nat -C POSTROUTING -s "$vpn_net" -o "$egress_if" -j MASQUERADE >/dev/null 2>&1; then
-            return 0  # 规则存在
-        fi
-    fi
-    
     # 检查 nftables 规则
     if command -v nft >/dev/null 2>&1; then
-        if nft list ruleset 2>/dev/null | grep -q "saddr $vpn_net.*oifname \"$egress_if\".*masquerade"; then
+        # 检查 "ip nat" 表
+        if nft list table "ip nat" 2>/dev/null | grep -q "saddr $vpn_net.*oifname \"$egress_if\".*masquerade"; then
+            return 0  # 规则存在
+        fi
+        # 检查 "inet nat" 表
+        if nft list table "inet nat" 2>/dev/null | grep -q "saddr $vpn_net.*oifname \"$egress_if\".*masquerade"; then
             return 0  # 规则存在
         fi
     fi
@@ -88,58 +97,39 @@ check_nat_rule_exists() {
     return 1  # 规则不存在
 }
 
-# 函数：添加 iptables 规则
-add_iptables_rule() {
-    local vpn_net="$1"
-    local egress_if="$2"
-    
-    if ! command -v iptables >/dev/null 2>&1; then
-        return 1
-    fi
-    
-    # 加载必要的内核模块
-    modprobe iptable_filter 2>/dev/null || true
-    modprobe iptable_nat 2>/dev/null || true
-    
-    # 添加 NAT 规则
-    if iptables -t nat -C POSTROUTING -s "$vpn_net" -o "$egress_if" -j MASQUERADE >/dev/null 2>&1; then
-        echo "  ✅ iptables NAT 规则已存在"
-        return 0
-    fi
-    
-    # 尝试插入到位置 1（最高优先级）
-    if iptables -t nat -I POSTROUTING 1 -s "$vpn_net" -o "$egress_if" -j MASQUERADE 2>/dev/null; then
-        echo "  ✅ iptables NAT 规则已添加（位置 1）"
-        return 0
-    fi
-    
-    # 如果插入失败，尝试追加
-    if iptables -t nat -A POSTROUTING -s "$vpn_net" -o "$egress_if" -j MASQUERADE 2>/dev/null; then
-        echo "  ✅ iptables NAT 规则已添加（追加）"
-        return 0
-    fi
-    
-    return 1
-}
-
-# 函数：添加 nftables 规则
-add_nftables_rule() {
+# 函数：添加 nftables NAT 规则
+add_nftables_nat_rule() {
     local vpn_net="$1"
     local egress_if="$2"
     
     if ! command -v nft >/dev/null 2>&1; then
+        echo "  ❌ nft 命令不可用"
         return 1
     fi
     
-    # 尝试使用 "ip nat" 表（兼容 iptables-nft）
+    # 优先尝试使用 "ip nat" 表（标准 nftables 表）
     local table_name="ip nat"
     local chain_name="POSTROUTING"
     
     # 创建表（如果不存在）
-    nft add table "$table_name" 2>/dev/null || true
+    if ! nft list table "$table_name" >/dev/null 2>&1; then
+        nft create table "$table_name" 2>/dev/null || {
+            echo "  ⚠️  无法创建表 $table_name，尝试 inet nat"
+            table_name="inet nat"
+            nft create table "$table_name" 2>/dev/null || {
+                echo "  ❌ 无法创建 nftables 表"
+                return 1
+            }
+        }
+    fi
     
     # 创建链（如果不存在）
-    nft add chain "$table_name" "$chain_name" "{ type nat hook postrouting priority 100; }" 2>/dev/null || true
+    if ! nft list chain "$table_name" "$chain_name" >/dev/null 2>&1; then
+        nft create chain "$table_name" "$chain_name" "{ type nat hook postrouting priority 100; }" 2>/dev/null || {
+            echo "  ❌ 无法创建 nftables 链"
+            return 1
+        }
+    fi
     
     # 检查规则是否已存在
     if nft list ruleset 2>/dev/null | grep -q "saddr $vpn_net.*oifname \"$egress_if\".*masquerade"; then
@@ -149,37 +139,59 @@ add_nftables_rule() {
     
     # 添加规则
     if nft add rule "$table_name" "$chain_name" "ip saddr $vpn_net oifname \"$egress_if\" masquerade" 2>/dev/null; then
-        echo "  ✅ nftables NAT 规则已添加"
+        echo "  ✅ nftables NAT 规则已添加（表: $table_name）"
         return 0
     fi
     
     # 如果 "ip nat" 失败，尝试 "inet nat"
+    if [ "$table_name" != "inet nat" ]; then
     table_name="inet nat"
-    nft add table "$table_name" 2>/dev/null || true
-    nft add chain "$table_name" "$chain_name" "{ type nat hook postrouting priority 100; }" 2>/dev/null || true
-    
+        if ! nft list table "$table_name" >/dev/null 2>&1; then
+            nft create table "$table_name" 2>/dev/null || return 1
+        fi
+        if ! nft list chain "$table_name" "$chain_name" >/dev/null 2>&1; then
+            nft create chain "$table_name" "$chain_name" "{ type nat hook postrouting priority 100; }" 2>/dev/null || return 1
+        fi
     if nft add rule "$table_name" "$chain_name" "ip saddr $vpn_net oifname \"$egress_if\" masquerade" 2>/dev/null; then
-        echo "  ✅ nftables NAT 规则已添加（inet nat）"
+            echo "  ✅ nftables NAT 规则已添加（表: $table_name）"
         return 0
+        fi
     fi
     
     return 1
 }
 
-# 函数：添加 FORWARD 规则（允许转发）
-add_forward_rule() {
-    if ! command -v iptables >/dev/null 2>&1; then
+# 函数：添加 nftables FORWARD 规则（允许转发）
+add_nftables_forward_rule() {
+    if ! command -v nft >/dev/null 2>&1; then
         return 1
     fi
     
+    # 尝试使用 "ip filter" 表
+    local table_name="ip filter"
+    local chain_name="FORWARD"
+    
+    # 创建表（如果不存在）
+    if ! nft list table "$table_name" >/dev/null 2>&1; then
+        nft create table "$table_name" 2>/dev/null || {
+            table_name="inet filter"
+            nft create table "$table_name" 2>/dev/null || return 1
+        }
+    fi
+    
+    # 创建链（如果不存在）
+    if ! nft list chain "$table_name" "$chain_name" >/dev/null 2>&1; then
+        nft create chain "$table_name" "$chain_name" "{ type filter hook forward priority 0; }" 2>/dev/null || return 1
+    fi
+    
     # 检查规则是否已存在
-    if iptables -C FORWARD -j ACCEPT >/dev/null 2>&1; then
+    if nft list ruleset 2>/dev/null | grep -q "chain $chain_name.*accept"; then
         return 0
     fi
     
     # 添加规则
-    if iptables -I FORWARD 1 -j ACCEPT 2>/dev/null || iptables -A FORWARD -j ACCEPT 2>/dev/null; then
-        echo "  ✅ FORWARD 规则已添加"
+    if nft add rule "$table_name" "$chain_name" "accept" 2>/dev/null; then
+        echo "  ✅ nftables FORWARD 规则已添加"
         return 0
     fi
     
@@ -190,24 +202,66 @@ add_forward_rule() {
 if check_nat_rule_exists "$VPN_NETWORK" "$VPN_EGRESS_INTERFACE"; then
     echo "  ✅ NAT 规则已存在，跳过设置"
 else
-    # 尝试添加规则（优先 nftables，然后 iptables）
-    NAT_ADDED=false
-    
-    if add_nftables_rule "$VPN_NETWORK" "$VPN_EGRESS_INTERFACE"; then
-        NAT_ADDED=true
-    elif add_iptables_rule "$VPN_NETWORK" "$VPN_EGRESS_INTERFACE"; then
-        NAT_ADDED=true
-    fi
-    
-    if [ "$NAT_ADDED" = "false" ]; then
+    # 使用 nftables 添加规则
+    if add_nftables_nat_rule "$VPN_NETWORK" "$VPN_EGRESS_INTERFACE"; then
+        echo "  ✅ NAT 规则配置成功"
+    else
         echo "  ⚠️  警告: 无法在启动脚本中添加 NAT 规则"
         echo "     程序启动时会自动尝试添加（作为兜底）"
         echo "     如果仍然失败，请手动执行："
-        echo "     iptables -t nat -A POSTROUTING -s $VPN_NETWORK -o $VPN_EGRESS_INTERFACE -j MASQUERADE"
+        echo "     nft add rule ip nat POSTROUTING ip saddr $VPN_NETWORK oifname \"$VPN_EGRESS_INTERFACE\" masquerade"
+    fi
     fi
     
-    # 添加 FORWARD 规则（允许转发）
-    add_forward_rule || true
+# 添加 FORWARD 和 INPUT 规则（允许转发和接收）
+echo "🔧 配置 nftables FORWARD 和 INPUT 规则..."
+if add_nftables_forward_rule; then
+    echo "  ✅ FORWARD 规则已配置"
+else
+    echo "  ⚠️  FORWARD 规则添加失败，程序代码会尝试添加（兜底）"
+fi
+
+# 添加 INPUT 规则（允许 ICMP 等包到达服务器 VPN IP）
+add_nftables_input_rule() {
+    if ! command -v nft >/dev/null 2>&1; then
+        return 1
+    fi
+    
+    # 尝试使用 "ip filter" 表
+    local table_name="ip filter"
+    local chain_name="INPUT"
+    
+    # 创建表（如果不存在）
+    if ! nft list table "$table_name" >/dev/null 2>&1; then
+        nft create table "$table_name" 2>/dev/null || {
+            table_name="inet filter"
+            nft create table "$table_name" 2>/dev/null || return 1
+        }
+    fi
+    
+    # 创建链（如果不存在）
+    if ! nft list chain "$table_name" "$chain_name" >/dev/null 2>&1; then
+        nft create chain "$table_name" "$chain_name" "{ type filter hook input priority 0; }" 2>/dev/null || return 1
+    fi
+    
+    # 检查规则是否已存在
+    if nft list ruleset 2>/dev/null | grep -q "chain $chain_name.*accept"; then
+        return 0
+    fi
+    
+    # 添加规则（允许所有 INPUT 包，因为内核会处理路由）
+    if nft add rule "$table_name" "$chain_name" "accept" 2>/dev/null; then
+        echo "  ✅ nftables INPUT 规则已添加"
+        return 0
+    fi
+    
+    return 1
+}
+
+if add_nftables_input_rule; then
+    echo "  ✅ INPUT 规则已配置"
+else
+    echo "  ⚠️  INPUT 规则添加失败，程序代码会尝试添加（兜底）"
 fi
 
 # 显示配置信息

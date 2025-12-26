@@ -174,32 +174,42 @@ CREATE INDEX IF NOT EXISTS idx_ldap_configs_deleted_at ON ldap_configs(deleted_a
 -- 审计日志表
 CREATE TABLE IF NOT EXISTS audit_logs (
     id BIGSERIAL PRIMARY KEY,
+    created_at TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP,
+    deleted_at TIMESTAMP(3) NULL,
     user_id BIGINT DEFAULT 0,
     username VARCHAR(255),
     type VARCHAR(50) NOT NULL,
     action VARCHAR(50) NOT NULL,
     source_ip VARCHAR(45),
     destination_ip VARCHAR(45),
-    source_port INT,
-    destination_port INT,
+    source_port SMALLINT,
+    destination_port SMALLINT,
     protocol VARCHAR(20),
-    resource_type VARCHAR(50),
-    resource_path VARCHAR(500),
+    resource_type VARCHAR(100),
+    resource_path TEXT,
     domain VARCHAR(255),
     hook_id VARCHAR(255),
     hook_name VARCHAR(255),
+    policy_id BIGINT DEFAULT 0,
     policy_name VARCHAR(255),
     result VARCHAR(50),
     reason TEXT,
-    metadata JSONB,
-    created_at TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP
+    bytes_sent BIGINT DEFAULT 0,
+    bytes_received BIGINT DEFAULT 0,
+    metadata JSONB
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_logs_user_id ON audit_logs(user_id);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_type ON audit_logs(type);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_action ON audit_logs(action);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_source_ip ON audit_logs(source_ip);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_destination_ip ON audit_logs(destination_ip);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_domain ON audit_logs(domain);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_hook_id ON audit_logs(hook_id);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_policy_id ON audit_logs(policy_id);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_deleted_at ON audit_logs(deleted_at);
 
 -- 域名管理表
 CREATE TABLE IF NOT EXISTS domains (

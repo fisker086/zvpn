@@ -160,14 +160,76 @@ func (c *VPNClient) writePacket(packet []byte) {
 		}
 	}
 
+	// CRITICAL: Separate TCP and DTLS usage:
+	// - Data packets (PacketTypeData, 0x00) should use DTLS if available, otherwise TCP
+	// - Control packets (keepalive, DPD, etc.) should always use TCP (per OpenConnect spec)
+	// This ensures control traffic and data traffic don't interfere with each other
+	//
+	// DTLS format: first byte is packet type, then payload
+	// - 0x00 = DATA (IP packet)
+	// - 0x03 = DPD-REQ
+	// - 0x04 = DPD-RESP
+	// - 0x05 = DISCONNECT
+	// - 0x07 = KEEPALIVE
+	// - 0x08 = COMPRESSED DATA
+	conn := c.Conn // Default to TCP
+	connType := "TCP"
+	var writePacket []byte // Packet to write
+
+	// Check if this is a data packet (PacketTypeData = 0x00)
+	// Data packets should use DTLS if available
+	if len(packet) >= 8 && packet[0] == 'S' && packet[1] == 'T' && packet[2] == 'F' {
+		// Packet has STF prefix, check packet type at byte 6
+		packetType := packet[6]
+		if packetType == 0x00 && c.DTLSConn != nil {
+			// Data packet: use DTLS if available
+			// DTLS format: first byte is packet type (0x00), then IP packet
+			// Use io.MultiWriter or single Write with pre-allocated buffer to ensure atomic write
+			conn = c.DTLSConn
+			connType = "DTLS"
+			// Build DTLS packet: packet type (1 byte) + payload
+			// Use buffer pool or allocate once to avoid fragmentation
+			payload := packet[8:] // Skip STF(3) + Header(5) = 8 bytes
+			dtlsPacket := make([]byte, 1+len(payload))
+			dtlsPacket[0] = packetType // 0x00 = DATA
+			copy(dtlsPacket[1:], payload)
+			writePacket = dtlsPacket
+		} else {
+			// Control packet: always use TCP (per OpenConnect spec)
+			conn = c.Conn
+			connType = "TCP"
+			writePacket = packet
+		}
+	} else if c.DTLSConn != nil {
+		// Legacy format or unknown format: if DTLS available, try DTLS first
+		// But this should rarely happen as we always use STF prefix now
+		conn = c.DTLSConn
+		connType = "DTLS"
+		writePacket = packet
+	} else {
+		writePacket = packet
+	}
+
 	written := 0
-	for written < len(packet) {
-		n, err := c.Conn.Write(packet[written:])
+	for written < len(writePacket) {
+		n, err := conn.Write(writePacket[written:])
 		if err != nil {
 			// Write error - connection is likely closed by client
 			// This can happen when client sends FIN and we try to write after
-			log.Printf("Failed to write packet to client %d (IP: %s): %v (wrote %d/%d bytes) - connection may be closed",
-				c.UserID, c.IP.String(), err, written, len(packet))
+			log.Printf("Failed to write packet to client %d (IP: %s) via %s: %v (wrote %d/%d bytes) - connection may be closed",
+				c.UserID, c.IP.String(), connType, err, written, len(packet))
+
+			// If DTLS write failed, fallback to TCP for data packets
+			if connType == "DTLS" && len(packet) >= 8 && packet[6] == 0x00 {
+				log.Printf("DTLS write failed, falling back to TCP for data packet")
+				conn = c.Conn
+				connType = "TCP"
+				// Retry with TCP using original CSTP format packet
+				writePacket = packet
+				written = 0
+				continue
+			}
+
 			// Signal write loop to stop
 			select {
 			case <-c.WriteClose:
@@ -194,7 +256,8 @@ func (c *VPNClient) writePacket(packet []byte) {
 	// the packet is sent and acknowledged before the next write operation.
 	// This is critical for CSTP packets where each packet must be sent separately.
 	// Increased delay to 10ms to better ensure packet boundaries are preserved.
-	if tcpConn, ok := c.Conn.(*net.TCPConn); ok {
+	// Note: For DTLS (UDP), no delay is needed as UDP doesn't buffer like TCP
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
 		// With TCP_NODELAY enabled, the write should be sent immediately
 		// Add a longer delay to ensure kernel processes and sends the packet
 		// This prevents multiple packets from being merged in the send buffer
@@ -207,9 +270,10 @@ func (c *VPNClient) writePacket(packet []byte) {
 		}
 	}
 
-	if written != len(packet) {
+	// Check if write was complete (compare with actual packet written, not original)
+	if written != len(writePacket) {
 		log.Printf("Warning: Incomplete write to client %d (IP: %s): wrote %d/%d bytes",
-			c.UserID, c.IP.String(), written, len(packet))
+			c.UserID, c.IP.String(), written, len(writePacket))
 	}
 }
 
@@ -259,13 +323,67 @@ func (c *VPNClient) writeBatch(batch [][]byte) {
 			}
 		}
 
+		// CRITICAL: Separate TCP and DTLS usage for each packet in batch
+		// - Data packets (PacketTypeData, 0x00) should use DTLS if available
+		// - Control packets (keepalive, DPD, etc.) should always use TCP (per OpenConnect spec)
+		// This ensures control traffic and data traffic don't interfere with each other
+		// Even if client disables DTLS (--disable-udp), control packets can still be sent via TCP
+		conn := c.Conn // Default to TCP
+		connType := "TCP"
+		var writePacket []byte // Packet to write
+
+		// Check if this is a data packet (PacketTypeData = 0x00)
+		if len(packet) >= 8 && packet[0] == 'S' && packet[1] == 'T' && packet[2] == 'F' {
+			// Packet has STF prefix, check packet type at byte 6
+			packetType := packet[6]
+			if packetType == 0x00 && c.DTLSConn != nil {
+				// Data packet: use DTLS if available
+				// DTLS format: first byte is packet type (0x00), then IP packet
+				// Build DTLS packet: packet type (1 byte) + payload
+				conn = c.DTLSConn
+				connType = "DTLS"
+				// Build DTLS packet: packet type (1 byte) + payload
+				payload := packet[8:] // Skip STF(3) + Header(5) = 8 bytes
+				dtlsPacket := make([]byte, 1+len(payload))
+				dtlsPacket[0] = packetType // 0x00 = DATA
+				copy(dtlsPacket[1:], payload)
+				writePacket = dtlsPacket
+			} else {
+				// Control packet: always use TCP (per OpenConnect spec)
+				// This ensures control packets work even if client disables DTLS
+				conn = c.Conn
+				connType = "TCP"
+				writePacket = packet
+			}
+		} else if c.DTLSConn != nil {
+			// Legacy format: if DTLS available, try DTLS first
+			// But this should rarely happen as we always use STF prefix now
+			conn = c.DTLSConn
+			connType = "DTLS"
+			writePacket = packet
+		} else {
+			writePacket = packet
+		}
+
 		written := 0
-		for written < len(packet) {
-			n, err := c.Conn.Write(packet[written:])
+		for written < len(writePacket) {
+			n, err := conn.Write(writePacket[written:])
 			if err != nil {
 				// Write error - connection is likely closed by client
-				log.Printf("Failed to write batch packet to client %d (IP: %s): %v (wrote %d/%d bytes) - connection may be closed",
-					c.UserID, c.IP.String(), err, written, len(packet))
+				log.Printf("Failed to write batch packet to client %d (IP: %s) via %s: %v (wrote %d/%d bytes) - connection may be closed",
+					c.UserID, c.IP.String(), connType, err, written, len(packet))
+
+				// If DTLS write failed, fallback to TCP for data packets
+				if connType == "DTLS" && len(packet) >= 8 && packet[6] == 0x00 {
+					log.Printf("DTLS write failed, falling back to TCP for data packet")
+					conn = c.Conn
+					connType = "TCP"
+					// Retry with TCP using original CSTP format packet
+					writePacket = packet
+					written = 0
+					continue
+				}
+
 				// Signal write loop to stop
 				select {
 				case <-c.WriteClose:
@@ -282,7 +400,8 @@ func (c *VPNClient) writeBatch(batch [][]byte) {
 		// This prevents packets from being merged in TCP buffer
 		// With TCP_NODELAY enabled, each write should be sent immediately
 		// Add a delay to ensure kernel processes and sends the packet
-		if _, ok := c.Conn.(*net.TCPConn); ok {
+		// Note: For DTLS (UDP), no delay is needed as UDP doesn't buffer like TCP
+		if _, ok := conn.(*net.TCPConn); ok {
 			// Delay to ensure kernel sends the packet before next write
 			// This is critical for CSTP packets where each packet must be sent separately
 			// Increased to 5ms to ensure packet is fully sent before next operation

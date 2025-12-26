@@ -37,12 +37,16 @@ vpn:
   dtlsport: "443"               # DTLS UDP 端口（与 TCP 保持一致）
   
   # CSTP/DTLS 连接保活配置
-  cstpdpd: 30                    # CSTP 死连接检测间隔（秒，默认：30）
-  cstpkeepalive: 20             # CSTP 保活间隔（秒，默认：20）
+  cstpdpd: 20                    # CSTP 死连接检测间隔（秒，默认：20）
+  cstpkeepalive: 3             # CSTP 保活间隔（秒，默认：3）
+  
+  # Cisco 客户端兼容性配置（ocserv 协议参数）
+  ciscoclientcompat: true        # 启用 Cisco 客户端兼容模式（支持旧版 AnyConnect 客户端，默认：true）
+  dtlslegacy: true               # 启用旧版 DTLS 协议支持（默认：true，OpenConnect 和 AnyConnect 客户端都支持）
   
   # DNS拦截器和域名动态拆分隧道（DNS拦截器始终启用）
   dnsport: "53"                 # DNS服务器端口
-  upstreamdns: "8.8.8.8:53,8.8.4.4:53"  # 上游DNS服务器（逗号分隔）
+  upstreamdns: "114.114.114.114:53"  # 上游DNS服务器（逗号分隔）
 
 # ==================== JWT 配置 ====================
 jwt:

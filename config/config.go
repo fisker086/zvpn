@@ -81,6 +81,10 @@ type VPNConfig struct {
 	CSTPDPD       int `mapstructure:"cstpdpd"`       // CSTP dead peer detection interval in seconds (default: 30)
 	CSTPKeepalive int `mapstructure:"cstpkeepalive"` // CSTP keepalive interval in seconds (default: 20)
 
+	// Cisco client compatibility (ocserv protocol parameters)
+	CiscoClientCompat bool `mapstructure:"ciscoclientcompat"` // Enable Cisco client compatibility mode (default: true for AnyConnect support)
+	DTLSLegacy        bool `mapstructure:"dtlslegacy"`        // Enable legacy DTLS protocol support (default: true, supported by both OpenConnect and AnyConnect clients)
+
 	// Security and protection settings
 	EnableRateLimit      bool  `mapstructure:"enableratelimit"`      // Enable rate limiting (default: true)
 	RateLimitPerIP       int64 `mapstructure:"ratelimitperip"`       // Rate limit per IP (packets per second, default: 1000)
@@ -97,7 +101,6 @@ type VPNConfig struct {
 
 	// Session/concurrency settings
 	AllowMultiClientLogin bool `mapstructure:"allowmulticlientlogin"` // Allow same account multiple concurrent logins
-
 }
 
 type JWTConfig struct {
@@ -129,6 +132,7 @@ func Load() *Config {
 	setDefaults()
 
 	// 环境变量映射
+	viper.BindEnv("vpn.network", "VPN_NETWORK")
 	viper.BindEnv("vpn.ebpfinterfacename", "VPN_EBPF_INTERFACE")
 	viper.BindEnv("vpn.enableafxdp", "VPN_ENABLE_AFXDP")
 	viper.BindEnv("vpn.afxdpqueueid", "VPN_AFXDP_QUEUE_ID")

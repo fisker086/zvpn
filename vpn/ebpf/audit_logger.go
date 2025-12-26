@@ -4,6 +4,7 @@
 package ebpf
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"sync"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/fisker/zvpn/database"
 	"github.com/fisker/zvpn/models"
+	"gorm.io/gorm"
 )
 
 // inferApplicationProtocol infers application layer protocol from network protocol and port
@@ -139,6 +141,17 @@ var globalAuditBuffer = &auditLogBuffer{
 	bufSize: 100,
 }
 
+// auditLogProtocolCache for eBPF package
+var ebpfAuditLogProtocolCache struct {
+	protocols  map[string]bool
+	lastUpdate time.Time
+	lock       sync.RWMutex
+	loading    bool // Flag to prevent concurrent DB queries
+}
+
+const ebpfAuditLogSettingKey = "audit_log_settings"
+const ebpfAuditLogCacheTTL = 5 * time.Minute // Cache for 5 minutes to reduce DB queries
+
 // flushAuditBuffer flushes buffered audit logs to database
 func (b *auditLogBuffer) flush() error {
 	b.lock.Lock()
@@ -233,6 +246,11 @@ func logPolicyEvent(event *PolicyEvent) error {
 	// Infer application layer protocol from destination port
 	protocolStr := inferApplicationProtocol(netProtocolStr, event.DstPort)
 
+	// 根据设置决定是否记录该协议的日志
+	if !shouldLogProtocolForEBPF(protocolStr, event.DstPort) {
+		return nil
+	}
+
 	// Determine action and result based on event action
 	// POLICY_ACTION_ALLOW = 0, POLICY_ACTION_DENY = 1, POLICY_ACTION_REDIRECT = 2
 	var auditAction models.AuditLogAction
@@ -296,4 +314,139 @@ func logPolicyEvent(event *PolicyEvent) error {
 	}()
 
 	return nil
+}
+
+// shouldLogProtocolForEBPF checks if a protocol should be logged based on settings (eBPF version)
+func shouldLogProtocolForEBPF(protocol string, dstPort uint16) bool {
+	// Get enabled protocols from cache or DB
+	enabledProtocols := getEnabledAuditLogProtocolsForEBPF()
+
+	// Check if protocol is enabled
+	if enabled, ok := enabledProtocols[protocol]; ok {
+		return enabled
+	}
+
+	// For DNS, also check by port
+	if dstPort == 53 && protocol != "dns" {
+		// This is likely DNS traffic, check DNS setting
+		if enabled, ok := enabledProtocols["dns"]; ok {
+			return enabled
+		}
+	}
+
+	// Default: if protocol not in settings, allow logging (backward compatibility)
+	// But for known high-frequency protocols, default to false
+	if protocol == "dns" || protocol == "icmp" {
+		return false
+	}
+
+	return true
+}
+
+// ClearEBPFAuditLogProtocolCache clears the cache to force reload on next access
+// This should be called when settings are updated
+func ClearEBPFAuditLogProtocolCache() {
+	ebpfAuditLogProtocolCache.lock.Lock()
+	defer ebpfAuditLogProtocolCache.lock.Unlock()
+	ebpfAuditLogProtocolCache.protocols = nil
+	ebpfAuditLogProtocolCache.lastUpdate = time.Time{} // Reset to zero time
+	ebpfAuditLogProtocolCache.loading = false
+}
+
+// getEnabledAuditLogProtocolsForEBPF returns the map of enabled protocols (eBPF version)
+func getEnabledAuditLogProtocolsForEBPF() map[string]bool {
+	ebpfAuditLogProtocolCache.lock.RLock()
+	// Check if cache is still valid
+	if time.Since(ebpfAuditLogProtocolCache.lastUpdate) < ebpfAuditLogCacheTTL && ebpfAuditLogProtocolCache.protocols != nil {
+		protocols := ebpfAuditLogProtocolCache.protocols
+		ebpfAuditLogProtocolCache.lock.RUnlock()
+		return protocols
+	}
+	ebpfAuditLogProtocolCache.lock.RUnlock()
+
+	// Cache expired or not set, reload from DB
+	ebpfAuditLogProtocolCache.lock.Lock()
+
+	// Double check after acquiring write lock
+	if time.Since(ebpfAuditLogProtocolCache.lastUpdate) < ebpfAuditLogCacheTTL && ebpfAuditLogProtocolCache.protocols != nil {
+		protocols := ebpfAuditLogProtocolCache.protocols
+		ebpfAuditLogProtocolCache.lock.Unlock()
+		return protocols
+	}
+
+	// Prevent concurrent DB queries - if another goroutine is already loading, wait and return current cache
+	if ebpfAuditLogProtocolCache.loading {
+		// Another goroutine is loading, return current cache or defaults
+		if ebpfAuditLogProtocolCache.protocols != nil {
+			protocols := ebpfAuditLogProtocolCache.protocols
+			ebpfAuditLogProtocolCache.lock.Unlock()
+			return protocols
+		}
+		protocols := getDefaultAuditLogProtocolsForEBPF()
+		ebpfAuditLogProtocolCache.lock.Unlock()
+		return protocols
+	}
+
+	// Mark as loading
+	ebpfAuditLogProtocolCache.loading = true
+	ebpfAuditLogProtocolCache.lock.Unlock()
+
+	// Load from DB (without holding lock to avoid blocking)
+	// Check if database is initialized
+	var newProtocols map[string]bool
+	if database.DB == nil {
+		// Database not initialized yet, use defaults
+		log.Printf("Database not initialized, using default audit log protocols")
+		newProtocols = getDefaultAuditLogProtocolsForEBPF()
+	} else {
+		var setting models.SystemSetting
+		err := database.DB.Where("`key` = ?", ebpfAuditLogSettingKey).First(&setting).Error
+
+		if err != nil {
+			if err == gorm.ErrRecordNotFound {
+				// Use defaults
+				newProtocols = getDefaultAuditLogProtocolsForEBPF()
+			} else {
+				log.Printf("Failed to load audit log settings: %v", err)
+				// Use defaults on error
+				newProtocols = getDefaultAuditLogProtocolsForEBPF()
+			}
+		} else {
+			// Parse JSON
+			var settings struct {
+				EnabledProtocols map[string]bool `json:"enabled_protocols"`
+			}
+			if err := json.Unmarshal([]byte(setting.Value), &settings); err != nil {
+				log.Printf("Failed to parse audit log settings: %v", err)
+				newProtocols = getDefaultAuditLogProtocolsForEBPF()
+			} else {
+				newProtocols = settings.EnabledProtocols
+			}
+		}
+	}
+
+	// Update cache with write lock
+	ebpfAuditLogProtocolCache.lock.Lock()
+	ebpfAuditLogProtocolCache.protocols = newProtocols
+	ebpfAuditLogProtocolCache.lastUpdate = time.Now()
+	ebpfAuditLogProtocolCache.loading = false
+	ebpfAuditLogProtocolCache.lock.Unlock()
+
+	return newProtocols
+}
+
+// getDefaultAuditLogProtocolsForEBPF returns default enabled protocols (eBPF version)
+func getDefaultAuditLogProtocolsForEBPF() map[string]bool {
+	return map[string]bool{
+		"tcp":   true,
+		"udp":   true,
+		"http":  true,
+		"https": true,
+		"ssh":   false,
+		"ftp":   false,
+		"smtp":  false,
+		"mysql": false,
+		"dns":   false, // DNS queries are too frequent
+		"icmp":  false, // ICMP (ping) is too frequent
+	}
 }
