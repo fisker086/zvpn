@@ -875,21 +875,15 @@ func (tc *TunnelClient) processDataPacket(payload []byte) error {
 		}
 	}
 
-	// Minimum IP header size is 20 bytes
-	if len(payload) < 20 {
-		return nil // Skip too small packets
+	// 验证数据包格式（使用统一的验证函数，确保后端验证一致性）
+	if err := validateIPPacket(payload); err != nil {
+		log.Printf("OpenConnect: Invalid packet from user %s: %v", tc.User.Username, err)
+		return nil // 跳过无效数据包
 	}
 
-	// Check IP version (first 4 bits)
-	ipVersion := payload[0] >> 4
-	if ipVersion != 4 {
-		// Only support IPv4 for now
-		return nil
-	}
-
-	// Validate IP header length
+	// 提取IP头长度（用于后续处理）
 	ipHeaderLen := int((payload[0] & 0x0F) * 4)
-	if ipHeaderLen < 20 || ipHeaderLen > len(payload) {
+	if ipHeaderLen > len(payload) {
 		log.Printf("OpenConnect: Invalid IP header length: %d", ipHeaderLen)
 		return nil
 	}
@@ -939,15 +933,13 @@ func (tc *TunnelClient) processDataPacket(payload []byte) error {
 	// Get VPN network configuration
 	cfg := tc.VPNServer.GetConfig()
 	if cfg != nil {
-		_, ipNet, err := net.ParseCIDR(cfg.VPN.Network)
+		ipNet, err := parseVPNNetwork(cfg.VPN.Network)
 		if err == nil {
-			// Get server VPN IP
-			serverVPNIP := make(net.IP, len(ipNet.IP))
-			copy(serverVPNIP, ipNet.IP)
-			serverVPNIP[len(serverVPNIP)-1] = 1
+			// 获取服务器VPN IP（后端验证的关键）
+			serverVPNIP := getServerVPNIP(ipNet)
 
-			// Check if this is client-to-client communication (Case 3)
-			if ipNet.Contains(srcIP) && ipNet.Contains(dstIP) && !dstIP.Equal(serverVPNIP) {
+			// 检查是否是客户端到客户端通信（Case 3）
+			if isVPNInternalTraffic(srcIP, dstIP, ipNet) && !dstIP.Equal(serverVPNIP) {
 				// Client-to-client communication - forward directly, bypassing TUN device
 				// This is the optimal path: no TUN read/write, no kernel routing overhead
 				if protocol == 1 { // ICMP - always log for debugging
@@ -1058,50 +1050,60 @@ func (tc *TunnelClient) processDPDPacket(payload []byte) error {
 	return tc.sendPacket(PacketTypeDPDResp, payload)
 }
 
+// logPolicyDenial 记录策略拒绝日志（统一格式，减少重复代码）
+func logPolicyDenial(hookName, username string, ctx *policy.Context, protocol byte) {
+	if protocol == 6 || protocol == 17 { // TCP or UDP - 包含端口信息
+		log.Printf("OpenConnect: [POLICY DENY] %s hook denied packet: User=%s, Src=%s:%d, Dst=%s:%d, Protocol=%s",
+			hookName, username, ctx.SrcIP, ctx.SrcPort, ctx.DstIP, ctx.DstPort, ctx.Protocol)
+	} else {
+		log.Printf("OpenConnect: [POLICY DENY] %s hook denied packet: User=%s, Src=%s, Dst=%s, Protocol=%s",
+			hookName, username, ctx.SrcIP, ctx.DstIP, ctx.Protocol)
+	}
+}
+
 // performPolicyCheck handles the policy check logic based on whether eBPF is enabled
 // This function reduces code duplication by centralizing the policy check logic
+// 后端验证的关键：无论客户端如何配置，服务端都必须进行策略验证
 func (tc *TunnelClient) performPolicyCheck(packet []byte) error {
-	// Extract packet information to determine if this is VPN internal traffic
-	if len(packet) < 20 {
-		return nil
+	// 验证数据包格式（后端验证的关键步骤）
+	if err := validateIPPacket(packet); err != nil {
+		log.Printf("OpenConnect: [POLICY CHECK] Invalid packet format: %v", err)
+		return fmt.Errorf("invalid packet format: %w", err)
 	}
+
 	srcIP := net.IP(packet[12:16])
 	dstIP := net.IP(packet[16:20])
 
-	// Check if this is VPN internal traffic (client-to-client or client-to-server)
-	// VPN internal traffic doesn't go through eth0, so eBPF can't handle it
-	// We need to do full policy check in user space for VPN internal traffic
+	// 检查是否是VPN内部流量（客户端到客户端或客户端到服务器）
+	// VPN内部流量不经过eth0，eBPF无法处理，必须在用户空间进行完整策略检查
 	isVPNInternal := false
 	cfg := tc.VPNServer.GetConfig()
 	if cfg != nil {
-		_, ipNet, err := net.ParseCIDR(cfg.VPN.Network)
+		ipNet, err := parseVPNNetwork(cfg.VPN.Network)
 		if err == nil {
-			// If both source and destination are in VPN network, it's VPN internal traffic
-			if ipNet.Contains(srcIP) && ipNet.Contains(dstIP) {
-				isVPNInternal = true
-			}
+			// 如果源和目标都在VPN网络中，则是VPN内部流量
+			isVPNInternal = isVPNInternalTraffic(srcIP, dstIP, ipNet)
 		}
 	}
 
 	ebpfProgram := tc.VPNServer.GetEBPFProgram()
-	// protocol := packet[9] // Unused, removed to reduce latency
-	// protocolName := getProtocolName(protocol) // Unused, removed to reduce latency
 
-	// Policy check logging removed to reduce latency
-	// Uncomment for debugging if needed:
+	// 策略检查日志已移除以减少延迟
+	// 如需调试，可取消注释：
 	// protocol := packet[9]
 	// protocolName := getProtocolName(protocol)
 	// if protocol == 1 || (isVPNInternal && (protocol == 6 || protocol == 17)) {
 	// 	log.Printf("OpenConnect: [POLICY CHECK] performPolicyCheck: Protocol=%s, Src=%s, Dst=%s, isVPNInternal=%v, ebpfProgram=%v",
 	// 		protocolName, srcIP.String(), dstIP.String(), isVPNInternal, ebpfProgram != nil)
 	// }
+
 	if ebpfProgram == nil || isVPNInternal {
-		// No eBPF, or VPN internal traffic (eBPF can't handle VPN internal traffic)
-		// Must check in user space for ALL protocols (ICMP, TCP, UDP, etc.)
+		// 无eBPF，或VPN内部流量（eBPF无法处理VPN内部流量）
+		// 必须在用户空间对所有协议（ICMP、TCP、UDP等）进行完整策略检查
 		return tc.checkPolicy(packet)
 	} else {
-		// eBPF is enabled and this is external traffic - do lightweight check
-		// eBPF will handle policy checks for external traffic at kernel level
+		// eBPF已启用且这是外部流量 - 进行轻量级检查
+		// eBPF将在内核层面处理外部流量的策略检查
 		return tc.checkPolicyLightweight(packet)
 	}
 }
@@ -1109,17 +1111,19 @@ func (tc *TunnelClient) performPolicyCheck(packet []byte) error {
 // checkPolicyLightweight performs a lightweight policy check
 // This is used when eBPF is enabled - eBPF handles most policy checks
 // This function only checks critical policies that can't be handled by eBPF
+// 后端验证的关键：即使eBPF处理了大部分检查，仍需要基本的验证
 func (tc *TunnelClient) checkPolicyLightweight(packet []byte) error {
-	// For now, just do basic validation
-	// Full policy checks are done in eBPF XDP
-	if len(packet) < 20 {
-		return nil
+	// 基本验证：确保数据包格式正确
+	if err := validateIPPacket(packet); err != nil {
+		return fmt.Errorf("invalid packet format: %w", err)
 	}
-	// Additional lightweight checks can be added here
+	// 完整的策略检查由eBPF XDP在内核层面处理
+	// 这里可以添加eBPF无法处理的额外检查
 	return nil
 }
 
 // checkPolicy checks if the packet is allowed by policy
+// 后端验证的核心：无论客户端如何配置路由，服务端都必须进行完整的策略验证
 func (tc *TunnelClient) checkPolicy(packet []byte) error {
 	if tc.VPNServer == nil {
 		return nil
@@ -1130,16 +1134,16 @@ func (tc *TunnelClient) checkPolicy(packet []byte) error {
 		return nil
 	}
 
-	// Extract packet information for policy check
-	if len(packet) < 20 {
-		return nil
+	// 验证数据包格式（后端验证的关键步骤）
+	if err := validateIPPacket(packet); err != nil {
+		return fmt.Errorf("invalid packet format: %w", err)
 	}
 
 	srcIP := net.IP(packet[12:16])
 	dstIP := net.IP(packet[16:20])
 	protocol := packet[9]
 
-	// Create policy context
+	// 创建策略上下文
 	ctx := policy.NewContext()
 	ctx.UserID = tc.User.ID
 	ctx.VPNIP = tc.IP.String()
@@ -1148,34 +1152,32 @@ func (tc *TunnelClient) checkPolicy(packet []byte) error {
 	ctx.DstIP = dstIP.String()
 	netProtocol := getProtocolName(protocol)
 
-	// Extract ports if TCP/UDP
+	// 如果是TCP/UDP，提取端口信息
 	if protocol == 6 || protocol == 17 { // TCP or UDP
 		if len(packet) >= 24 {
 			ctx.SrcPort = binary.BigEndian.Uint16(packet[20:22])
 			ctx.DstPort = binary.BigEndian.Uint16(packet[22:24])
 		}
-		// Infer application layer protocol from destination port
+		// 从目标端口推断应用层协议
 		ctx.Protocol = inferApplicationProtocol(netProtocol, ctx.DstPort)
 	} else {
 		ctx.Protocol = netProtocol
 	}
 
-	// Determine which hook points to check based on packet flow
-	// - Client-to-client: PRE_ROUTING + FORWARD
-	// - Client-to-server: PRE_ROUTING + INPUT
-	// - External traffic: PRE_ROUTING + POST_ROUTING
+	// 根据数据包流向确定需要检查的hook点
+	// - 客户端到客户端：PRE_ROUTING + FORWARD
+	// - 客户端到服务器：PRE_ROUTING + INPUT
+	// - 外部流量：PRE_ROUTING + POST_ROUTING
 	cfg := tc.VPNServer.GetConfig()
 	isClientToClient := false
 	isClientToServer := false
 	if cfg != nil {
-		_, ipNet, err := net.ParseCIDR(cfg.VPN.Network)
+		ipNet, err := parseVPNNetwork(cfg.VPN.Network)
 		if err == nil {
-			if ipNet.Contains(srcIP) && ipNet.Contains(dstIP) {
-				// Both source and destination are in VPN network
-				// Check if destination is server VPN IP
-				serverVPNIP := make(net.IP, len(ipNet.IP))
-				copy(serverVPNIP, ipNet.IP)
-				serverVPNIP[len(serverVPNIP)-1] = 1
+			if isVPNInternalTraffic(srcIP, dstIP, ipNet) {
+				// 源和目标都在VPN网络中
+				// 检查目标是否是服务器VPN IP
+				serverVPNIP := getServerVPNIP(ipNet)
 				if dstIP.Equal(serverVPNIP) {
 					isClientToServer = true
 				} else {
@@ -1199,14 +1201,8 @@ func (tc *TunnelClient) checkPolicy(packet []byte) error {
 	// 		action)
 	// }
 	if action == policy.ActionDeny {
-		// Log policy denial for debugging (all protocols)
-		if protocol == 6 || protocol == 17 { // TCP or UDP - include port info
-			log.Printf("OpenConnect: [POLICY DENY] PRE_ROUTING hook denied packet: User=%s, Src=%s:%d, Dst=%s:%d, Protocol=%s",
-				tc.User.Username, ctx.SrcIP, ctx.SrcPort, ctx.DstIP, ctx.DstPort, ctx.Protocol)
-		} else {
-			log.Printf("OpenConnect: [POLICY DENY] PRE_ROUTING hook denied packet: User=%s, Src=%s, Dst=%s, Protocol=%s",
-				tc.User.Username, ctx.SrcIP, ctx.DstIP, ctx.Protocol)
-		}
+		// 记录策略拒绝日志（所有协议）
+		logPolicyDenial("PRE_ROUTING", tc.User.Username, ctx, protocol)
 		return fmt.Errorf("packet denied by PRE_ROUTING policy")
 	}
 
@@ -1215,13 +1211,7 @@ func (tc *TunnelClient) checkPolicy(packet []byte) error {
 		// Client-to-client: check FORWARD hook
 		forwardAction := policyMgr.ExecutePolicies(policy.HookForward, ctx)
 		if forwardAction == policy.ActionDeny {
-			if protocol == 6 || protocol == 17 { // TCP or UDP - include port info
-				log.Printf("OpenConnect: [POLICY DENY] FORWARD hook denied packet: User=%s, Src=%s:%d, Dst=%s:%d, Protocol=%s",
-					tc.User.Username, ctx.SrcIP, ctx.SrcPort, ctx.DstIP, ctx.DstPort, ctx.Protocol)
-			} else {
-				log.Printf("OpenConnect: [POLICY DENY] FORWARD hook denied packet: User=%s, Src=%s, Dst=%s, Protocol=%s",
-					tc.User.Username, ctx.SrcIP, ctx.DstIP, ctx.Protocol)
-			}
+			logPolicyDenial("FORWARD", tc.User.Username, ctx, protocol)
 			return fmt.Errorf("packet denied by FORWARD policy")
 		}
 		if forwardAction != policy.ActionAllow {
@@ -1242,14 +1232,7 @@ func (tc *TunnelClient) checkPolicy(packet []byte) error {
 		// 		inputAction)
 		// }
 		if inputAction == policy.ActionDeny {
-			// Log policy denial for debugging (all protocols)
-			if protocol == 6 || protocol == 17 { // TCP or UDP - include port info
-				log.Printf("OpenConnect: [POLICY DENY] INPUT hook denied packet: User=%s, Src=%s:%d, Dst=%s:%d, Protocol=%s",
-					tc.User.Username, ctx.SrcIP, ctx.SrcPort, ctx.DstIP, ctx.DstPort, ctx.Protocol)
-			} else {
-				log.Printf("OpenConnect: [POLICY DENY] INPUT hook denied packet: User=%s, Src=%s, Dst=%s, Protocol=%s",
-					tc.User.Username, ctx.SrcIP, ctx.DstIP, ctx.Protocol)
-			}
+			logPolicyDenial("INPUT", tc.User.Username, ctx, protocol)
 			return fmt.Errorf("packet denied by INPUT policy")
 		}
 		if inputAction != policy.ActionAllow {

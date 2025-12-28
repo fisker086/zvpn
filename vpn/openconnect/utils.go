@@ -1,7 +1,9 @@
 package openconnect
 
 import (
+	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"net"
 	"strconv"
 	"strings"
@@ -65,9 +67,7 @@ func getDTLSConfig(cfg *config.Config, clientHost string) string {
 	dtlsPort := cfg.VPN.OpenConnectPort
 
 	// 如果 clientHost 包含端口，只保留主机部分
-	if colonPos := strings.Index(clientHost, ":"); colonPos != -1 {
-		clientHost = clientHost[:colonPos]
-	}
+	clientHost = extractHostname(clientHost)
 
 	// 构建完整的 DTLS 配置（增强版本）
 	dtlsConfig := "\n\t\t<cstp:dtls-enabled>true</cstp:dtls-enabled>"
@@ -139,13 +139,37 @@ func isPublicDNS(dnsIP string) bool {
 	return false
 }
 
+// getUserTunnelMode 获取用户的隧道模式（默认 split）
+func getUserTunnelMode(user *models.User) string {
+	tunnelMode := user.TunnelMode
+	if tunnelMode == "" {
+		tunnelMode = "split" // 默认分隧道模式
+	}
+	return tunnelMode
+}
+
+// extractHostname 从 Host header 中提取主机名（去掉端口）
+func extractHostname(host string) string {
+	if colonPos := strings.Index(host, ":"); colonPos != -1 {
+		return host[:colonPos]
+	}
+	return host
+}
+
 // shouldTunnelAllDNS 判断是否应该让所有DNS查询走VPN
+// tunnelMode: 用户的隧道模式（split 或 full）
+// hasDNSInterceptor: 是否启用了DNS拦截器
 // 如果启用了DNS拦截器，可以设置Tunnel-All-DNS为false
 // 因为DNS拦截器（VPN网关IP）在VPN网络中，已经在split-include路由中，会自动走VPN
 // 而公网DNS不在split-include路由中，不会走VPN，这样既能保证DNS拦截器工作，又能优化性能
-// 如果未启用DNS拦截器，所有DNS都不走VPN
-func shouldTunnelAllDNS(hasDNSInterceptor bool, dnsServers []string) bool {
-	// 如果启用了DNS拦截器，设置Tunnel-All-DNS为false
+// 全局模式下，所有DNS都应该走VPN，所以Tunnel-All-DNS应该为true
+func shouldTunnelAllDNS(tunnelMode string, hasDNSInterceptor bool) bool {
+	// 全局模式：所有流量都走 VPN，DNS 也应该走 VPN
+	if tunnelMode == "full" {
+		return true
+	}
+
+	// 分隧道模式：如果启用了DNS拦截器，设置Tunnel-All-DNS为false
 	// DNS拦截器（VPN网关IP）在VPN网络中，已经在split-include路由中
 	// 客户端访问DNS拦截器时会自动走VPN，DNS拦截器可以正常工作
 	// 公网DNS不在split-include路由中，不会走VPN，减少延迟
@@ -155,4 +179,54 @@ func shouldTunnelAllDNS(hasDNSInterceptor bool, dnsServers []string) bool {
 
 	// 如果未启用DNS拦截器，所有DNS都不走VPN
 	return false
+}
+
+// getServerVPNIP 从VPN网络CIDR计算服务器VPN IP（通常是.1）
+// 这是后端验证的关键：无论客户端如何配置，服务端都使用这个IP进行验证
+func getServerVPNIP(ipNet *net.IPNet) net.IP {
+	serverVPNIP := make(net.IP, len(ipNet.IP))
+	copy(serverVPNIP, ipNet.IP)
+	serverVPNIP[len(serverVPNIP)-1] = 1
+	return serverVPNIP
+}
+
+// parseVPNNetwork 解析VPN网络配置，返回IPNet和错误
+// 这是后端验证的关键：统一解析VPN网络，确保验证逻辑一致
+func parseVPNNetwork(vpnNetwork string) (*net.IPNet, error) {
+	_, ipNet, err := net.ParseCIDR(vpnNetwork)
+	return ipNet, err
+}
+
+// isVPNInternalTraffic 判断是否是VPN内部流量（客户端到客户端或客户端到服务器）
+// 这是后端验证的关键：VPN内部流量必须进行完整的策略检查
+func isVPNInternalTraffic(srcIP, dstIP net.IP, ipNet *net.IPNet) bool {
+	return ipNet.Contains(srcIP) && ipNet.Contains(dstIP)
+}
+
+// validateIPPacket 验证IP数据包的基本格式
+// 这是后端验证的关键：确保数据包格式正确，防止恶意数据包
+func validateIPPacket(packet []byte) error {
+	if len(packet) < 20 {
+		return fmt.Errorf("packet too small: %d bytes (minimum 20)", len(packet))
+	}
+
+	// 检查IP版本
+	ipVersion := packet[0] >> 4
+	if ipVersion != 4 {
+		return fmt.Errorf("unsupported IP version: %d (only IPv4 supported)", ipVersion)
+	}
+
+	// 检查IP头长度（IHL）
+	ihl := int(packet[0] & 0x0F)
+	if ihl < 5 {
+		return fmt.Errorf("invalid IP header length: %d (minimum 5)", ihl)
+	}
+
+	// 检查数据包总长度
+	expectedLen := int(binary.BigEndian.Uint16(packet[2:4]))
+	if expectedLen < 20 || expectedLen > len(packet) {
+		return fmt.Errorf("invalid packet length: expected %d, got %d", expectedLen, len(packet))
+	}
+
+	return nil
 }

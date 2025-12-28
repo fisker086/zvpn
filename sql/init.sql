@@ -53,6 +53,7 @@ CREATE TABLE IF NOT EXISTS users (
     client_ip VARCHAR(45),
     connected BOOLEAN DEFAULT FALSE,
     last_seen DATETIME(3) NULL,
+    tunnel_mode VARCHAR(20) DEFAULT 'split',
     otp_secret VARCHAR(255) DEFAULT '',
     otp_enabled BOOLEAN DEFAULT FALSE,
     created_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),

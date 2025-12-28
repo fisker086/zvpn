@@ -255,7 +255,8 @@ func (h *Handler) handleConnect(c *gin.Context) {
 		return
 	}
 
-	// 获取完整用户信息
+	// 获取完整用户信息（包含所有字段，特别是 TunnelMode）
+	// 注意：Preload 只预加载关联关系，所有用户表字段（包括 TunnelMode）都会自动加载
 	var user models.User
 	if err := database.DB.Preload("Groups.Policies.Routes").First(&user, userID).Error; err != nil {
 		log.Printf("OpenConnect: Failed to get user info: %v", err)
@@ -320,9 +321,17 @@ func (h *Handler) handleConnect(c *gin.Context) {
 		c.Request.Body.Close()
 	}
 
+	// 加载用户策略（从用户组获取）
 	if policy := user.GetPolicy(); policy != nil {
 		user.PolicyID = policy.ID
 		user.Policy = *policy
+		log.Printf("OpenConnect: User %s - Loaded policy (ID: %d, Routes: %d)",
+			user.Username, user.PolicyID, len(user.Policy.Routes))
+	} else {
+		log.Printf("OpenConnect: User %s - No policy found (user has no groups or groups have no routes)", user.Username)
+		// 确保 PolicyID 为 0，Policy 为空
+		user.PolicyID = 0
+		user.Policy = models.Policy{}
 	}
 
 	// 获取DNS服务器配置（从策略中获取，如果没有则使用默认DNS）
@@ -426,11 +435,10 @@ func (h *Handler) handleConnect(c *gin.Context) {
 			gateway = h.vpnServer.GetVPNGatewayIP()
 		}
 		if gateway == nil {
-			// Fallback to configured gateway IP
-			_, vpnNet, _ := net.ParseCIDR(h.config.VPN.Network)
-			gateway = make(net.IP, len(vpnNet.IP))
-			copy(gateway, vpnNet.IP)
-			gateway[len(gateway)-1] = 1
+			// Fallback to configured gateway IP（使用统一的辅助函数）
+			if ipNet, err := parseVPNNetwork(h.config.VPN.Network); err == nil {
+				gateway = getServerVPNIP(ipNet)
+			}
 		}
 
 		// 获取路由管理器
@@ -648,11 +656,16 @@ func (h *Handler) sendCSTPConfig(conn net.Conn, user *models.User, dnsServers []
 
 	netmask := net.IP(ipNet.Mask).String()
 
+	// 获取用户的隧道模式
+	tunnelMode := getUserTunnelMode(user)
+
 	// 判断是否应该让所有DNS查询走VPN（智能DNS路由）
 	hasDNSInterceptor := h.vpnServer != nil && h.vpnServer.GetDNSInterceptor() != nil
-	tunnelAllDNS := shouldTunnelAllDNS(hasDNSInterceptor, dnsServers)
+	tunnelAllDNS := shouldTunnelAllDNS(tunnelMode, hasDNSInterceptor)
 
-	if hasDNSInterceptor {
+	if tunnelMode == "full" {
+		log.Printf("OpenConnect: Full tunnel mode - All DNS queries will go through VPN (Tunnel-All-DNS=true)")
+	} else if hasDNSInterceptor {
 		log.Printf("OpenConnect: Smart DNS routing - DNS interceptor enabled, Tunnel-All-DNS=false, DNS interceptor (VPN gateway) will go through VPN via split-include route, public DNS will use direct connection")
 	} else {
 		log.Printf("OpenConnect: Smart DNS routing - DNS interceptor disabled, all DNS queries will use direct connection")
@@ -745,7 +758,13 @@ func (h *Handler) sendCSTPConfig(conn net.Conn, user *models.User, dnsServers []
 	} else {
 		response += "X-CSTP-Tunnel-All-DNS: false\r\n"
 	}
-	response += "X-CSTP-Tunnel-All-Networks: false\r\n" // 使用split-tunnel模式
+
+	// 根据用户的隧道模式设置（tunnelMode 已在上面声明）
+	if tunnelMode == "full" {
+		response += "X-CSTP-Tunnel-All-Networks: true\r\n" // 全局模式：所有流量走 VPN
+	} else {
+		response += "X-CSTP-Tunnel-All-Networks: false\r\n" // 分隧道模式：只路由特定网段
+	}
 
 	// 压缩编码配置（如果客户端支持且服务端启用）
 	if h.config.VPN.EnableCompression && cstpAcceptEncoding != "" {
@@ -854,12 +873,6 @@ func (h *Handler) sendCSTPConfig(conn net.Conn, user *models.User, dnsServers []
 			}
 		}
 
-		log.Printf("OpenConnect: CSTP config - DTLS enabled:")
-		log.Printf("OpenConnect:   - Session ID: %s", dtlsSessionID)
-		log.Printf("OpenConnect:   - Port: %s (UDP)", dtlsPort)
-		log.Printf("OpenConnect:   - DPD: %s seconds", dtlsDPD)
-		log.Printf("OpenConnect:   - Keepalive: %s seconds", dtlsKeepalive)
-		log.Printf("OpenConnect:   - Cipher Suites: %s", cipherSuiteHeader)
 	}
 
 	// 添加DNS服务器
@@ -870,36 +883,39 @@ func (h *Handler) sendCSTPConfig(conn net.Conn, user *models.User, dnsServers []
 	}
 
 	// 添加路由配置（split-include）
-	// 构建路由列表（根据用户策略）
-	var splitIncludeRoutes []string
+	// 注意：全局模式下不应该发送 split-include，所有流量都走 VPN
+	if tunnelMode != "full" {
+		// 分隧道模式：构建路由列表（根据用户策略）
+		var splitIncludeRoutes []string
 
-	// 始终包含VPN网络本身，确保客户端可以访问VPN服务器和其他VPN客户端
-	splitIncludeRoutes = append(splitIncludeRoutes, h.config.VPN.Network)
+		// 始终包含VPN网络本身，确保客户端可以访问VPN服务器和其他VPN客户端
+		splitIncludeRoutes = append(splitIncludeRoutes, h.config.VPN.Network)
 
-	// 添加策略路由
-	if user.PolicyID != 0 && len(user.Policy.Routes) > 0 {
-		for _, route := range user.Policy.Routes {
-			// 避免重复添加VPN网络
-			if route.Network != "" && route.Network != h.config.VPN.Network {
-				splitIncludeRoutes = append(splitIncludeRoutes, route.Network)
+		// 添加策略路由
+		if user.PolicyID != 0 && len(user.Policy.Routes) > 0 {
+			for _, route := range user.Policy.Routes {
+				// 避免重复添加VPN网络
+				if route.Network != "" && route.Network != h.config.VPN.Network {
+					splitIncludeRoutes = append(splitIncludeRoutes, route.Network)
+				}
 			}
 		}
-		log.Printf("OpenConnect: CSTP config - User %s split-include routes: %v", user.Username, splitIncludeRoutes)
-	} else {
-		log.Printf("OpenConnect: CSTP config - User %s has no policy routes, using VPN network only", user.Username)
-	}
 
-	// 添加所有路由到HTTP头（每个路由一行）
-	for _, route := range splitIncludeRoutes {
-		response += "X-CSTP-Split-Include: " + route + "\r\n"
+		// 添加所有路由到HTTP头（每个路由一行）
+		// 注意：只在分隧道模式下发送 split-include
+		// 即使只有VPN网络，也要发送，确保客户端可以访问VPN服务器
+		for _, route := range splitIncludeRoutes {
+			response += "X-CSTP-Split-Include: " + route + "\r\n"
+		}
+
+		if len(splitIncludeRoutes) == 0 {
+			log.Printf("OpenConnect: WARNING - No split-include routes to send for user %s", user.Username)
+		}
 	}
 
 	// 结束HTTP响应头（必须是两个CRLF）
 	response += "\r\n"
 
-	// 记录发送的 CSTP 配置（用于调试）
-	log.Printf("OpenConnect: Sending CSTP config for user %s (IP: %s, MTU: %d, DNS: %v, Routes: %d)",
-		user.Username, user.VPNIP, h.config.VPN.MTU, dnsServers, len(splitIncludeRoutes))
 	if vpn.ShouldLogPacket() {
 		// 只记录前 500 字节，避免日志过长
 		previewLen := len(response)

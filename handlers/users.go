@@ -34,12 +34,13 @@ type CreateUserRequest struct {
 }
 
 type UpdateUserRequest struct {
-	Email    string `json:"email"`
-	FullName string `json:"full_name"` // 中文名/全名（可选）
-	IsAdmin  bool   `json:"is_admin"` // 管理员状态
-	IsActive bool   `json:"is_active"`
-	GroupIDs []uint `json:"group_ids"` // 更新用户组
-	Password string `json:"password"`  // 密码（可选，留空则不修改）
+	Email      string `json:"email"`
+	FullName   string `json:"full_name"` // 中文名/全名（可选）
+	IsAdmin    bool   `json:"is_admin"`  // 管理员状态
+	IsActive   bool   `json:"is_active"`
+	GroupIDs   []uint `json:"group_ids"`   // 更新用户组
+	Password   string `json:"password"`    // 密码（可选，留空则不修改）
+	TunnelMode string `json:"tunnel_mode"` // 隧道模式: split(分隧道) 或 full(全局)
 }
 
 func (h *UserHandler) ListUsers(c *gin.Context) {
@@ -163,6 +164,18 @@ func (h *UserHandler) UpdateUser(c *gin.Context) {
 	user.IsAdmin = req.IsAdmin
 	user.IsActive = req.IsActive
 
+	// 更新隧道模式（如果提供了）
+	updateTunnelMode := false
+	if req.TunnelMode != "" {
+		if req.TunnelMode != "split" && req.TunnelMode != "full" {
+			log.Printf("UpdateUser: Invalid tunnel_mode value: '%s'", req.TunnelMode)
+			c.JSON(http.StatusBadRequest, gin.H{"error": "tunnel_mode must be 'split' or 'full'"})
+			return
+		}
+		user.TunnelMode = req.TunnelMode
+		updateTunnelMode = true
+	}
+
 	// 更新用户组（如果提供了，必须至少一个）
 	if req.GroupIDs != nil {
 		if len(req.GroupIDs) == 0 {
@@ -201,8 +214,11 @@ func (h *UserHandler) UpdateUser(c *gin.Context) {
 	}
 
 	// 使用 Select 明确指定要更新的字段
-	// 如果更新密码，则包含 password_hash；否则排除 password_hash，避免密码被覆盖
+	// 只更新实际需要更新的字段，避免意外覆盖其他字段
 	updateFields := []string{"email", "full_name", "is_admin", "is_active", "updated_at"}
+	if updateTunnelMode {
+		updateFields = append(updateFields, "tunnel_mode")
+	}
 	if updatePassword {
 		updateFields = append(updateFields, "password_hash")
 	}

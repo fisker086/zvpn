@@ -919,7 +919,13 @@ func (h *Handler) Authenticate(c *gin.Context) {
 
 		user.VPNIP = vpnIP.String()
 		// 注意：不在这里设置 Connected，等连接真正建立后再设置
-		database.DB.Save(&user)
+		// 重要：使用 Select 只更新 VPNIP 字段，避免覆盖其他字段（特别是 TunnelMode）
+		// 如果使用 Save(&user)，可能会用内存中的旧值覆盖数据库中的新值
+		if err := database.DB.Model(&user).Select("vpn_ip", "updated_at").Updates(map[string]interface{}{
+			"vpn_ip": user.VPNIP,
+		}).Error; err != nil {
+			log.Printf("OpenConnect: Warning - Failed to save VPN IP for user %s: %v", user.Username, err)
+		}
 
 		log.Printf("OpenConnect: Allocated IP %s to user %s (gateway: %s)",
 			user.VPNIP, user.Username, gatewayIP.String())
@@ -933,6 +939,16 @@ func (h *Handler) Authenticate(c *gin.Context) {
 	// 登录成功，清除该IP的失败记录
 	if h.bruteforceProtection != nil {
 		h.bruteforceProtection.RecordSuccess(clientIP)
+	}
+
+	// 重新加载用户以确保获取最新的 TunnelMode 值（防止缓存问题）
+	// 注意：在认证过程中，用户对象可能被多次修改，需要重新加载以确保获取数据库中的最新值
+	var freshUser models.User
+	if err := database.DB.Where("id = ?", user.ID).First(&freshUser).Error; err == nil {
+		// 使用最新加载的用户对象，但保留已加载的策略信息
+		user.TunnelMode = freshUser.TunnelMode
+	} else {
+		log.Printf("OpenConnect: Warning - Failed to reload user %s for TunnelMode: %v", user.Username, err)
 	}
 
 	// 计算并设置用户策略（从用户组获取）
@@ -950,68 +966,76 @@ func (h *Handler) Authenticate(c *gin.Context) {
 	copy(gatewayIP, ipNet.IP)
 	gatewayIP[len(gatewayIP)-1] = 1
 
-	// 构建路由信息（根据用户策略）
-	// 使用 Split-Tunnel 模式，避免接管所有流量导致路由环路
+	// 获取用户的隧道模式（默认 split）
+	tunnelMode := getUserTunnelMode(&user)
+
+	// 构建路由信息（根据用户策略和隧道模式）
 	var splitIncludeRoutes []string
+	var routeXML string
+	var defaultRoute string
 
-	// 注意：不包含VPN网络本身（10.8.0.0/24），只包含数据库中的策略路由
+	if tunnelMode == "full" {
+		// 全局模式：所有流量都走 VPN
+		defaultRoute = "true"
+		routeXML = "" // 全局模式不需要 split-include
+	} else {
+		// 分隧道模式：只路由特定网段
+		defaultRoute = "false"
 
-	log.Printf("OpenConnect: User %s policyID=%d, routes count=%d", user.Username, user.PolicyID, len(user.Policy.Routes))
-	// 打印所有路由详情
-	for i, route := range user.Policy.Routes {
-		log.Printf("OpenConnect: User %s route %d: %s", user.Username, i+1, route.Network)
-	}
-	if user.PolicyID != 0 && len(user.Policy.Routes) > 0 {
+		// 使用 map 去重路由
+		routeMap := make(map[string]bool)
+
 		// 首先添加VPN网络本身的路由，确保基本连通性（服务器、网关、DNS拦截器等）
 		// 这对于ping服务器、访问DNS拦截器等基础功能是必需的
 		splitIncludeRoutes = append(splitIncludeRoutes, h.config.VPN.Network)
-		log.Printf("OpenConnect: User %s - Auto-added VPN network route: %s (for basic connectivity)", user.Username, h.config.VPN.Network)
+		routeMap[h.config.VPN.Network] = true
 
-		// Split-tunnel mode: 添加策略路由（包含VPN网络本身）
-		for _, route := range user.Policy.Routes {
-			// 添加策略路由（包含VPN网络本身，用户可能有多个网段策略）
-			splitIncludeRoutes = append(splitIncludeRoutes, route.Network)
-			log.Printf("OpenConnect: User %s - Added policy route: %s", user.Username, route.Network)
+		// Split-tunnel mode: 添加策略路由（去重）
+		if user.PolicyID != 0 && len(user.Policy.Routes) > 0 {
+			for _, route := range user.Policy.Routes {
+				// 去重：避免重复添加相同的路由
+				if !routeMap[route.Network] {
+					splitIncludeRoutes = append(splitIncludeRoutes, route.Network)
+					routeMap[route.Network] = true
+				}
+			}
 		}
-		log.Printf("OpenConnect: User %s - Split tunnel mode with %d total routes (VPN network + %d policy routes): %v",
-			user.Username, len(splitIncludeRoutes), len(user.Policy.Routes), splitIncludeRoutes)
-	} else {
-		// 没有策略路由，但仍有VPN网络路由确保基本连通性
-		splitIncludeRoutes = append(splitIncludeRoutes, h.config.VPN.Network)
-		log.Printf("OpenConnect: User %s - No policy routes, using VPN network only: %s", user.Username, h.config.VPN.Network)
-	}
-	// 构建 split-include XML（每个路由一行，正确的缩进）
-	// 注意：不包含VPN网络本身（10.8.0.0/24），只包含数据库中的策略路由
-	// 格式要求：IP + 掩码分开写
-	routeXML := ""
-	for _, route := range splitIncludeRoutes {
-		// 解析 CIDR 格式（如 192.168.0.0/16）为 IP 和掩码
-		_, ipNet, err := net.ParseCIDR(route)
-		if err != nil {
-			log.Printf("OpenConnect: Failed to parse route %s: %v", route, err)
-			continue
+
+		// 构建 split-include XML（使用 strings.Builder 提高性能）
+		// 格式要求：IP + 掩码分开写
+		var routeXMLBuilder strings.Builder
+		for _, route := range splitIncludeRoutes {
+			// 解析 CIDR 格式（如 192.168.0.0/16）为 IP 和掩码
+			_, ipNet, err := net.ParseCIDR(route)
+			if err != nil {
+				log.Printf("OpenConnect: Failed to parse route %s: %v", route, err)
+				continue
+			}
+			network := ipNet.IP.String()
+			netmask := net.IP(ipNet.Mask).String()
+			routeXMLBuilder.WriteString("\n\t\t<cstp:split-include>")
+			routeXMLBuilder.WriteString("\n\t\t\t<cstp:network>")
+			routeXMLBuilder.WriteString(network)
+			routeXMLBuilder.WriteString("</cstp:network>")
+			routeXMLBuilder.WriteString("\n\t\t\t<cstp:netmask>")
+			routeXMLBuilder.WriteString(netmask)
+			routeXMLBuilder.WriteString("</cstp:netmask>")
+			routeXMLBuilder.WriteString("\n\t\t</cstp:split-include>")
 		}
-		network := ipNet.IP.String()
-		netmask := net.IP(ipNet.Mask).String()
-		routeXML += "\n\t\t<cstp:split-include>"
-		routeXML += "\n\t\t\t<cstp:network>" + network + "</cstp:network>"
-		routeXML += "\n\t\t\t<cstp:netmask>" + netmask + "</cstp:netmask>"
-		routeXML += "\n\t\t</cstp:split-include>"
+		routeXML = routeXMLBuilder.String()
 	}
 
 	// 获取服务器地址（用于添加主机路由保护）
-	serverHost := c.Request.Host
-	if colonPos := strings.Index(serverHost, ":"); colonPos != -1 {
-		serverHost = serverHost[:colonPos]
-	}
+	serverHost := extractHostname(c.Request.Host)
 
 	// 检查serverHost是否是IP地址
 	isIP := net.ParseIP(serverHost) != nil
 	noSplitDNSXML := ""
-	if !isIP {
-		// 只有当serverHost是域名时才配置no-split-dns
-		// no-split-dns用于指定哪些域名不使用VPN DNS解析
-		noSplitDNSXML = "\n\t\t<!-- no-split-dns: 指定哪些域名不使用VPN DNS解析 -->\n\t\t<cstp:no-split-dns>" + serverHost + "</cstp:no-split-dns>"
+	// no-split-dns 只在分隧道模式下设置，全局模式下所有流量都走 VPN，不需要 no-split-dns
+	if tunnelMode == "split" && !isIP {
+		// 只有当serverHost是域名且为分隧道模式时才配置no-split-dns
+		// no-split-dns用于指定哪些域名不使用VPN DNS解析（分隧道模式下）
+		noSplitDNSXML = "\n\t\t<!-- no-split-dns: 指定哪些域名不使用VPN DNS解析（分隧道模式） -->\n\t\t<cstp:no-split-dns>" + serverHost + "</cstp:no-split-dns>"
 	}
 
 	// 获取DNS服务器配置（从策略中获取，如果没有则使用默认DNS）
@@ -1138,12 +1162,12 @@ func (h *Handler) Authenticate(c *gin.Context) {
 		<cstp:dns>` + dnsXML + `
 		</cstp:dns>
 
-		<!-- Split-Tunnel 配置：只路由特定网段，不接管默认路由 -->
-		<!-- 明确禁用默认路由，只走 split-tunnel -->
-		<cstp:default-route>false</cstp:default-route>
+		<!-- 隧道模式配置 -->
+		<!-- full: 全局模式，所有流量走 VPN；split: 分隧道模式，只路由特定网段 -->
+		<cstp:default-route>` + defaultRoute + `</cstp:default-route>
 		
-		<!-- 包含的路由（只有这些网段走 VPN） -->
-		<!-- 注意：只使用split-include来明确指定需要路由的网段 -->` + routeXML + noSplitDNSXML + `
+		<!-- 包含的路由（分隧道模式下，只有这些网段走 VPN） -->
+		<!-- 注意：全局模式下不需要 split-include -->` + routeXML + noSplitDNSXML + `
 
 		<!-- 超时配置 -->
 		<cstp:idle-timeout>7200</cstp:idle-timeout>

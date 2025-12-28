@@ -35,10 +35,11 @@ type User struct {
 	LDAPAttributes string `gorm:"type:text" json:"-"`        // LDAP原始属性JSON（不返回给API，用于扩展）
 
 	// VPN related
-	VPNIP     string     `gorm:"size:50" json:"-"`    // Assigned VPN IP (不返回给前端API，在线用户接口单独返回)
-	ClientIP  string     `gorm:"size:50" json:"-"`    // Client's real IP (不返回给前端API)
-	Connected bool       `gorm:"default:false" json:"connected"`
-	LastSeen  *time.Time `json:"last_seen"`
+	VPNIP      string     `gorm:"size:50" json:"-"`              // Assigned VPN IP (不返回给前端API，在线用户接口单独返回)
+	ClientIP   string     `gorm:"size:50" json:"-"`              // Client's real IP (不返回给前端API)
+	Connected  bool       `gorm:"default:false" json:"connected"`
+	LastSeen   *time.Time `json:"last_seen"`
+	TunnelMode string     `gorm:"default:'split';size:20" json:"tunnel_mode"` // 隧道模式: split(分隧道) 或 full(全局)
 
 	// OTP related
 	OTPSecret  string `gorm:"size:255" json:"-"`                // OTP密钥（不返回给API）

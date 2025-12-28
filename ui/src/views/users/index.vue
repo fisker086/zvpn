@@ -218,6 +218,19 @@
         <a-form-item label="激活状态" v-if="isEdit">
           <a-switch v-model="formData.is_active" />
         </a-form-item>
+
+        <a-form-item label="隧道模式">
+          <a-select v-model="formData.tunnel_mode" placeholder="选择隧道模式">
+            <a-option value="split">分隧道模式（默认）</a-option>
+            <a-option value="full">全局模式</a-option>
+          </a-select>
+          <template #extra>
+            <a-typography-text type="secondary" style="font-size: 12px">
+              <div>分隧道模式：只路由策略中配置的网段，其他流量走本地网络</div>
+              <div style="margin-top: 4px">全局模式：所有流量都通过 VPN，适合需要完全代理的场景</div>
+            </a-typography-text>
+          </template>
+        </a-form-item>
       </a-form>
     </a-modal>
 
@@ -344,6 +357,7 @@ const formData = reactive<CreateUserRequest & UpdateUserRequest & { group_ids?: 
   is_admin: false,
   is_active: true,
   group_ids: [],
+  tunnel_mode: 'split', // 默认分隧道模式
 })
 
 const columns = [
@@ -441,6 +455,11 @@ const handleEdit = async (record: User) => {
   formData.full_name = record.full_name || ''
   formData.is_admin = record.is_admin
   formData.is_active = record.is_active
+  // 修复：确保正确加载 tunnel_mode，如果数据库中是 'full'，应该保持 'full'
+  // 只有当 record.tunnel_mode 是 undefined、null 或空字符串时，才使用默认值 'split'
+  formData.tunnel_mode = (record.tunnel_mode === 'full' || record.tunnel_mode === 'split') 
+    ? record.tunnel_mode 
+    : 'split'
   formData.password = '' // 编辑时清空密码字段，如果用户需要修改密码，需要填写新密码
   formData.group_ids = record.groups?.map(g => g.id) || []
   if (formData.group_ids.length === 0) {
@@ -508,6 +527,13 @@ const handleSubmit = async () => {
         is_admin: formData.is_admin,
         is_active: formData.is_active,
         group_ids: formData.group_ids,
+        // 确保 tunnel_mode 总是被发送
+        // 注意：如果 formData.tunnel_mode 是 'full'，应该发送 'full'，不应该被替换成 'split'
+        // 只有当 formData.tunnel_mode 是 undefined、null 或空字符串时，才使用默认值 'split'
+        // 使用明确的检查，避免 'full' 被错误替换
+        tunnel_mode: formData.tunnel_mode === 'full' || formData.tunnel_mode === 'split' 
+          ? formData.tunnel_mode 
+          : 'split',
       }
       
       // 如果填写了密码，且不是LDAP用户，则添加到更新数据中
@@ -526,6 +552,7 @@ const handleSubmit = async () => {
         full_name: formData.full_name || undefined,
         is_admin: formData.is_admin,
         group_ids: formData.group_ids,
+        tunnel_mode: (formData.tunnel_mode && formData.tunnel_mode.trim()) ? formData.tunnel_mode : 'split',
       })
       
       Message.success('创建成功')
@@ -553,6 +580,7 @@ const resetForm = () => {
     is_admin: false,
     is_active: true,
     group_ids: [],
+    tunnel_mode: 'split',
   })
 }
 

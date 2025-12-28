@@ -172,6 +172,25 @@ func Init(cfg *config.Config) error {
 		log.Printf("Migrated %d existing users to source='system'", result.RowsAffected)
 	}
 
+	// 数据迁移：确保已存在的用户都有 tunnel_mode 字段
+	// 对于已部署的系统，AutoMigrate 会添加新字段，但已存在用户的 tunnel_mode 可能为空
+	// 这里将所有 tunnel_mode 为空或 NULL 的用户设置为 'split'（分隧道模式）
+	// 注意：只更新空值，不会覆盖已有用户的设置（不会影响 'split' 或 'full' 的值）
+	result = DB.Model(&models.User{}).
+		Where("tunnel_mode IS NULL OR tunnel_mode = ''").
+		Update("tunnel_mode", "split")
+	if result.Error != nil {
+		log.Printf("Warning: Failed to migrate user tunnel_mode field: %v", result.Error)
+	} else if result.RowsAffected > 0 {
+		log.Printf("Migrated %d existing users to tunnel_mode='split' (only NULL or empty values)", result.RowsAffected)
+	} else {
+		// 记录迁移结果，确认没有意外更新已有值
+		var totalUsers, usersWithTunnelMode int64
+		DB.Model(&models.User{}).Count(&totalUsers)
+		DB.Model(&models.User{}).Where("tunnel_mode IN (?)", []string{"split", "full"}).Count(&usersWithTunnelMode)
+		log.Printf("Tunnel mode migration: %d total users, %d users with tunnel_mode set (split/full)", totalUsers, usersWithTunnelMode)
+	}
+
 	// Create default policy if not exists (must be created before admin user due to foreign key)
 	var defaultPolicy models.Policy
 	var policyCount int64
