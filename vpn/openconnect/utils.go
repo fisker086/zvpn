@@ -89,9 +89,10 @@ func getDTLSConfig(cfg *config.Config, clientHost string) string {
 	dtlsConfig += "\n\t\t<cstp:dtls-keepalive>" + strconv.Itoa(cstpKeepalive) + "</cstp:dtls-keepalive>"
 	dtlsConfig += "\n\t\t<cstp:dtls-dpd>" + strconv.Itoa(cstpDPD) + "</cstp:dtls-dpd>"
 
-	// 新增：添加重传和握手超时配置
-	dtlsConfig += "\n\t\t<cstp:dtls-retrans-timeout>60</cstp:dtls-retrans-timeout>"
-	dtlsConfig += "\n\t\t<cstp:dtls-handshake-timeout>30</cstp:dtls-handshake-timeout>"
+	// 优化：添加重传和握手超时配置（减少超时时间以加快连接速度）
+	// 减少重传超时和握手超时可以加快DTLS连接建立速度
+	dtlsConfig += "\n\t\t<cstp:dtls-retrans-timeout>30</cstp:dtls-retrans-timeout>"
+	dtlsConfig += "\n\t\t<cstp:dtls-handshake-timeout>15</cstp:dtls-handshake-timeout>"
 
 	// 新增：添加压缩配置（与CSTP一致）
 	dtlsConfig += "\n\t\t<cstp:dtls-compression>" + getCompressionType(cfg) + "</cstp:dtls-compression>"
@@ -158,26 +159,65 @@ func extractHostname(host string) string {
 
 // shouldTunnelAllDNS 判断是否应该让所有DNS查询走VPN
 // tunnelMode: 用户的隧道模式（split 或 full）
-// hasDNSInterceptor: 是否启用了DNS拦截器
-// 如果启用了DNS拦截器，可以设置Tunnel-All-DNS为false
-// 因为DNS拦截器（VPN网关IP）在VPN网络中，已经在split-include路由中，会自动走VPN
-// 而公网DNS不在split-include路由中，不会走VPN，这样既能保证DNS拦截器工作，又能优化性能
 // 全局模式下，所有DNS都应该走VPN，所以Tunnel-All-DNS应该为true
-func shouldTunnelAllDNS(tunnelMode string, hasDNSInterceptor bool) bool {
+func shouldTunnelAllDNS(tunnelMode string) bool {
 	// 全局模式：所有流量都走 VPN，DNS 也应该走 VPN
 	if tunnelMode == "full" {
 		return true
 	}
 
-	// 分隧道模式：如果启用了DNS拦截器，设置Tunnel-All-DNS为false
-	// DNS拦截器（VPN网关IP）在VPN网络中，已经在split-include路由中
-	// 客户端访问DNS拦截器时会自动走VPN，DNS拦截器可以正常工作
-	// 公网DNS不在split-include路由中，不会走VPN，减少延迟
-	if hasDNSInterceptor {
+	// 分隧道模式：DNS不走VPN，使用直接连接
+	return false
+}
+
+// getLocalNetworkRoutes 获取常见的本地网络路由（私有IP地址段）
+// 这些路由应该在全局模式下被排除，确保本地网络流量不走VPN
+// 参考 RFC 1918 私有IP地址范围
+func getLocalNetworkRoutes() []string {
+	return []string{
+		"10.0.0.0/8",     // 10.0.0.0 - 10.255.255.255
+		"172.16.0.0/12",  // 172.16.0.0 - 172.31.255.255
+		"192.168.0.0/16", // 192.168.0.0 - 192.168.255.255
+		"169.254.0.0/16", // 169.254.0.0 - 169.254.255.255 (Link-local)
+		"127.0.0.0/8",    // 127.0.0.0 - 127.255.255.255 (Loopback)
+		"224.0.0.0/4",    // 224.0.0.0 - 239.255.255.255 (Multicast)
+		"240.0.0.0/4",    // 240.0.0.0 - 255.255.255.255 (Reserved)
+	}
+}
+
+// isPrivateNetwork 检查给定的CIDR是否是私有网络
+func isPrivateNetwork(cidr string) bool {
+	ip, ipNet, err := net.ParseCIDR(cidr)
+	if err != nil {
 		return false
 	}
 
-	// 如果未启用DNS拦截器，所有DNS都不走VPN
+	// 检查IP是否是私有IP地址（使用标准库方法）
+	if ip.To4() != nil {
+		// IPv4: 检查是否是私有IP
+		if ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+			return true
+		}
+		// 检查是否是组播或保留地址
+		if ip[0] >= 224 {
+			return true
+		}
+	}
+
+	// 额外检查：与已知的私有网络段进行比较
+	localRoutes := getLocalNetworkRoutes()
+	for _, localRoute := range localRoutes {
+		_, localNet, err := net.ParseCIDR(localRoute)
+		if err != nil {
+			continue
+		}
+		// 检查两个网络是否有重叠
+		// 如果 ipNet 包含 localNet 的起始IP，或者 localNet 包含 ipNet 的起始IP，则认为重叠
+		if ipNet.Contains(localNet.IP) || localNet.Contains(ipNet.IP) {
+			return true
+		}
+	}
+
 	return false
 }
 
@@ -203,6 +243,21 @@ func isVPNInternalTraffic(srcIP, dstIP net.IP, ipNet *net.IPNet) bool {
 	return ipNet.Contains(srcIP) && ipNet.Contains(dstIP)
 }
 
+// ErrUnsupportedIPVersion 表示不支持的IP版本（用于IPv6等）
+type ErrUnsupportedIPVersion struct {
+	Version int
+}
+
+func (e *ErrUnsupportedIPVersion) Error() string {
+	return fmt.Sprintf("unsupported IP version: %d (only IPv4 supported)", e.Version)
+}
+
+// IsUnsupportedIPVersion 检查错误是否是IPv6等不支持的IP版本
+func IsUnsupportedIPVersion(err error) bool {
+	_, ok := err.(*ErrUnsupportedIPVersion)
+	return ok
+}
+
 // validateIPPacket 验证IP数据包的基本格式
 // 这是后端验证的关键：确保数据包格式正确，防止恶意数据包
 func validateIPPacket(packet []byte) error {
@@ -213,7 +268,7 @@ func validateIPPacket(packet []byte) error {
 	// 检查IP版本
 	ipVersion := packet[0] >> 4
 	if ipVersion != 4 {
-		return fmt.Errorf("unsupported IP version: %d (only IPv4 supported)", ipVersion)
+		return &ErrUnsupportedIPVersion{Version: int(ipVersion)}
 	}
 
 	// 检查IP头长度（IHL）

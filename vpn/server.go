@@ -37,9 +37,6 @@ type VPNServer struct {
 	vpnIPLock       sync.RWMutex        // Used when sharded locks disabled
 	shardedVPNIP    *ShardedVPNIPMap    // Used when sharded locks enabled
 
-	// DNS interceptor for domain-based split tunneling
-	dnsInterceptor *DNSInterceptor
-
 	// Compression manager
 	CompressionMgr *CompressionManager
 
@@ -58,7 +55,7 @@ type VPNClient struct {
 	UserID     uint
 	User       *models.User
 	Conn       net.Conn
-	DTLSConn   net.Conn      // DTLS connection (if DTLS is enabled and established)
+	DTLSConn   net.Conn // DTLS connection (if DTLS is enabled and established)
 	IP         net.IP
 	UserAgent  string
 	ClientOS   string
@@ -307,15 +304,6 @@ func NewVPNServer(cfg *config.Config) (*VPNServer, error) {
 		log.Printf("Using standard locks (sharded locks disabled)")
 	}
 
-	// Initialize DNS interceptor for domain-based split tunneling (always enabled)
-	server.dnsInterceptor = NewDNSInterceptor(server)
-	if err := server.dnsInterceptor.Start(); err != nil {
-		log.Printf("Warning: Failed to start DNS interceptor: %v", err)
-		log.Printf("Note: DNS interceptor requires root privileges to bind to port 53")
-	} else {
-		log.Printf("DNS interceptor enabled for domain-based split tunneling")
-	}
-
 	// Initialize compression manager
 	compressionType := CompressionType(cfg.VPN.CompressionType)
 	if compressionType == "" {
@@ -452,11 +440,6 @@ func NewVPNServer(cfg *config.Config) (*VPNServer, error) {
 	}
 
 	return server, nil
-}
-
-// GetDNSInterceptor returns the DNS interceptor
-func (s *VPNServer) GetDNSInterceptor() *DNSInterceptor {
-	return s.dnsInterceptor
 }
 
 // GetBruteforceProtection returns the bruteforce protection instance

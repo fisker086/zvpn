@@ -221,14 +221,41 @@
 
         <a-form-item label="隧道模式">
           <a-select v-model="formData.tunnel_mode" placeholder="选择隧道模式">
-            <a-option value="split">分隧道模式（默认）</a-option>
+            <a-option value="split">分离隧道（默认）</a-option>
             <a-option value="full">全局模式</a-option>
           </a-select>
           <template #extra>
-            <a-typography-text type="secondary" style="font-size: 12px">
-              <div>分隧道模式：只路由策略中配置的网段，其他流量走本地网络</div>
-              <div style="margin-top: 4px">全局模式：所有流量都通过 VPN，适合需要完全代理的场景</div>
-            </a-typography-text>
+            <div class="tunnel-mode-help">
+              <div class="mode-card mode-card-recommended">
+                <div class="mode-header">
+                  <icon-check-circle-fill class="mode-icon mode-icon-success" />
+                  <span class="mode-title">分离隧道（推荐）</span>
+                </div>
+                <div class="mode-content">
+                  <div class="mode-desc">
+                    <strong>只有策略中配置的特定网段走 VPN</strong>，其他所有流量（包括未配置的公网和本地网络）都走本地网络。
+                  </div>
+                  <div class="mode-tip mode-tip-success" style="margin-top: 8px;">
+                    ✓ 例如：策略配置了公司服务器网段 203.0.113.0/24，只有访问该网段的流量走 VPN，访问 baidu.com、本地网络等都走本地
+                  </div>
+                </div>
+              </div>
+              
+              <div class="mode-card">
+                <div class="mode-header">
+                  <icon-computer class="mode-icon mode-icon-primary" />
+                  <span class="mode-title">全局模式</span>
+                </div>
+                <div class="mode-content">
+                  <div class="mode-desc">
+                    <strong>所有公网流量走 VPN</strong>，只有本地网络（私有IP）被排除，走本地网络。
+                  </div>
+                  <div class="mode-tip mode-tip-success" style="margin-top: 8px;">
+                    ✓ 例如：访问 baidu.com、google.com 等公网走 VPN，访问 192.168.x.x、10.x.x.x 等本地网络走本地
+                  </div>
+                </div>
+              </div>
+            </div>
           </template>
         </a-form-item>
       </a-form>
@@ -313,7 +340,10 @@ import {
   IconUser, 
   IconInfoCircle, 
   IconCopy,
-  IconCheckCircle
+  IconCheckCircle,
+  IconCheckCircleFill,
+  IconComputer,
+  IconExclamationCircleFill
 } from '@arco-design/web-vue/es/icon'
 import request from '@/api/request'
 import { useClipboard } from '@/composables/useClipboard'
@@ -357,7 +387,7 @@ const formData = reactive<CreateUserRequest & UpdateUserRequest & { group_ids?: 
   is_admin: false,
   is_active: true,
   group_ids: [],
-  tunnel_mode: 'split', // 默认分隧道模式
+  tunnel_mode: 'split', // 默认分离隧道模式
 })
 
 const columns = [
@@ -758,5 +788,96 @@ onMounted(() => {
 :deep(.arco-card-header-wrapper) {
   min-height: auto !important;
   height: auto !important;
+}
+
+/* 隧道模式帮助样式 */
+.tunnel-mode-help {
+  margin-top: 12px;
+}
+
+.mode-card {
+  background: var(--color-bg-2);
+  border: 1px solid var(--color-border-2);
+  border-radius: 6px;
+  padding: 12px;
+  margin-bottom: 12px;
+  transition: all 0.2s;
+}
+
+.mode-card:hover {
+  border-color: var(--color-border-3);
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.04);
+}
+
+.mode-card-recommended {
+  background: linear-gradient(135deg, rgba(0, 180, 42, 0.05) 0%, rgba(0, 180, 42, 0.02) 100%);
+  border-color: rgba(0, 180, 42, 0.2);
+}
+
+.mode-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.mode-icon {
+  font-size: 16px;
+  flex-shrink: 0;
+}
+
+.mode-icon-success {
+  color: rgb(var(--green-6));
+}
+
+.mode-icon-primary {
+  color: rgb(var(--arcoblue-6));
+}
+
+.mode-title {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--color-text-1);
+}
+
+.mode-content {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--color-text-2);
+}
+
+.mode-desc {
+  margin-bottom: 10px;
+}
+
+.mode-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 8px 10px;
+  background: rgba(var(--orange-1), 0.5);
+  border-left: 3px solid rgb(var(--orange-6));
+  border-radius: 4px;
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: rgb(var(--orange-7));
+}
+
+.warning-icon {
+  font-size: 14px;
+  color: rgb(var(--orange-6));
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.mode-tip {
+  margin-top: 8px;
+  padding: 6px 10px;
+  background: rgba(var(--arcoblue-1), 0.5);
+  border-radius: 4px;
+  font-size: 11px;
+  color: rgb(var(--arcoblue-7));
+  line-height: 1.5;
 }
 </style>

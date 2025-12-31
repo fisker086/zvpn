@@ -62,12 +62,6 @@ const routes: RouteRecordRaw[] = [
         component: () => import('@/views/audit-logs/index.vue'),
         meta: { title: '审计日志', icon: 'icon-file-text' }, // 普通用户也可以查看
       },
-      {
-        path: 'domains',
-        name: 'Domains',
-        component: () => import('@/views/domains/index.vue'),
-        meta: { title: '域名管理', icon: 'icon-link' }, // 普通用户也可以查看
-      },
     ],
   },
 ]

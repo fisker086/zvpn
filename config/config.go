@@ -73,13 +73,15 @@ type VPNConfig struct {
 	EnableCompression bool   `mapstructure:"enablecompression"` // Enable traffic compression (default: false)
 	CompressionType   string `mapstructure:"compressiontype"`   // Compression type: none, lz4, gzip (default: none)
 
-	// DNS and domain-based split tunneling (DNS interceptor is always enabled)
-	DNSPort     string `mapstructure:"dnsport"`     // DNS server port (default: 53)
+	// Upstream DNS configuration (for fallback DNS in full tunnel mode)
 	UpstreamDNS string `mapstructure:"upstreamdns"` // Upstream DNS servers (comma-separated, default: 8.8.8.8:53,8.8.4.4:53)
 
 	// CSTP/DTLS keepalive configuration
 	CSTPDPD       int `mapstructure:"cstpdpd"`       // CSTP dead peer detection interval in seconds (default: 30)
 	CSTPKeepalive int `mapstructure:"cstpkeepalive"` // CSTP keepalive interval in seconds (default: 20)
+
+	// VPN profile configuration
+	VPNProfileName string `mapstructure:"vpnprofilename"` // VPN profile name shown in client (default: "ZVPN")
 
 	// Cisco client compatibility (ocserv protocol parameters)
 	CiscoClientCompat bool `mapstructure:"ciscoclientcompat"` // Enable Cisco client compatibility mode (default: true for AnyConnect support)
@@ -101,6 +103,12 @@ type VPNConfig struct {
 
 	// Session/concurrency settings
 	AllowMultiClientLogin bool `mapstructure:"allowmulticlientlogin"` // Allow same account multiple concurrent logins
+
+	// Local network access control (similar to AnyLink's allow_lan)
+	// When allow_lan=true, excludes local network traffic in full tunnel mode (priority over global route settings)
+	// Requires client to enable "Allow Local Lan" option to take effect
+	// Behavior: Local network traffic bypasses VPN, all other traffic goes through VPN tunnel
+	AllowLan bool `mapstructure:"allow_lan"`
 }
 
 type JWTConfig struct {
@@ -236,8 +244,7 @@ func setDefaults() {
 	viper.SetDefault("vpn.enablecompression", false) // Disabled by default
 	viper.SetDefault("vpn.compressiontype", "none")  // none, lz4, gzip
 
-	// DNS interceptor defaults (DNS interceptor is always enabled)
-	viper.SetDefault("vpn.dnsport", "53")                        // DNS server port
+	// Upstream DNS defaults (for fallback DNS in full tunnel mode)
 	viper.SetDefault("vpn.upstreamdns", "8.8.8.8:53,8.8.4.4:53") // Upstream DNS servers
 	viper.SetDefault("vpn.changecheckinterval", 5)               // Check for changes every 5 seconds
 	viper.SetDefault("vpn.cstpbatchmaxpackets", 10)              // Max 10 packets per batch
@@ -258,6 +265,9 @@ func setDefaults() {
 	viper.SetDefault("vpn.maxloginattempts", 5)              // 5 failed attempts before blocking
 	viper.SetDefault("vpn.loginlockoutduration", 900)        // Block for 15 minutes
 	viper.SetDefault("vpn.loginattemptwindow", 300)          // Count attempts within 5 minutes
+
+	// Local network access control defaults (similar to AnyLink's allow_lan)
+	viper.SetDefault("vpn.allow_lan", true) // Enable by default to exclude local network traffic in full tunnel mode
 
 	// JWT 默认配置
 	viper.SetDefault("jwt.secret", "your-secret-key-change-this")

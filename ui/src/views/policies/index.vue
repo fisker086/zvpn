@@ -121,6 +121,9 @@
               <a-button size="small" type="text" @click="handleEditRoutes(record)">
                 路由
               </a-button>
+              <a-button size="small" type="text" @click="handleEditExcludeRoutes(record)">
+                排除路由
+              </a-button>
               <a-button size="small" type="text" @click="handleAssignGroups(record)">
                 用户组
               </a-button>
@@ -334,6 +337,103 @@
       </a-form>
     </a-modal>
 
+    <!-- 排除路由管理对话框 -->
+    <a-modal
+      v-model:visible="excludeRoutesModalVisible"
+      title="排除路由管理"
+      width="700px"
+      :footer="false"
+    >
+      <a-space direction="vertical" :size="16" fill>
+        <a-alert
+          type="info"
+          show-icon
+          style="margin-bottom: 8px"
+        >
+          <div>
+            <div style="margin-bottom: 4px">
+              <strong>排除路由用于全局模式</strong>：配置的网段将不走 VPN 隧道，直接走本地网络。
+            </div>
+            <div style="font-size: 12px; color: var(--color-text-3)">
+              <div style="margin-bottom: 4px">
+                注意：如果系统配置了 <code>allow_lan=true</code>，会添加 <code>0.0.0.0/255.255.255.255</code> 排除规则（需要客户端开启"Allow Local Lan"选项）。
+              </div>
+              <div>
+                排除路由用于排除其他特定的网段（如私有IP段、公司内网的其他网段、特定的公网IP段等），根据实际需求配置。
+              </div>
+            </div>
+          </div>
+        </a-alert>
+        <a-button v-if="canEdit" type="primary" size="small" @click="showAddExcludeRouteModal">
+          <template #icon>
+            <icon-plus />
+          </template>
+          添加排除路由
+        </a-button>
+
+        <a-table
+          :columns="excludeRouteColumns"
+          :data="currentExcludeRoutes"
+          :pagination="false"
+          row-key="id"
+        >
+          <template #network="{ record }">
+            <a-tag color="orange">{{ record.network }}</a-tag>
+          </template>
+
+          <template #actions="{ record }">
+            <div v-if="canEdit" style="display: flex; gap: 8px;">
+              <a-button
+                size="small"
+                type="text"
+                @click="handleEditExcludeRoute(record)"
+              >
+                编辑
+              </a-button>
+              <a-button
+                size="small"
+                type="text"
+                status="danger"
+                @click="handleDeleteExcludeRoute(record)"
+              >
+                删除
+              </a-button>
+            </div>
+            <span v-else class="text-secondary">只读</span>
+          </template>
+        </a-table>
+      </a-space>
+    </a-modal>
+
+    <!-- 添加/编辑排除路由对话框 -->
+    <a-modal
+      v-model:visible="addExcludeRouteModalVisible"
+      :title="isEditExcludeRoute ? '编辑排除路由' : '添加排除路由'"
+      @ok="handleExcludeRouteSubmit"
+      @cancel="addExcludeRouteModalVisible = false"
+      :ok-loading="submitLoading"
+      width="500px"
+    >
+      <a-form :model="excludeRouteFormData" layout="vertical">
+        <a-form-item label="网络 CIDR" required>
+          <a-input
+            v-model="excludeRouteFormData.network"
+            placeholder="例如: 203.0.113.0/24"
+          />
+          <template #extra>
+            <a-typography-text type="secondary" style="font-size: 12px">
+              <div style="margin-bottom: 4px">
+                配置的网段在全局模式下将不走 VPN，直接走本地网络。
+              </div>
+              <div>
+                提示：如果系统配置了 <code>allow_lan=true</code>，会添加 <code>0.0.0.0/255.255.255.255</code> 规则（需要客户端开启"Allow Local Lan"选项）。这里可以配置其他需要排除的网段（如私有IP段、公司内网等）。
+              </div>
+            </a-typography-text>
+          </template>
+        </a-form-item>
+      </a-form>
+    </a-modal>
+
     <!-- 分配用户组对话框 -->
     <a-modal
       v-model:visible="assignGroupsModalVisible"
@@ -393,6 +493,8 @@ import {
   type UpdatePolicyRequest,
   type Route,
   type AddRouteRequest,
+  type ExcludeRoute,
+  type AddExcludeRouteRequest,
 } from '@/api/policies'
 import { groupsApi, type UserGroup } from '@/api/groups'
 import { Message, Modal } from '@arco-design/web-vue'
@@ -406,13 +508,18 @@ const policies = ref<Policy[]>([])
 const groups = ref<UserGroup[]>([])
 const modalVisible = ref(false)
 const routesModalVisible = ref(false)
+const excludeRoutesModalVisible = ref(false)
 const addRouteModalVisible = ref(false)
+const addExcludeRouteModalVisible = ref(false)
 const assignGroupsModalVisible = ref(false)
 const isEdit = ref(false)
 const isEditRoute = ref(false)
+const isEditExcludeRoute = ref(false)
 const currentPolicy = ref<Policy | null>(null)
 const currentRoutes = ref<Route[]>([])
+const currentExcludeRoutes = ref<ExcludeRoute[]>([])
 const currentRouteId = ref<number | null>(null)
+const currentExcludeRouteId = ref<number | null>(null)
 const selectedGroupIds = ref<number[]>([])
 
 const pagination = reactive({
@@ -433,6 +540,10 @@ const routeFormData = reactive<AddRouteRequest>({
   network: '',
   gateway: '',
   metric: 100,
+})
+
+const excludeRouteFormData = reactive<AddExcludeRouteRequest>({
+  network: '',
 })
 
 const columns = [
@@ -509,6 +620,20 @@ const routeColumns = [
   },
 ]
 
+const excludeRouteColumns = [
+  {
+    title: '网络',
+    slotName: 'network',
+    align: 'center',
+  },
+  {
+    title: '操作',
+    slotName: 'actions',
+    width: 80,
+    align: 'center',
+  },
+]
+
 const fetchPolicies = async () => {
   loading.value = true
   try {
@@ -556,6 +681,18 @@ const handleEditRoutes = (record: Policy) => {
   currentPolicy.value = record
   currentRoutes.value = record.routes || []
   routesModalVisible.value = true
+}
+
+const handleEditExcludeRoutes = async (record: Policy) => {
+  currentPolicy.value = record
+  try {
+    // 重新获取策略详情，确保包含最新的排除路由数据
+    const policy = await policiesApi.get(record.id)
+    currentExcludeRoutes.value = policy.exclude_routes || []
+    excludeRoutesModalVisible.value = true
+  } catch (error: any) {
+    Message.error(error.response?.data?.error || '获取策略详情失败')
+  }
 }
 
 const handleDelete = (record: Policy) => {
@@ -647,6 +784,11 @@ const removeDNSServer = (index: number) => {
 const showAddRouteModal = () => {
   resetRouteForm()
   addRouteModalVisible.value = true
+}
+
+const showAddExcludeRouteModal = () => {
+  resetExcludeRouteForm()
+  addExcludeRouteModalVisible.value = true
 }
 
 const handleRouteSubmit = async () => {
@@ -756,6 +898,77 @@ const handleAssignGroupsSubmit = async () => {
   } finally {
     submitLoading.value = false
   }
+}
+
+const handleExcludeRouteSubmit = async () => {
+  if (!excludeRouteFormData.network) {
+    Message.warning('请填写网络 CIDR')
+    return
+  }
+
+  if (!currentPolicy.value) {
+    return
+  }
+
+  submitLoading.value = true
+  try {
+    if (isEditExcludeRoute.value && currentExcludeRouteId.value) {
+      // 修改排除路由
+      await policiesApi.updateExcludeRoute(currentPolicy.value.id, currentExcludeRouteId.value, {
+        network: excludeRouteFormData.network,
+      })
+      Message.success('更新成功')
+    } else {
+      // 添加排除路由
+      await policiesApi.addExcludeRoute(currentPolicy.value.id, {
+        network: excludeRouteFormData.network,
+      })
+      Message.success('添加成功')
+    }
+    addExcludeRouteModalVisible.value = false
+    
+    const policy = await policiesApi.get(currentPolicy.value.id)
+    currentExcludeRoutes.value = policy.exclude_routes || []
+    fetchPolicies()
+  } catch (error: any) {
+    Message.error(error.response?.data?.error || '操作失败')
+  } finally {
+    submitLoading.value = false
+  }
+}
+
+const handleDeleteExcludeRoute = (record: ExcludeRoute) => {
+  if (!currentPolicy.value) {
+    return
+  }
+
+  Modal.confirm({
+    title: '确认删除',
+    content: `确定要删除排除路由 "${record.network}" 吗？`,
+    onOk: async () => {
+      try {
+        await policiesApi.deleteExcludeRoute(currentPolicy.value!.id, record.id)
+        Message.success('删除成功')
+        currentExcludeRoutes.value = currentExcludeRoutes.value.filter((r) => r.id !== record.id)
+        fetchPolicies()
+      } catch (error) {
+        Message.error('删除失败')
+      }
+    },
+  })
+}
+
+const resetExcludeRouteForm = () => {
+  excludeRouteFormData.network = ''
+  isEditExcludeRoute.value = false
+  currentExcludeRouteId.value = null
+}
+
+const handleEditExcludeRoute = (record: ExcludeRoute) => {
+  isEditExcludeRoute.value = true
+  currentExcludeRouteId.value = record.id
+  excludeRouteFormData.network = record.network
+  addExcludeRouteModalVisible.value = true
 }
 
 onMounted(() => {

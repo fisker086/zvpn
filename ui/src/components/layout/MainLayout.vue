@@ -103,7 +103,6 @@ import {
   IconUserGroup,
   IconTool,
   IconFile,
-  IconLink,
 } from '@arco-design/web-vue/es/icon'
 
 const router = useRouter()
@@ -152,11 +151,6 @@ const menuItems = computed(() => {
       name: 'AuditLogs',
       title: '审计日志',
       icon: IconFile,
-    },
-    {
-      name: 'Domains',
-      title: '域名管理',
-      icon: IconLink,
     }
   )
 

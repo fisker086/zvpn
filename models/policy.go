@@ -17,6 +17,7 @@ type Policy struct {
 	// Routing rules
 	AllowedNetworks []AllowedNetwork `gorm:"foreignKey:PolicyID" json:"allowed_networks"`
 	Routes          []Route          `gorm:"foreignKey:PolicyID" json:"routes"`
+	ExcludeRoutes   []ExcludeRoute   `gorm:"foreignKey:PolicyID" json:"exclude_routes"` // 排除路由（用于全局模式）
 
 	// Bandwidth limits (bytes per second)
 	MaxBandwidth int64 `json:"max_bandwidth"` // 0 means unlimited
@@ -51,6 +52,16 @@ type Route struct {
 	Network  string `gorm:"not null" json:"network"` // CIDR format
 	Gateway  string `json:"gateway"`                 // Optional gateway
 	Metric   int    `gorm:"default:100" json:"metric"`
+}
+
+type ExcludeRoute struct {
+	ID        uint           `gorm:"primarykey" json:"id"`
+	CreatedAt time.Time      `json:"created_at"`
+	UpdatedAt time.Time      `json:"updated_at"`
+	DeletedAt gorm.DeletedAt `gorm:"index" json:"-"`
+
+	PolicyID uint   `gorm:"not null" json:"policy_id"`
+	Network  string `gorm:"not null" json:"network"` // CIDR format
 }
 
 type TimeRestriction struct {

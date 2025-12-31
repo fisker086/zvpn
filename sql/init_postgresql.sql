@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS user_groups (
     id BIGSERIAL PRIMARY KEY,
     name VARCHAR(255) NOT NULL UNIQUE,
     description TEXT,
+    allow_lan BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP,
     deleted_at TIMESTAMP(3) NULL
@@ -91,10 +92,26 @@ CREATE TABLE IF NOT EXISTS routes (
     metric INT DEFAULT 0,
     created_at TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP,
+    deleted_at TIMESTAMP(3) NULL,
     FOREIGN KEY (policy_id) REFERENCES policies(id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_routes_policy_id ON routes(policy_id);
+CREATE INDEX IF NOT EXISTS idx_routes_deleted_at ON routes(deleted_at);
+
+-- 排除路由表（用于全局模式）
+CREATE TABLE IF NOT EXISTS exclude_routes (
+    id BIGSERIAL PRIMARY KEY,
+    policy_id BIGINT NOT NULL,
+    network VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP,
+    deleted_at TIMESTAMP(3) NULL,
+    FOREIGN KEY (policy_id) REFERENCES policies(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_exclude_routes_policy_id ON exclude_routes(policy_id);
+CREATE INDEX IF NOT EXISTS idx_exclude_routes_deleted_at ON exclude_routes(deleted_at);
 
 -- 允许的网络表
 CREATE TABLE IF NOT EXISTS allowed_networks (
@@ -211,24 +228,6 @@ CREATE INDEX IF NOT EXISTS idx_audit_logs_hook_id ON audit_logs(hook_id);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_policy_id ON audit_logs(policy_id);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_deleted_at ON audit_logs(deleted_at);
-
--- 域名管理表
-CREATE TABLE IF NOT EXISTS domains (
-    id BIGSERIAL PRIMARY KEY,
-    domain VARCHAR(255) NOT NULL UNIQUE,
-    description TEXT,
-    policy_id BIGINT,
-    manual_ips TEXT,
-    access_count INT DEFAULT 0,
-    created_at TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP,
-    deleted_at TIMESTAMP(3) NULL,
-    FOREIGN KEY (policy_id) REFERENCES policies(id) ON DELETE SET NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_domains_domain ON domains(domain);
-CREATE INDEX IF NOT EXISTS idx_domains_policy_id ON domains(policy_id);
-CREATE INDEX IF NOT EXISTS idx_domains_deleted_at ON domains(deleted_at);
 
 -- 系统设置表（前端配置持久化）
 CREATE TABLE IF NOT EXISTS system_settings (

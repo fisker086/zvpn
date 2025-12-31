@@ -10,7 +10,7 @@ export interface User {
   source?: string  // system 或 ldap
   vpn_ip?: string
   connected: boolean
-  tunnel_mode?: string  // 隧道模式: split(分隧道) 或 full(全局)
+  tunnel_mode?: string  // 隧道模式: split(分离隧道) 或 full(全局模式)
   groups?: Array<{
     id: number
     name: string
@@ -35,7 +35,7 @@ export interface UpdateUserRequest {
   is_active?: boolean
   group_ids?: number[] // 更新用户组（必须至少一个）
   password?: string    // 密码（可选，留空则不修改）
-  tunnel_mode?: string // 隧道模式: split(分隧道) 或 full(全局)
+  tunnel_mode?: string // 隧道模式: split(分离隧道) 或 full(全局模式)
 }
 
 export const usersApi = {

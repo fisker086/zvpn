@@ -35,6 +35,7 @@
             <span class="text-secondary">{{ record.description || '-' }}</span>
           </template>
 
+
           <template #users="{ record }">
             <a-space wrap>
               <a-tag
@@ -232,7 +233,7 @@ import {
 import { usersApi, type User } from '@/api/users'
 import { policiesApi, type Policy } from '@/api/policies'
 import { Message, Modal } from '@arco-design/web-vue'
-import { IconPlus, IconUserGroup } from '@arco-design/web-vue/es/icon'
+import { IconPlus, IconUserGroup, IconInfoCircle, IconCheckCircleFill, IconExclamationCircleFill, IconLink } from '@arco-design/web-vue/es/icon'
 
 const loading = ref(false)
 const submitLoading = ref(false)
@@ -258,6 +259,7 @@ const pagination = reactive({
 const formData = reactive<CreateGroupRequest & UpdateGroupRequest>({
   name: '',
   description: '',
+  allow_lan: false,
 })
 
 const columns = [
@@ -341,6 +343,7 @@ const handleEdit = (record: UserGroup) => {
   currentGroup.value = record
   formData.name = record.name
   formData.description = record.description || ''
+  formData.allow_lan = record.allow_lan || false
   modalVisible.value = true
 }
 
@@ -386,12 +389,14 @@ const handleSubmit = async () => {
       await groupsApi.update(currentGroup.value.id, {
         name: formData.name,
         description: formData.description,
+        allow_lan: formData.allow_lan,
       })
       Message.success('更新成功')
     } else {
       await groupsApi.create({
         name: formData.name,
         description: formData.description,
+        allow_lan: formData.allow_lan,
       })
       Message.success('创建成功')
     }
@@ -452,6 +457,7 @@ const handleCancel = () => {
 const resetForm = () => {
   formData.name = ''
   formData.description = ''
+  formData.allow_lan = false
 }
 
 const handlePageChange = (page: number) => {
@@ -512,5 +518,117 @@ onMounted(() => {
   min-height: auto !important;
   height: auto !important;
 }
+
+/* 排除本地网络帮助样式 */
+.allow-lan-help {
+  margin-top: 12px;
+}
+
+.help-card {
+  background: var(--color-bg-2);
+  border: 1px solid var(--color-border-2);
+  border-radius: 6px;
+  padding: 12px;
+  margin-bottom: 12px;
+  transition: all 0.2s;
+}
+
+.help-card:hover {
+  border-color: var(--color-border-3);
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.04);
+}
+
+.help-card-info {
+  background: linear-gradient(135deg, rgba(var(--arcoblue-1), 0.3) 0%, rgba(var(--arcoblue-1), 0.1) 100%);
+  border-left: 3px solid rgb(var(--arcoblue-6));
+}
+
+.help-card-notice {
+  background: linear-gradient(135deg, rgba(var(--orange-1), 0.3) 0%, rgba(var(--orange-1), 0.1) 100%);
+  border-left: 3px solid rgb(var(--orange-6));
+  margin-bottom: 12px;
+}
+
+.help-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.help-icon {
+  font-size: 16px;
+  flex-shrink: 0;
+  color: rgb(var(--arcoblue-6));
+}
+
+.help-icon-success {
+  color: rgb(var(--green-6));
+}
+
+.help-icon-info {
+  color: rgb(var(--arcoblue-6));
+}
+
+.help-title {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--color-text-1);
+}
+
+.help-content {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--color-text-2);
+}
+
+.help-desc {
+  margin-bottom: 10px;
+}
+
+.help-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 8px 10px;
+  background: rgba(var(--orange-1), 0.5);
+  border-left: 3px solid rgb(var(--orange-6));
+  border-radius: 4px;
+  margin-top: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: rgb(var(--orange-7));
+}
+
+.help-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin-bottom: 8px;
+  padding: 6px 0;
+}
+
+.help-item:last-child {
+  margin-bottom: 0;
+}
+
+.help-badge {
+  display: inline-block;
+  padding: 2px 8px;
+  background: rgb(var(--arcoblue-1));
+  color: rgb(var(--arcoblue-7));
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  flex-shrink: 0;
+  min-width: 70px;
+  text-align: center;
+}
+
+.help-badge-auto {
+  background: rgb(var(--green-1));
+  color: rgb(var(--green-7));
+}
 </style>
+
 

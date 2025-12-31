@@ -19,14 +19,12 @@ func RegisterAPIRoutes(router *gin.Engine, cfg *config.Config, vpnServer *vpn.VP
 	groupHandler := handlers.NewGroupHandler(cfg)
 	ldapConfigHandler := handlers.NewLDAPConfigHandler()
 	auditLogHandler := handlers.NewAuditLogHandler()
-	domainHandler := handlers.NewDomainHandler(cfg)
 	settingsHandler := handlers.NewSettingsHandler(cfg)
 	systemHandler := handlers.NewSystemHandler(cfg.VPN.EBPFInterfaceName)
 
 	// 设置 VPN 服务器
 	vpnHandler.SetVPNServer(vpnServer)
 	hookHandler.SetVPNServer(vpnServer)
-	domainHandler.SetVPNServer(vpnServer)
 	settingsHandler.SetVPNServer(vpnServer)
 
 	// API 版本组
@@ -36,7 +34,7 @@ func RegisterAPIRoutes(router *gin.Engine, cfg *config.Config, vpnServer *vpn.VP
 	registerPublicRoutes(api, authHandler, ldapConfigHandler)
 
 	// 注册受保护路由
-	registerProtectedRoutes(api, cfg, authHandler, vpnHandler, userHandler, policyHandler, hookHandler, groupHandler, ldapConfigHandler, auditLogHandler, domainHandler, settingsHandler, systemHandler)
+	registerProtectedRoutes(api, cfg, authHandler, vpnHandler, userHandler, policyHandler, hookHandler, groupHandler, ldapConfigHandler, auditLogHandler, settingsHandler, systemHandler)
 }
 
 // registerPublicRoutes 注册公开路由（无需认证）
@@ -71,7 +69,6 @@ func registerProtectedRoutes(
 	groupHandler *handlers.GroupHandler,
 	ldapConfigHandler *handlers.LDAPConfigHandler,
 	auditLogHandler *handlers.AuditLogHandler,
-	domainHandler *handlers.DomainHandler,
 	settingsHandler *handlers.SettingsHandler,
 	systemHandler *handlers.SystemHandler,
 ) {
@@ -83,16 +80,16 @@ func registerProtectedRoutes(
 	registerAuthRoutes(protected, authHandler)
 
 	// VPN 相关路由
-	registerVPNRoutes(protected, vpnHandler, domainHandler)
+	registerVPNRoutes(protected, vpnHandler)
 
 	// 审计日志路由（普通用户可查看，管理员可删除）
 	registerAuditLogRoutes(protected, auditLogHandler)
 
 	// 只读路由（普通用户可查看）
-	registerReadOnlyRoutes(protected, userHandler, policyHandler, hookHandler, groupHandler, domainHandler, settingsHandler)
+	registerReadOnlyRoutes(protected, userHandler, policyHandler, hookHandler, groupHandler, settingsHandler)
 
 	// 管理员路由（仅管理员可编辑）
-	registerAdminRoutes(protected, userHandler, policyHandler, hookHandler, groupHandler, ldapConfigHandler, domainHandler, settingsHandler)
+	registerAdminRoutes(protected, userHandler, policyHandler, hookHandler, groupHandler, ldapConfigHandler, settingsHandler)
 
 	// 系统指标
 	system := protected.Group("/system")
@@ -111,7 +108,7 @@ func registerAuthRoutes(protected *gin.RouterGroup, authHandler *handlers.AuthHa
 }
 
 // registerVPNRoutes 注册 VPN 路由
-func registerVPNRoutes(protected *gin.RouterGroup, vpnHandler *handlers.VPNHandler, domainHandler *handlers.DomainHandler) {
+func registerVPNRoutes(protected *gin.RouterGroup, vpnHandler *handlers.VPNHandler) {
 	vpn := protected.Group("/vpn")
 	{
 		// 用户 VPN 连接管理
@@ -165,7 +162,6 @@ func registerReadOnlyRoutes(
 	policyHandler *handlers.PolicyHandler,
 	hookHandler *handlers.HookHandler,
 	groupHandler *handlers.GroupHandler,
-	domainHandler *handlers.DomainHandler,
 	settingsHandler *handlers.SettingsHandler,
 ) {
 	// 用户管理（只读）
@@ -201,12 +197,6 @@ func registerReadOnlyRoutes(
 		groups.GET("/:id/policies", groupHandler.GetGroupPolicies)
 	}
 
-	// 域名管理（只读）
-	domains := protected.Group("/vpn/admin/domains")
-	{
-		domains.GET("", domainHandler.ListDomains)
-	}
-
 	// 性能设置（只读，普通用户可查看）
 	settings := protected.Group("/settings")
 	{
@@ -225,7 +215,6 @@ func registerAdminRoutes(
 	hookHandler *handlers.HookHandler,
 	groupHandler *handlers.GroupHandler,
 	ldapConfigHandler *handlers.LDAPConfigHandler,
-	domainHandler *handlers.DomainHandler,
 	settingsHandler *handlers.SettingsHandler,
 ) {
 	// 应用管理员中间件
@@ -253,6 +242,9 @@ func registerAdminRoutes(
 		policies.POST("/:id/routes", policyHandler.AddRoute)
 		policies.PUT("/:id/routes/:route_id", policyHandler.UpdateRoute)
 		policies.DELETE("/:id/routes/:route_id", policyHandler.DeleteRoute)
+		policies.POST("/:id/exclude-routes", policyHandler.AddExcludeRoute)
+		policies.PUT("/:id/exclude-routes/:exclude_route_id", policyHandler.UpdateExcludeRoute)
+		policies.DELETE("/:id/exclude-routes/:exclude_route_id", policyHandler.DeleteExcludeRoute)
 		policies.POST("/:id/groups", policyHandler.AssignGroups)
 	}
 
@@ -280,15 +272,6 @@ func registerAdminRoutes(
 
 	// LDAP配置管理
 	registerLDAPConfigRoutes(admin, ldapConfigHandler)
-
-	// 域名管理（编辑）
-	domains := admin.Group("/vpn/admin/domains")
-	{
-		domains.POST("", domainHandler.CreateDomain)
-		domains.PUT("/:id", domainHandler.UpdateDomain)
-		domains.POST("/:id/resolve", domainHandler.ResolveDomain)
-		domains.DELETE("/:id", domainHandler.DeleteDomain)
-	}
 
 	// 性能设置管理（编辑，需要管理员权限）
 	settings := admin.Group("/settings")

@@ -797,6 +797,9 @@ func (tc *TunnelClient) processPacket(packetType byte, payload []byte) error {
 		log.Printf("OpenConnect: recv LinkCstp Keepalive - user: %s, IP: %s, remote: %s",
 			tc.User.Username, tc.IP.String(), tc.Conn.RemoteAddr())
 
+		// 更新最后数据包时间（包括心跳包）
+		tc.lastDataTime = time.Now().Unix()
+
 		// 检查空闲超时（如果启用）
 		if tc.idleTimeout > 0 {
 			now := time.Now().Unix()
@@ -817,7 +820,8 @@ func (tc *TunnelClient) processPacket(packetType byte, payload []byte) error {
 	case PacketTypeDPD:
 		return tc.processDPDPacket(payload)
 	case PacketTypeDPDResp:
-		// DPD response from client; nothing to do
+		// DPD response from client; update last activity time
+		tc.lastDataTime = time.Now().Unix()
 		return nil
 	default:
 		// Log unknown packet types but don't crash - this could be DTLS protocol messages
@@ -877,6 +881,11 @@ func (tc *TunnelClient) processDataPacket(payload []byte) error {
 
 	// 验证数据包格式（使用统一的验证函数，确保后端验证一致性）
 	if err := validateIPPacket(payload); err != nil {
+		// IPv6 数据包是预期的，静默跳过（系统只支持 IPv4）
+		if IsUnsupportedIPVersion(err) {
+			return nil // 静默跳过 IPv6 数据包
+		}
+		// 其他错误记录日志
 		log.Printf("OpenConnect: Invalid packet from user %s: %v", tc.User.Username, err)
 		return nil // 跳过无效数据包
 	}
@@ -1044,9 +1053,17 @@ func (tc *TunnelClient) processDataPacket(payload []byte) error {
 }
 
 // processDPDPacket processes a Dead Peer Detection packet
+// IMPORTANT: CSTP (TCP) 和 DTLS (UDP) 是分开的，两个互不干涉
+// - 如果从 TCP 通道收到 DPD-REQ，只通过 TCP 发送 DPD-RESP
+// - 如果从 DTLS 通道收到 DPD-REQ，只通过 DTLS 发送 DPD-RESP（在 dtls.go 中处理）
+// - 两个通道独立处理，不互相影响
 func (tc *TunnelClient) processDPDPacket(payload []byte) error {
-	// Reply with DPD response
-	log.Printf("OpenConnect: Received DPD packet from user %s, sending DPD response", tc.User.Username)
+	// Update last data time for DPD packets
+	tc.lastDataTime = time.Now().Unix()
+
+	// Reply with DPD response on TCP only (CSTP channel)
+	// Note: This is called when DPD-REQ is received on TCP channel
+	log.Printf("OpenConnect: Received DPD-REQ on TCP channel from user %s, sending DPD-RESP on TCP", tc.User.Username)
 	return tc.sendPacket(PacketTypeDPDResp, payload)
 }
 
@@ -1067,6 +1084,10 @@ func logPolicyDenial(hookName, username string, ctx *policy.Context, protocol by
 func (tc *TunnelClient) performPolicyCheck(packet []byte) error {
 	// 验证数据包格式（后端验证的关键步骤）
 	if err := validateIPPacket(packet); err != nil {
+		// IPv6 数据包是预期的，静默跳过（系统只支持 IPv4）
+		if IsUnsupportedIPVersion(err) {
+			return nil // 静默跳过 IPv6 数据包，不进行策略检查
+		}
 		log.Printf("OpenConnect: [POLICY CHECK] Invalid packet format: %v", err)
 		return fmt.Errorf("invalid packet format: %w", err)
 	}
@@ -1115,6 +1136,10 @@ func (tc *TunnelClient) performPolicyCheck(packet []byte) error {
 func (tc *TunnelClient) checkPolicyLightweight(packet []byte) error {
 	// 基本验证：确保数据包格式正确
 	if err := validateIPPacket(packet); err != nil {
+		// IPv6 数据包是预期的，静默跳过（系统只支持 IPv4）
+		if IsUnsupportedIPVersion(err) {
+			return nil // 静默跳过 IPv6 数据包
+		}
 		return fmt.Errorf("invalid packet format: %w", err)
 	}
 	// 完整的策略检查由eBPF XDP在内核层面处理
@@ -1136,6 +1161,10 @@ func (tc *TunnelClient) checkPolicy(packet []byte) error {
 
 	// 验证数据包格式（后端验证的关键步骤）
 	if err := validateIPPacket(packet); err != nil {
+		// IPv6 数据包是预期的，静默跳过（系统只支持 IPv4）
+		if IsUnsupportedIPVersion(err) {
+			return nil // 静默跳过 IPv6 数据包
+		}
 		return fmt.Errorf("invalid packet format: %w", err)
 	}
 
@@ -1275,28 +1304,9 @@ func (tc *TunnelClient) checkPolicy(packet []byte) error {
 	}
 }
 
-// sendPacket sends a CSTP packet with the given type and payload
-// This function is thread-safe and can be called concurrently with reads
-// IMPORTANT: Both server-to-client and client-to-server packets NOW include "STF" prefix for compatibility
-// This ensures the client can properly parse packets from the server
-func (tc *TunnelClient) sendPacket(packetType byte, data []byte) error {
-	// Use "STF" prefix + 8-byte CSTP header format for all packets to ensure compatibility
-	// CSTP format with STF prefix:
-	// Bytes 0-2: "STF" prefix
-	// Byte 3: Version (0x01)
-	// Byte 4: Type
-	// Byte 5-6: Flags/Reserved
-	// Byte 7-8: Length (BIG-ENDIAN - this is the ONLY big-endian field)
-	// Byte 9-10: Reserved
-	// Payload starts at byte 11
-
-	// Per OpenConnect spec draft-mavrogiannopoulos-openconnect-02:
-	// Byte 0-2: 'S', 'T', 'F' (fixed)
-	// Byte 3: 0x01 (fixed)
-	// Byte 4-5: Length (BIG-ENDIAN) - length of payload that follows header (NOT including header)
-	// Byte 6: Payload type
-	// Byte 7: 0x00 (fixed)
-	// Byte 8+: Payload
+// BuildCSTPPacket builds a CSTP packet with the given type and payload
+// Returns the packet bytes without sending it
+func (tc *TunnelClient) BuildCSTPPacket(packetType byte, data []byte) []byte {
 	stfLen := 3
 	headerLen := 5                  // Version(1) + Length(2) + Type(1) + Reserved(1) = 5 bytes (excluding STF prefix)
 	payloadLen := uint16(len(data)) // Length field is payload length only, NOT including header
@@ -1321,6 +1331,28 @@ func (tc *TunnelClient) sendPacket(packetType byte, data []byte) error {
 		copy(fullPacket[8:], data)
 	}
 
+	return fullPacket
+}
+
+// sendPacket sends a CSTP packet with the given type and payload
+// This function is thread-safe and can be called concurrently with reads
+// IMPORTANT: Both server-to-client and client-to-server packets NOW include "STF" prefix for compatibility
+// This ensures the client can properly parse packets from the server
+func (tc *TunnelClient) sendPacket(packetType byte, data []byte) error {
+	// Use "STF" prefix + 8-byte CSTP header format for all packets to ensure compatibility
+	// CSTP format with STF prefix:
+	// Bytes 0-2: "STF" prefix
+	// Byte 3: Version (0x01)
+	// Byte 4: Type
+	// Byte 5-6: Flags/Reserved
+	// Byte 7-8: Length (BIG-ENDIAN - this is the ONLY big-endian field)
+	// Byte 9-10: Reserved
+	// Payload starts at byte 11
+
+	// Use BuildCSTPPacket to build the packet
+	fullPacket := tc.BuildCSTPPacket(packetType, data)
+	payloadLen := uint16(len(data))
+
 	// Log packet details for debugging
 	if vpn.ShouldLogPacket() {
 		// Server always uses BIG-ENDIAN for server-to-client packets
@@ -1338,7 +1370,15 @@ func (tc *TunnelClient) sendPacket(packetType byte, data []byte) error {
 }
 
 // sendKeepalive sends a keepalive packet to the client
+// IMPORTANT: CSTP (TCP) 和 DTLS (UDP) 是分开的，两个互不干涉
+// - TCP keepalive: 只通过 TCP 通道发送（CSTP 通道）
+// - DTLS keepalive: 只通过 DTLS 通道发送（在 dtls.go 的 handleDTLSConnection 中独立处理）
+// - 如果客户端禁用了 UDP (--disable-udp)，DTLS 连接不存在，不会发送 DTLS keepalive
+// 两个通道独立处理，各自在自己的超时时发送自己的 keepalive
 func (tc *TunnelClient) sendKeepalive() error {
+	// Send TCP keepalive only (CSTP channel)
+	// Note: DTLS keepalive is handled independently in dtls.go when DTLS connection times out
+	log.Printf("OpenConnect: Sending keepalive on TCP channel for user %s", tc.User.Username)
 	return tc.sendPacket(PacketTypeKeepalive, nil)
 }
 

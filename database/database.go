@@ -147,13 +147,13 @@ func Init(cfg *config.Config) error {
 		&models.Policy{},
 		&models.AllowedNetwork{},
 		&models.Route{},
+		&models.ExcludeRoute{},
 		&models.TimeRestriction{},
 		&models.Session{},
 		&models.Hook{},
 		&models.UserGroup{},
 		&models.LDAPConfig{},
 		&models.AuditLog{},
-		&models.Domain{},
 		&models.SystemSetting{},
 	)
 	if err != nil {

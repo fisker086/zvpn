@@ -305,10 +305,6 @@ func (h *VPNHandler) buildVPNConfig(user *models.User) *VPNConfig {
 		}
 	}
 
-	// Get routes from domains associated with user's policy
-	domainRoutes := h.getDomainRoutes(user)
-	routes = append(routes, domainRoutes...)
-
 	// Get server IP (from request or config)
 	serverIP := h.config.Server.Host
 	if serverIP == "0.0.0.0" {
@@ -330,38 +326,6 @@ func (h *VPNHandler) buildVPNConfig(user *models.User) *VPNConfig {
 		Routes:     routes,
 		MTU:        h.config.VPN.MTU,
 	}
-}
-
-// getDomainRoutes 获取与用户策略关联的域名路由
-func (h *VPNHandler) getDomainRoutes(user *models.User) []string {
-	var routes []string
-
-	// 如果用户没有策略，返回空
-	if user.PolicyID == 0 {
-		return routes
-	}
-
-	// 查询所有已解析的、关联到用户策略的域名
-	var domains []models.Domain
-	if err := database.DB.Where("policy_id = ? AND resolved = ?", user.PolicyID, true).Find(&domains).Error; err != nil {
-		return routes
-	}
-
-	// 提取所有域名的IP路由
-	for _, domain := range domains {
-		var ips []string
-		if domain.IPs != "" {
-			if err := json.Unmarshal([]byte(domain.IPs), &ips); err != nil {
-				continue
-			}
-			// 为每个IP添加/32路由
-			for _, ip := range ips {
-				routes = append(routes, ip+"/32")
-			}
-		}
-	}
-
-	return routes
 }
 
 // applyPolicyRoutes applies policy routes to eBPF and kernel routing table
@@ -419,53 +383,6 @@ func (h *VPNHandler) applyPolicyRoutes(user *models.User) {
 
 	// 应用域名路由（如果域名关联了用户策略）
 	if user.PolicyID != 0 {
-		h.applyDomainRoutes(user, gateway, routeMgr)
-	}
-}
-
-// applyDomainRoutes 应用域名相关的路由
-func (h *VPNHandler) applyDomainRoutes(user *models.User, gateway net.IP, routeMgr *vpn.RouteManager) {
-	// 查询所有已解析的、关联到用户策略的域名
-	var domains []models.Domain
-	if err := database.DB.Where("policy_id = ? AND resolved = ?", user.PolicyID, true).Find(&domains).Error; err != nil {
-		return
-	}
-
-	// 为每个域名的IP添加路由
-	for _, domain := range domains {
-		var ips []string
-		if domain.IPs != "" {
-			if err := json.Unmarshal([]byte(domain.IPs), &ips); err != nil {
-				continue
-			}
-
-			for _, ipStr := range ips {
-				ip := net.ParseIP(ipStr)
-				if ip == nil || ip.To4() == nil {
-					continue
-				}
-
-				// 检查IP是否在VPN网络中
-				_, vpnNet, _ := net.ParseCIDR(h.config.VPN.Network)
-				if vpnNet.Contains(ip) {
-					continue
-				}
-
-				// 创建/32路由
-				_, ipNet, err := net.ParseCIDR(ipStr + "/32")
-				if err != nil {
-					continue
-				}
-
-				// 添加到内核路由表
-				if routeMgr != nil {
-					if err := routeMgr.AddRoute(ipNet, gateway, 100); err != nil {
-						// 路由可能已存在，这是正常的
-						// fmt.Printf("Warning: Failed to add domain route %s: %v\n", ipStr+"/32", err)
-					}
-				}
-			}
-		}
 	}
 }
 
@@ -742,18 +659,9 @@ func (h *VPNHandler) StreamEBPFStats(c *gin.Context) {
 
 // GetAdminConfig returns VPN admin configuration
 func (h *VPNHandler) GetAdminConfig(c *gin.Context) {
-	// DNS拦截器始终启用，配置已写死：端口53，上游DNS为114.114.114.114和8.8.8.8
-	enableDNSInterceptor := false
-	if h.vpnServer != nil && h.vpnServer.GetDNSInterceptor() != nil {
-		enableDNSInterceptor = true
-	}
-
 	config := gin.H{
-		"enable_compression":     h.config.VPN.EnableCompression,
-		"compression_type":       h.config.VPN.CompressionType,
-		"enable_dns_interceptor": enableDNSInterceptor,
-		"dns_port":               "53",                            // 固定端口
-		"upstream_dns":           "114.114.114.114:53,8.8.8.8:53", // 固定上游DNS
+		"enable_compression": h.config.VPN.EnableCompression,
+		"compression_type":   h.config.VPN.CompressionType,
 	}
 
 	c.JSON(http.StatusOK, config)
@@ -847,51 +755,4 @@ func (h *VPNHandler) applyCompressionToRuntime() {
 	} else {
 		h.vpnServer.CompressionMgr = vpn.NewCompressionManager(vpn.CompressionNone)
 	}
-}
-
-// UpdateDNSConfig updates DNS interceptor configuration
-type DNSConfigRequest struct {
-	EnableDNSInterceptor bool   `json:"enable_dns_interceptor"`
-	DNSPort              string `json:"dns_port" binding:"required"`
-	UpstreamDNS          string `json:"upstream_dns" binding:"required"`
-}
-
-func (h *VPNHandler) UpdateDNSConfig(c *gin.Context) {
-	var req DNSConfigRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	// Update in-memory config
-	h.config.VPN.DNSPort = req.DNSPort
-	h.config.VPN.UpstreamDNS = req.UpstreamDNS
-
-	// Update DNS interceptor if available
-	// DNS拦截器始终启用，只需要更新配置并重启
-	if h.vpnServer != nil && h.vpnServer.GetDNSInterceptor() != nil {
-		dnsInterceptor := h.vpnServer.GetDNSInterceptor()
-		// Restart DNS interceptor with new config
-		if err := dnsInterceptor.Stop(); err != nil {
-			log.Printf("Warning: Failed to stop DNS interceptor: %v", err)
-		}
-		// DNS拦截器始终启用，直接启动
-		if err := dnsInterceptor.Start(); err != nil {
-			log.Printf("Warning: Failed to restart DNS interceptor: %v", err)
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"error": fmt.Sprintf("Failed to restart DNS interceptor: %v", err),
-			})
-			return
-		}
-	}
-
-	// Return updated config
-	// DNS拦截器始终启用
-	config := gin.H{
-		"enable_dns_interceptor": true,
-		"dns_port":               h.config.VPN.DNSPort,
-		"upstream_dns":           h.config.VPN.UpstreamDNS,
-	}
-
-	c.JSON(http.StatusOK, config)
 }

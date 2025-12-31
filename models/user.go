@@ -65,11 +65,13 @@ func (u *User) GetPolicy() *Policy {
 
 	// 创建一个新的合并策略
 	mergedPolicy := &Policy{
-		Routes: []Route{},
+		Routes:        []Route{},
+		ExcludeRoutes: []ExcludeRoute{},
 	}
 
 	// 合并所有用户组的所有策略的路由
-	routeMap := make(map[string]bool) // 用于去重
+	routeMap := make(map[string]bool)        // 用于去重路由
+	excludeRouteMap := make(map[string]bool) // 用于去重排除路由
 	// 存储所有策略ID，用于后续设置合并策略的ID
 	var policyIDs []uint
 
@@ -79,10 +81,12 @@ func (u *User) GetPolicy() *Policy {
 
 		for policyIndex, policy := range group.Policies {
 			log.Printf("User.GetPolicy: 处理组 %d 的策略 %d (ID: %d)", groupIndex+1, policyIndex+1, policy.ID)
-			log.Printf("User.GetPolicy: 策略 %d 的路由数量: %d", policyIndex+1, len(policy.Routes))
+			log.Printf("User.GetPolicy: 策略 %d 的路由数量: %d，排除路由数量: %d", policyIndex+1, len(policy.Routes), len(policy.ExcludeRoutes))
 
 			// 收集所有策略ID
 			policyIDs = append(policyIDs, policy.ID)
+			
+			// 合并路由
 			for routeIndex, route := range policy.Routes {
 				log.Printf("User.GetPolicy: 策略 %d 的路由 %d: %s", policyIndex+1, routeIndex+1, route.Network)
 				// 去重路由
@@ -94,10 +98,23 @@ func (u *User) GetPolicy() *Policy {
 					log.Printf("User.GetPolicy: 跳过重复路由: %s", route.Network)
 				}
 			}
+			
+			// 合并排除路由
+			for excludeRouteIndex, excludeRoute := range policy.ExcludeRoutes {
+				log.Printf("User.GetPolicy: 策略 %d 的排除路由 %d: %s", policyIndex+1, excludeRouteIndex+1, excludeRoute.Network)
+				// 去重排除路由
+				if !excludeRouteMap[excludeRoute.Network] {
+					log.Printf("User.GetPolicy: 添加新排除路由: %s", excludeRoute.Network)
+					mergedPolicy.ExcludeRoutes = append(mergedPolicy.ExcludeRoutes, excludeRoute)
+					excludeRouteMap[excludeRoute.Network] = true
+				} else {
+					log.Printf("User.GetPolicy: 跳过重复排除路由: %s", excludeRoute.Network)
+				}
+			}
 		}
 	}
 
-	log.Printf("User.GetPolicy: 合并后策略路由数量: %d", len(mergedPolicy.Routes))
+	log.Printf("User.GetPolicy: 合并后策略路由数量: %d，排除路由数量: %d", len(mergedPolicy.Routes), len(mergedPolicy.ExcludeRoutes))
 
 	// 如果没有路由，返回nil
 	if len(mergedPolicy.Routes) == 0 {

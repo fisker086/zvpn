@@ -4,6 +4,7 @@ export interface UserGroup {
   id: number
   name: string
   description?: string
+  allow_lan?: boolean // 允许本地网络访问（类似 anylink 的 allow_lan 配置）
   users?: Array<{
     id: number
     username: string
@@ -19,11 +20,13 @@ export interface UserGroup {
 export interface CreateGroupRequest {
   name: string
   description?: string
+  allow_lan?: boolean
 }
 
 export interface UpdateGroupRequest {
   name?: string
   description?: string
+  allow_lan?: boolean
 }
 
 export interface AssignUsersRequest {

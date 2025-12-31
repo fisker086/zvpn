@@ -7,11 +7,17 @@ export interface Route {
   metric: number
 }
 
+export interface ExcludeRoute {
+  id: number
+  network: string
+}
+
 export interface Policy {
   id: number
   name: string
   description?: string
   routes: Route[]
+  exclude_routes?: ExcludeRoute[]
   max_bandwidth?: number
   dns_servers?: string[] // DNS服务器IP地址数组
   groups?: Array<{
@@ -47,6 +53,14 @@ export interface UpdateRouteRequest {
   network?: string
   gateway?: string
   metric?: number
+}
+
+export interface AddExcludeRouteRequest {
+  network: string
+}
+
+export interface UpdateExcludeRouteRequest {
+  network?: string
 }
 
 export const policiesApi = {
@@ -85,5 +99,17 @@ export const policiesApi = {
   // 给策略分配用户组
   assignGroups: (id: number, data: { group_ids: number[] }): Promise<Policy> => 
     request.post<Policy>(`/policies/${id}/groups`, data),
+
+  // 添加排除路由
+  addExcludeRoute: (id: number, data: AddExcludeRouteRequest): Promise<ExcludeRoute> => 
+    request.post<ExcludeRoute>(`/policies/${id}/exclude-routes`, data),
+
+  // 删除排除路由
+  deleteExcludeRoute: (policyId: number, excludeRouteId: number): Promise<void> => 
+    request.delete(`/policies/${policyId}/exclude-routes/${excludeRouteId}`),
+  
+  // 更新排除路由
+  updateExcludeRoute: (policyId: number, excludeRouteId: number, data: UpdateExcludeRouteRequest): Promise<ExcludeRoute> => 
+    request.put<ExcludeRoute>(`/policies/${policyId}/exclude-routes/${excludeRouteId}`, data),
 }
 

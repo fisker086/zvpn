@@ -220,8 +220,15 @@ func (c *VPNClient) writePacket(packet []byte) {
 				c.UserID, c.IP.String(), connType, err, written, len(packet))
 
 			// If DTLS write failed, fallback to TCP for data packets
+			// IMPORTANT: When DTLS fails, clear DTLS connection reference to enable automatic fallback to CSTP-only mode
+			// This ensures subsequent data packets will use TCP directly instead of retrying DTLS every time
+			// This is the standard behavior: if UDP is blocked or DTLS fails, automatically degrade to CSTP (TCP) only
 			if connType == "DTLS" && len(packet) >= 8 && packet[6] == 0x00 {
-				log.Printf("DTLS write failed, falling back to TCP for data packet")
+				log.Printf("DTLS write failed for user %d (IP: %s), automatically falling back to CSTP (TCP) only mode - clearing DTLS connection",
+					c.UserID, c.IP.String())
+				// Clear DTLS connection reference to prevent future DTLS attempts
+				// This enables automatic degradation to CSTP-only mode (standard behavior)
+				c.DTLSConn = nil
 				conn = c.Conn
 				connType = "TCP"
 				// Retry with TCP using original CSTP format packet
@@ -374,8 +381,15 @@ func (c *VPNClient) writeBatch(batch [][]byte) {
 					c.UserID, c.IP.String(), connType, err, written, len(packet))
 
 				// If DTLS write failed, fallback to TCP for data packets
+				// IMPORTANT: When DTLS fails, clear DTLS connection reference to enable automatic fallback to CSTP-only mode
+				// This ensures subsequent data packets will use TCP directly instead of retrying DTLS every time
+				// This is the standard behavior: if UDP is blocked or DTLS fails, automatically degrade to CSTP (TCP) only
 				if connType == "DTLS" && len(packet) >= 8 && packet[6] == 0x00 {
-					log.Printf("DTLS write failed, falling back to TCP for data packet")
+					log.Printf("DTLS write failed for user %d (IP: %s) in batch, automatically falling back to CSTP (TCP) only mode - clearing DTLS connection",
+						c.UserID, c.IP.String())
+					// Clear DTLS connection reference to prevent future DTLS attempts
+					// This enables automatic degradation to CSTP-only mode (standard behavior)
+					c.DTLSConn = nil
 					conn = c.Conn
 					connType = "TCP"
 					// Retry with TCP using original CSTP format packet

@@ -841,7 +841,6 @@ const compressionForm = reactive({
   compression_type: 'lz4',
 })
 
-// DNS拦截器配置已写死在代码中，不需要配置
 
 // 性能优化配置
 const performanceForm = reactive({
@@ -1220,7 +1219,6 @@ const fetchVPNConfig = async () => {
       const config = response.data
       compressionForm.enable_compression = config.enable_compression || false
       compressionForm.compression_type = config.compression_type || 'lz4'
-      // DNS拦截器配置已写死在代码中，不需要从配置读取
     }
   } catch (error) {
     console.error('获取VPN配置失败:', error)
@@ -1244,7 +1242,6 @@ const handleCompressionSubmit = async () => {
   }
 }
 
-// DNS拦截器配置已写死在代码中，不需要验证和保存函数
 
 // 保存性能优化配置
 const handlePerformanceSubmit = async () => {

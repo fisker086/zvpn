@@ -21,7 +21,7 @@ vpn:
   # 网络配置
   interfacename: "zvpn0"
   network: "10.8.0.0/24"  # 使用与环境变量一致的网段
-  mtu: 1460
+  mtu: 1400
   ebpfinterfacename: "eth0"  # 指定eBPF程序要挂载的物理网卡（如eth0, ens33, enp0s3等）
   
   # SSL 证书配置
@@ -37,16 +37,24 @@ vpn:
   dtlsport: "443"               # DTLS UDP 端口（与 TCP 保持一致）
   
   # CSTP/DTLS 连接保活配置
-  cstpdpd: 20                    # CSTP 死连接检测间隔（秒，默认：20）
-  cstpkeepalive: 3             # CSTP 保活间隔（秒，默认：3）
+  cstpdpd: 15                  
+  cstpkeepalive: 10                    
+  
+  # VPN 配置文件配置
+  vpnprofilename: "ZVPN"        # VPN 连接名称（显示在客户端连接列表中，默认：ZVPN）
   
   # Cisco 客户端兼容性配置（ocserv 协议参数）
   ciscoclientcompat: true        # 启用 Cisco 客户端兼容模式（支持旧版 AnyConnect 客户端，默认：true）
   dtlslegacy: true               # 启用旧版 DTLS 协议支持（默认：true，OpenConnect 和 AnyConnect 客户端都支持）
   
-  # DNS拦截器和域名动态拆分隧道（DNS拦截器始终启用）
-  dnsport: "53"                 # DNS服务器端口
-  upstreamdns: "114.114.114.114:53"  # 上游DNS服务器（逗号分隔）
+  # 上游DNS服务器配置（用于全局模式下的fallback DNS）
+  upstreamdns: "114.114.114.114:53"  # 上游DNS服务器（逗号分隔，用于全局模式下的fallback DNS）
+  
+  # 本地网络访问控制（类似 AnyLink 的 allow_lan）
+  # 当 allow_lan=true 时，全局模式下会排除本地网络流量，优先级高于全局路由设置
+  # 需要客户端同时开启"Allow Local Lan"选项才能生效
+  # 行为：本地网络流量直接访问本地网络，其他所有流量通过VPN隧道传输
+  allow_lan: true
 
 # ==================== JWT 配置 ====================
 jwt:

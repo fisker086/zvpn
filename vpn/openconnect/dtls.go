@@ -44,61 +44,23 @@ type customLogger struct {
 }
 
 func (c *customLogger) Trace(msg string) {
-	// 总是输出 Trace 日志以便调试
-	log.Printf("DTLS [%s] TRACE: %s", c.scope, msg)
+	// 仅在调试模式下输出 Trace 日志
+	// log.Printf("DTLS [%s] TRACE: %s", c.scope, msg)
 }
 
 func (c *customLogger) Tracef(format string, args ...interface{}) {
-	// 总是输出 Trace 日志以便调试
-	log.Printf("DTLS [%s] TRACE: "+format, append([]interface{}{c.scope}, args...)...)
+	// 仅在调试模式下输出 Trace 日志
+	// log.Printf("DTLS [%s] TRACE: "+format, append([]interface{}{c.scope}, args...)...)
 }
 
 func (c *customLogger) Debug(msg string) {
-	// 总是输出 Debug 日志以便调试
-	log.Printf("DTLS [%s] DEBUG: %s", c.scope, msg)
-	// 如果包含关键信息，额外输出（特别是扩展相关的）
-	msgLower := strings.ToLower(msg)
-	if strings.Contains(msgLower, "handshake") ||
-		strings.Contains(msgLower, "client") ||
-		strings.Contains(msgLower, "error") ||
-		strings.Contains(msgLower, "packet") ||
-		strings.Contains(msgLower, "udp") ||
-		strings.Contains(msgLower, "read") ||
-		strings.Contains(msgLower, "write") ||
-		strings.Contains(msgLower, "received") ||
-		strings.Contains(msgLower, "sent") ||
-		strings.Contains(msgLower, "extension") ||
-		strings.Contains(msgLower, "hello") ||
-		strings.Contains(msgLower, "flight") ||
-		strings.Contains(msgLower, "serverhello") ||
-		strings.Contains(msgLower, "supported") ||
-		strings.Contains(msgLower, "curve") ||
-		strings.Contains(msgLower, "point") ||
-		strings.Contains(msgLower, "format") ||
-		strings.Contains(msgLower, "group") ||
-		strings.Contains(msgLower, "algorithm") ||
-		strings.Contains(msgLower, "signature") {
-		log.Printf("DTLS [%s] DEBUG (KEY): %s", c.scope, msg)
-	}
+	// 仅在调试模式下输出 Debug 日志
+	// log.Printf("DTLS [%s] DEBUG: %s", c.scope, msg)
 }
 
 func (c *customLogger) Debugf(format string, args ...interface{}) {
-	// 总是输出 Debug 日志以便调试
-	msg := fmt.Sprintf(format, args...)
-	log.Printf("DTLS [%s] DEBUG: "+format, append([]interface{}{c.scope}, args...)...)
-	// 如果包含关键信息，额外输出
-	msgLower := strings.ToLower(msg)
-	if strings.Contains(msgLower, "handshake") ||
-		strings.Contains(msgLower, "client") ||
-		strings.Contains(msgLower, "error") ||
-		strings.Contains(msgLower, "packet") ||
-		strings.Contains(msgLower, "udp") ||
-		strings.Contains(msgLower, "connect") ||
-		strings.Contains(msgLower, "extension") ||
-		strings.Contains(msgLower, "hello") ||
-		strings.Contains(msgLower, "flight") {
-		log.Printf("DTLS [%s] DEBUG (KEY): "+format, append([]interface{}{c.scope}, args...)...)
-	}
+	// 仅在调试模式下输出 Debug 日志
+	// log.Printf("DTLS [%s] DEBUG: "+format, append([]interface{}{c.scope}, args...)...)
 }
 
 func (c *customLogger) Info(msg string) {
@@ -358,9 +320,10 @@ func (h *Handler) startRealDTLSServer() error {
 		LoggerFactory:        logf,
 		MTU:                  dtlsMTU,   // 使用配置文件中的 MTU
 		SessionStore:         sessStore, // 使用 session store
-		// 设置握手超时（使用 5 秒）
+		// 设置握手超时（优化为 3 秒，加快连接速度）
+		// 减少超时时间可以加快连接建立，如果握手失败会快速重试
 		ConnectContextMaker: func() (context.Context, func()) {
-			return context.WithTimeout(context.Background(), 5*time.Second)
+			return context.WithTimeout(context.Background(), 3*time.Second)
 		},
 		// 注意：以下选项使用默认值，让 pion/dtls 使用默认配置
 		// - SRTPProtectionProfiles
@@ -582,7 +545,22 @@ func (h *Handler) handleDTLSConnection(conn net.Conn) {
 		n, err := conn.Read(readBuf)
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-				// 超时 - DTLS keepalive 由客户端处理，我们只需要继续
+				// 超时 - 发送 DTLS keepalive 包以保持连接活跃
+				// IMPORTANT: CSTP (TCP) 和 DTLS (UDP) 是分开的，两个互不干涉
+				// - DTLS keepalive: 只通过 DTLS 通道发送（在 DTLS 连接超时时发送）
+				// - TCP keepalive: 只通过 TCP 通道发送（在 protocol.go 的 sendKeepalive 中处理）
+				// - 如果客户端禁用了 UDP (--disable-udp)，DTLS 连接不存在，不会发送 DTLS keepalive
+				// 两个通道独立处理，各自在自己的超时时发送自己的 keepalive
+				if matchedClient != nil {
+					dtlsKeepalive := []byte{PacketTypeKeepalive} // 0x07
+					if _, writeErr := conn.Write(dtlsKeepalive); writeErr != nil {
+						log.Printf("DTLS: 发送 keepalive 失败: %v (连接可能已关闭)", writeErr)
+						// 如果写入失败，连接可能已关闭，退出循环
+						return
+					}
+					log.Printf("DTLS: ✓ 发送 keepalive 包到客户端 %s (VPN IP: %s, Session ID: %s) - DTLS keepalive active",
+						matchedClient.User.Username, matchedClient.IP.String(), sessionID[:16]+"...")
+				}
 				continue
 			}
 
@@ -632,11 +610,18 @@ func (h *Handler) handleDTLSConnection(conn net.Conn) {
 			return
 
 		case PacketTypeDPDReq: // 0x03
-			// DPD-REQ - 死连接检测请求
-			// 发送 DPD-RESP 响应（优化：直接修改第一个字节，避免复制）
-			readBuf[0] = PacketTypeDPDResp
+			// DPD-REQ - 死连接检测请求（从 DTLS 通道收到）
+			// IMPORTANT: CSTP (TCP) 和 DTLS (UDP) 是分开的，两个互不干涉
+			// - 如果从 DTLS 通道收到 DPD-REQ，只通过 DTLS 通道发送 DPD-RESP
+			// - 如果从 TCP 通道收到 DPD-REQ，只通过 TCP 通道发送 DPD-RESP（在 protocol.go 的 processDPDPacket 中处理）
+			// - 如果客户端禁用了 UDP (--disable-udp)，DTLS 连接不存在，不会收到 DTLS 的 DPD-REQ
+			// 两个通道独立处理，各自在自己的通道上发送自己的 DPD 响应
+			readBuf[0] = PacketTypeDPDResp // 0x04
 			if _, err := conn.Write(readBuf[:n]); err != nil {
 				log.Printf("DTLS: 发送 DPD-RESP 失败: %v", err)
+			} else {
+				log.Printf("DTLS: ✓ 发送 DPD-RESP 响应到客户端 %s (VPN IP: %s) - DTLS DPD active",
+					matchedClient.User.Username, matchedClient.IP.String())
 			}
 			continue
 

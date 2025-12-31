@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS user_groups (
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     name VARCHAR(255) NOT NULL UNIQUE,
     description TEXT,
+    allow_lan BOOLEAN DEFAULT FALSE COMMENT '允许本地网络访问（类似 anylink 的 allow_lan 配置）',
     created_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
     updated_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
     deleted_at DATETIME(3) NULL,
@@ -92,8 +93,23 @@ CREATE TABLE IF NOT EXISTS routes (
     metric INT DEFAULT 0,
     created_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
     updated_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+    deleted_at DATETIME(3) NULL,
     FOREIGN KEY (policy_id) REFERENCES policies(id) ON DELETE CASCADE,
-    INDEX idx_policy_id (policy_id)
+    INDEX idx_policy_id (policy_id),
+    INDEX idx_deleted_at (deleted_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 排除路由表（用于全局模式）
+CREATE TABLE IF NOT EXISTS exclude_routes (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    policy_id BIGINT UNSIGNED NOT NULL,
+    network VARCHAR(255) NOT NULL COMMENT 'CIDR格式，例如: 192.168.1.0/24',
+    created_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
+    updated_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+    deleted_at DATETIME(3) NULL,
+    FOREIGN KEY (policy_id) REFERENCES policies(id) ON DELETE CASCADE,
+    INDEX idx_policy_id (policy_id),
+    INDEX idx_deleted_at (deleted_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- 允许的网络表
@@ -203,23 +219,6 @@ CREATE TABLE IF NOT EXISTS audit_logs (
     INDEX idx_hook_id (hook_id),
     INDEX idx_policy_id (policy_id),
     INDEX idx_created_at (created_at),
-    INDEX idx_deleted_at (deleted_at)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-
--- 域名管理表
-CREATE TABLE IF NOT EXISTS domains (
-    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
-    domain VARCHAR(255) NOT NULL UNIQUE,
-    description TEXT,
-    policy_id BIGINT UNSIGNED,
-    manual_ips TEXT,
-    access_count INT DEFAULT 0,
-    created_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
-    updated_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
-    deleted_at DATETIME(3) NULL,
-    FOREIGN KEY (policy_id) REFERENCES policies(id) ON DELETE SET NULL,
-    INDEX idx_domain (domain),
-    INDEX idx_policy_id (policy_id),
     INDEX idx_deleted_at (deleted_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 

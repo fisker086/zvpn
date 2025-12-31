@@ -324,6 +324,11 @@ func (al *AuditLogger) LogHookExecution(ctx *Context, hook Hook, action Action, 
 		protocol = inferApplicationProtocol(protocol, ctx.DstPort)
 	}
 
+	// 根据设置决定是否记录该协议的日志
+	if !ShouldLogProtocol(protocol, ctx.DstPort) {
+		return
+	}
+
 	auditLog := models.AuditLog{
 		UserID:          ctx.UserID,
 		Type:            models.AuditLogTypeHook,

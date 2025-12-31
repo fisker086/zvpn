@@ -21,11 +21,13 @@ func NewGroupHandler(cfg *config.Config) *GroupHandler {
 type CreateGroupRequest struct {
 	Name        string `json:"name" binding:"required"`
 	Description string `json:"description"`
+	AllowLan    *bool  `json:"allow_lan"` // 允许本地网络访问（类似 anylink 的 allow_lan 配置）
 }
 
 type UpdateGroupRequest struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
+	AllowLan    *bool  `json:"allow_lan"` // 允许本地网络访问（类似 anylink 的 allow_lan 配置）
 }
 
 type AssignUsersRequest struct {
@@ -71,6 +73,9 @@ func (h *GroupHandler) CreateGroup(c *gin.Context) {
 		Name:        req.Name,
 		Description: req.Description,
 	}
+	if req.AllowLan != nil {
+		group.AllowLan = *req.AllowLan
+	}
 
 	if err := database.DB.Create(group).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -101,6 +106,9 @@ func (h *GroupHandler) UpdateGroup(c *gin.Context) {
 	}
 	if req.Description != "" {
 		group.Description = req.Description
+	}
+	if req.AllowLan != nil {
+		group.AllowLan = *req.AllowLan
 	}
 
 	if err := database.DB.Save(&group).Error; err != nil {

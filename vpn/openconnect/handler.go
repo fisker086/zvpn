@@ -258,7 +258,7 @@ func (h *Handler) handleConnect(c *gin.Context) {
 	// 获取完整用户信息（包含所有字段，特别是 TunnelMode）
 	// 注意：Preload 只预加载关联关系，所有用户表字段（包括 TunnelMode）都会自动加载
 	var user models.User
-	if err := database.DB.Preload("Groups.Policies.Routes").First(&user, userID).Error; err != nil {
+	if err := database.DB.Preload("Groups.Policies.Routes").Preload("Groups.Policies.ExcludeRoutes").First(&user, userID).Error; err != nil {
 		log.Printf("OpenConnect: Failed to get user info: %v", err)
 		c.AbortWithStatus(http.StatusInternalServerError)
 		return
@@ -337,36 +337,11 @@ func (h *Handler) handleConnect(c *gin.Context) {
 	// 获取DNS服务器配置（从策略中获取，如果没有则使用默认DNS）
 	userDNSServers := getDNSServers(user.GetPolicy())
 
-	// 构建DNS服务器列表，顺序为：
-	// 1. DNS拦截器（用于域名管理功能，走VPN）
-	// 2. 用户配置的DNS（从策略中获取）
+	// 构建DNS服务器列表
+	// 只添加用户配置的DNS（从策略中获取）
 	// 注意：不通过CSTP下发公网DNS，让客户端使用系统默认DNS（不走VPN）
 	// 这样可以避免OpenConnect客户端为公网DNS IP自动添加路由到VPN
 	var dnsServers []string
-
-	// 只添加DNS拦截器作为DNS服务器（用于域名管理功能）
-	if h.vpnServer != nil && h.vpnServer.GetDNSInterceptor() != nil {
-		var dnsInterceptorIP string
-		if tunDevice := h.vpnServer.GetTUNDevice(); tunDevice != nil {
-			if tunIP, err := tunDevice.GetIP(); err == nil {
-				dnsInterceptorIP = tunIP.String()
-			}
-		}
-
-		if dnsInterceptorIP == "" {
-			_, ipNet, err := net.ParseCIDR(h.config.VPN.Network)
-			if err == nil {
-				gatewayIP := make(net.IP, len(ipNet.IP))
-				copy(gatewayIP, ipNet.IP)
-				gatewayIP[len(gatewayIP)-1] = 1
-				dnsInterceptorIP = gatewayIP.String()
-			}
-		}
-
-		if dnsInterceptorIP != "" {
-			dnsServers = append(dnsServers, dnsInterceptorIP)
-		}
-	}
 
 	if len(userDNSServers) > 0 {
 		dnsServers = append(dnsServers, userDNSServers...)
@@ -544,25 +519,150 @@ func (h *Handler) handleConnect(c *gin.Context) {
 	}
 
 	// 清理工作
-	log.Printf("OpenConnect: Tunnel closed for user %s", user.Username)
+	tunnelMode := getUserTunnelMode(&user)
+	log.Printf("OpenConnect: Tunnel closed for user %s (VPN IP: %s, Tunnel Mode: %s)",
+		user.Username, user.VPNIP, tunnelMode)
+
+	// CRITICAL: 在断开连接前，先发送 DISCONNECT 包给客户端
+	// 这样客户端可以收到明确的断开信号，并清理路由表（特别是全局模式下的默认路由）
+	// 这对于全局模式特别重要，因为客户端需要删除默认路由才能恢复网络访问
+	// 注意：必须在关闭 WriteLoop 之前发送，通过 WriteChan 发送更可靠
+	client, exists := h.vpnServer.GetClient(user.ID)
+	disconnectSent := false
+	if exists && client != nil {
+		// 通过 WriteChan 发送 DISCONNECT 包，这样更可靠（WriteLoop 会处理）
+		// 构建 DISCONNECT 包（使用 BuildCSTPPacket 确保格式正确）
+		disconnectPacket := tunnelClient.BuildCSTPPacket(PacketTypeDisconnect, nil)
+
+		// 发送 DISCONNECT 包到 WriteChan（非阻塞）
+		select {
+		case client.WriteChan <- disconnectPacket:
+			disconnectSent = true
+			if tunnelMode == "full" {
+				log.Printf("OpenConnect: DISCONNECT packet queued for client %s (full tunnel mode), waiting for route cleanup", user.Username)
+				// CRITICAL: 全局模式下，VPN断开后不应该影响客户端本地网络访问
+				// 需要确保客户端有足够时间清理路由表（删除默认路由），恢复原始网络配置
+				// 1. WriteLoop 处理 DISCONNECT 包并发送到客户端（至少 200ms）
+				time.Sleep(200 * time.Millisecond)
+				// 2. 客户端接收 DISCONNECT 包并处理断开信号（至少 500ms）
+				time.Sleep(500 * time.Millisecond)
+				// 3. 客户端清理路由表（删除默认路由）和恢复原始路由（至少 2 秒）
+				// 这是最关键的一步，需要足够的时间确保路由被正确清理
+				time.Sleep(2000 * time.Millisecond)
+			} else {
+				log.Printf("OpenConnect: DISCONNECT packet queued for client %s", user.Username)
+				// 分隧道模式也需要等待 WriteLoop 处理完 DISCONNECT 包
+				time.Sleep(100 * time.Millisecond)
+				// 分隧道模式不需要清理默认路由，所以等待时间可以短一些
+				time.Sleep(200 * time.Millisecond)
+			}
+		default:
+			// WriteChan 已满或已关闭，尝试直接发送
+			log.Printf("OpenConnect: WriteChan unavailable, sending DISCONNECT packet directly")
+			if conn != nil {
+				if tcpConn, ok := conn.(*net.TCPConn); ok {
+					tcpConn.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
+					if err := tunnelClient.sendPacket(PacketTypeDisconnect, nil); err != nil {
+						log.Printf("OpenConnect: Failed to send DISCONNECT packet directly: %v", err)
+					} else {
+						disconnectSent = true
+						if tunnelMode == "full" {
+							log.Printf("OpenConnect: DISCONNECT packet sent directly to client %s (full tunnel mode), waiting for route cleanup", user.Username)
+							// CRITICAL: 全局模式下，确保客户端有足够时间清理路由表
+							// 直接发送成功，等待客户端处理断开信号和清理路由（至少 2.5 秒）
+							time.Sleep(2500 * time.Millisecond)
+						} else {
+							time.Sleep(200 * time.Millisecond)
+						}
+					}
+					tcpConn.SetWriteDeadline(time.Time{})
+				} else {
+					if err := tunnelClient.sendPacket(PacketTypeDisconnect, nil); err != nil {
+						log.Printf("OpenConnect: Failed to send DISCONNECT packet: %v", err)
+					} else {
+						disconnectSent = true
+						if tunnelMode == "full" {
+							log.Printf("OpenConnect: DISCONNECT packet sent directly to client %s (full tunnel mode), waiting for route cleanup", user.Username)
+							// CRITICAL: 全局模式下，确保客户端有足够时间清理路由表
+							time.Sleep(2500 * time.Millisecond)
+						} else {
+							time.Sleep(200 * time.Millisecond)
+						}
+					}
+				}
+			}
+		}
+	} else {
+		log.Printf("OpenConnect: Cannot send DISCONNECT packet - client not available")
+	}
+
+	// CRITICAL: 全局模式下，VPN断开后不应该影响客户端本地网络访问和公网访问
+	// 由于我们在全局模式下已经通过 split-exclude 排除了本地网络路由（私有IP段），
+	// 客户端在断开时只需要清理默认路由，本地网络和公网访问应该不受影响
+	// 如果 DISCONNECT 包已发送，在关闭连接前再等待一段时间，确保客户端有足够时间处理
+	if disconnectSent && tunnelMode == "full" {
+		log.Printf("OpenConnect: Additional wait for full tunnel mode client %s to complete route cleanup", user.Username)
+		log.Printf("OpenConnect: Note: Local network routes were already excluded via split-exclude (private IP ranges), so local access should not be affected")
+		// 额外等待 1 秒，确保客户端已经完全恢复原始网络配置
+		time.Sleep(1000 * time.Millisecond)
+	}
+
+	// CRITICAL: 全局模式下，VPN断开后不应该影响客户端本地网络访问和公网访问
+	// 我们已经：
+	// 1. 通过 split-exclude 排除了本地网络路由（10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 等）
+	// 2. 发送了 DISCONNECT 包并等待足够的时间（总计约 3.7 秒），确保客户端有足够时间：
+	//    - 接收 DISCONNECT 包
+	//    - 处理断开信号
+	//    - 清理路由表（删除默认路由）
+	//    - 恢复原始路由和DNS配置
+	// 由于本地网络路由已经被排除，客户端断开时只需要清理默认路由，
+	// 本地网络和公网访问应该不受影响
+	if tunnelMode == "full" {
+		if disconnectSent {
+			log.Printf("OpenConnect: DISCONNECT packet sent to client %s (full tunnel mode), waited ~3.7s for route cleanup", user.Username)
+			log.Printf("OpenConnect: Local network routes were excluded via split-exclude, so local and public internet access should not be affected")
+			log.Printf("OpenConnect: Client should have cleaned up default route and restored network access")
+		} else {
+			log.Printf("OpenConnect: WARNING - Failed to send DISCONNECT packet to client %s (full tunnel mode)", user.Username)
+			log.Printf("OpenConnect: Client may not clean up default route automatically")
+			log.Printf("OpenConnect: However, local network routes were excluded via split-exclude, so local access should still work")
+			log.Printf("OpenConnect: If client cannot access public internet after disconnect, check route table and remove VPN routes manually if needed")
+			log.Printf("OpenConnect: Linux: 'ip route del default via <VPN网关IP>' or 'route del default gw <VPN网关IP>'")
+			log.Printf("OpenConnect: macOS: 'route delete default <VPN网关IP>'")
+			log.Printf("OpenConnect: Windows: 'route delete 0.0.0.0 mask 0.0.0.0 <VPN网关IP>'")
+		}
+	}
 
 	// CRITICAL: Stop WriteLoop before closing connection to prevent RST packets
 	// This ensures graceful connection shutdown:
 	// 1. Stop WriteLoop goroutine first (signal via WriteClose channel)
-	// 2. Wait a moment for WriteLoop to finish any pending writes
+	// 2. Wait a moment for WriteLoop to finish any pending writes (especially DISCONNECT packet)
 	// 3. Properly close TLS session if it's a TLS connection (send close_notify)
 	// 4. Then close the connection
 	// This prevents the scenario where:
 	// - Connection is closed (FIN sent)
 	// - Client sends data after receiving FIN
 	// - Server sends RST because connection is already closed
-	client, exists := h.vpnServer.GetClient(user.ID)
+	// 注意：client 和 exists 已经在上面声明过了，这里直接使用
 	if exists && client != nil {
 		// Signal WriteLoop to stop
 		select {
 		case <-client.WriteClose:
 			// Already closed
 		default:
+			// CRITICAL: 在关闭 WriteClose 之前，确保 DISCONNECT 包已经被 WriteLoop 处理完
+			// 对于全局模式，这是确保客户端能够恢复本地网络访问的关键步骤
+			if disconnectSent {
+				if tunnelMode == "full" {
+					// 全局模式：再等待 500ms，确保 WriteLoop 已经处理完 DISCONNECT 包
+					// 这是最后一道保障，确保 DISCONNECT 包已经被发送到客户端
+					log.Printf("OpenConnect: Final wait before closing WriteLoop for full tunnel mode client %s", user.Username)
+					time.Sleep(500 * time.Millisecond)
+				} else {
+					// 分隧道模式：等待 100ms
+					time.Sleep(100 * time.Millisecond)
+				}
+			}
 			close(client.WriteClose)
 			// Give WriteLoop a moment to finish any pending writes
 			// This prevents RST packets when connection closes
@@ -659,30 +759,38 @@ func (h *Handler) sendCSTPConfig(conn net.Conn, user *models.User, dnsServers []
 	// 获取用户的隧道模式
 	tunnelMode := getUserTunnelMode(user)
 
-	// 判断是否应该让所有DNS查询走VPN（智能DNS路由）
-	hasDNSInterceptor := h.vpnServer != nil && h.vpnServer.GetDNSInterceptor() != nil
-	tunnelAllDNS := shouldTunnelAllDNS(tunnelMode, hasDNSInterceptor)
+	// 注意：全局模式下总是排除私有IP（类似 AnyLink），不依赖 AllowLan 配置
+	// 分隧道模式下，AllowLan 配置保留用于未来扩展（当前分隧道模式本身就不路由本地网络）
 
-	if tunnelMode == "full" {
-		log.Printf("OpenConnect: Full tunnel mode - All DNS queries will go through VPN (Tunnel-All-DNS=true)")
-	} else if hasDNSInterceptor {
-		log.Printf("OpenConnect: Smart DNS routing - DNS interceptor enabled, Tunnel-All-DNS=false, DNS interceptor (VPN gateway) will go through VPN via split-include route, public DNS will use direct connection")
+	// 判断是否应该让所有DNS查询走VPN（智能DNS路由）
+	tunnelAllDNS := shouldTunnelAllDNS(tunnelMode)
+
+	if tunnelAllDNS {
+		log.Printf("OpenConnect: Tunnel-All-DNS=true - All DNS queries will go through VPN tunnel")
 	} else {
-		log.Printf("OpenConnect: Smart DNS routing - DNS interceptor disabled, all DNS queries will use direct connection")
+		log.Printf("OpenConnect: Tunnel-All-DNS=false - DNS queries will use direct connection")
 	}
 
 	// 构建CSTP响应头
+	// 参考 anylink 的实现，确保响应格式符合 AnyConnect 标准
 	// 这是服务端和客户端的协商过程：
 	// 1. 服务端通过 HTTP header 发送配置参数（DPD、Keepalive 等）
 	// 2. 客户端自动接收并使用这些参数
 	// 3. 客户端无需手动配置，协议会自动处理 keep-alive 机制
 	response := "HTTP/1.1 200 OK\r\n"
 	response += "Content-Type: application/octet-stream\r\n"
+	// 参考 anylink：确保 Connection: keep-alive 头部正确设置
+	// 这对于 AnyConnect 客户端的长连接至关重要
+	response += "Connection: keep-alive\r\n"
 
 	// 获取主机名（用于 X-CSTP-Hostname）
-	hostname, _ := os.Hostname()
+	// 优先使用配置的 VPN 配置名称，如果没有则使用系统主机名
+	hostname := h.config.VPN.VPNProfileName
 	if hostname == "" {
-		hostname = "zvpn"
+		hostname, _ = os.Hostname()
+		if hostname == "" {
+			hostname = "zvpn"
+		}
 	}
 
 	// 获取客户端请求的 header
@@ -740,10 +848,10 @@ func (h *Handler) sendCSTPConfig(conn net.Conn, user *models.User, dnsServers []
 	response += "X-CSTP-Session-Timeout: none\r\n"   // 会话超时：无限制
 	response += "X-CSTP-Session-Timeout-Alert-Interval: 60\r\n"
 	response += "X-CSTP-Session-Timeout-Remaining: none\r\n"
-	response += "X-CSTP-Idle-Timeout: 0\r\n"             // 空闲超时：0 表示禁用
+	response += "X-CSTP-Idle-Timeout: 18000\r\n"         // 空闲超时：5小时（与 anylink 保持一致）
 	response += "X-CSTP-Disconnected-Timeout: 18000\r\n" // 断开超时：5小时
 	response += "X-CSTP-Keep: true\r\n"                  // 保持连接
-	response += "X-CSTP-Rekey-Time: 86400\r\n"           // 重密钥时间：24小时
+	response += "X-CSTP-Rekey-Time: 172800\r\n"          // 重密钥时间：48小时（与 anylink 保持一致）
 	response += "X-CSTP-Rekey-Method: new-tunnel\r\n"    // 重密钥方法：新建隧道
 	response += "X-CSTP-MSIE-Proxy-Lockdown: true\r\n"
 	response += "X-CSTP-Smartcard-Removal-Disconnect: true\r\n"
@@ -751,7 +859,7 @@ func (h *Handler) sendCSTPConfig(conn net.Conn, user *models.User, dnsServers []
 	response += "X-CSTP-Routing-Filtering-Ignore: false\r\n"
 	response += "X-CSTP-Quarantine: false\r\n"
 	response += "X-CSTP-Disable-Always-On-VPN: false\r\n"
-	response += "X-CSTP-Client-Bypass-Protocol: true\r\n"
+	response += "X-CSTP-Client-Bypass-Protocol: false\r\n"
 	response += "X-CSTP-TCP-Keepalive: false\r\n"
 	if tunnelAllDNS {
 		response += "X-CSTP-Tunnel-All-DNS: true\r\n"
@@ -762,6 +870,36 @@ func (h *Handler) sendCSTPConfig(conn net.Conn, user *models.User, dnsServers []
 	// 根据用户的隧道模式设置（tunnelMode 已在上面声明）
 	if tunnelMode == "full" {
 		response += "X-CSTP-Tunnel-All-Networks: true\r\n" // 全局模式：所有流量走 VPN
+
+		// 根据配置决定是否排除本地网络（类似 AnyLink 的 allow_lan）
+		// allow_lan 设置优先于全局路由模式，会覆盖全局路由设置对本地网络的影响
+		// 当 allow_lan=true 时，排除本地网络流量，需要客户端同时开启"Allow Local Lan"选项
+		excludeRouteMap := make(map[string]bool) // 用于去重排除路由
+		if h.config.VPN.AllowLan {
+			// 添加 AnyLink 风格的排除规则（0.0.0.0/255.255.255.255）
+			// 这个规则会覆盖全局路由设置对本地网络的影响，告诉客户端排除本地网络
+			// 需要客户端同时开启 "Allow Local Lan" 选项才能生效
+			response += "X-CSTP-Split-Exclude: 0.0.0.0/255.255.255.255\r\n"
+			excludeRouteMap["0.0.0.0/255.255.255.255"] = true
+			log.Printf("OpenConnect: Full tunnel mode with allow_lan=true - Added AnyLink-style exclude rule (0.0.0.0/255.255.255.255), requires client to enable 'Allow Local Lan' option")
+			log.Printf("OpenConnect: Local network traffic bypasses VPN, all other traffic goes through VPN tunnel")
+		} else {
+			log.Printf("OpenConnect: Full tunnel mode with allow_lan=false - All traffic goes through VPN (no local network exclusion)")
+		}
+
+		// 添加策略中配置的自定义排除路由（用于全局模式）
+		// 这些路由是用户自定义的，用于排除特定的网段不走VPN
+		userPolicy := user.GetPolicy()
+		if userPolicy != nil && len(userPolicy.ExcludeRoutes) > 0 {
+			for _, excludeRoute := range userPolicy.ExcludeRoutes {
+				// 去重：避免重复添加相同的排除路由
+				if !excludeRouteMap[excludeRoute.Network] {
+					response += "X-CSTP-Split-Exclude: " + excludeRoute.Network + "\r\n"
+					excludeRouteMap[excludeRoute.Network] = true
+				}
+			}
+			log.Printf("OpenConnect: Full tunnel mode - Added %d custom exclude routes from policy", len(userPolicy.ExcludeRoutes))
+		}
 	} else {
 		response += "X-CSTP-Tunnel-All-Networks: false\r\n" // 分隧道模式：只路由特定网段
 	}
@@ -834,7 +972,7 @@ func (h *Handler) sendCSTPConfig(conn net.Conn, user *models.User, dnsServers []
 		response += "X-DTLS-MTU: " + strconv.Itoa(h.config.VPN.MTU) + "\r\n" // DTLS MTU（与CSTP MTU相同）
 		response += "X-DTLS-DPD: " + dtlsDPD + "\r\n"
 		response += "X-DTLS-Keepalive: " + dtlsKeepalive + "\r\n"
-		response += "X-DTLS-Rekey-Time: 86400\r\n"                        // DTLS 重密钥时间：24小时
+		response += "X-DTLS-Rekey-Time: 5400\r\n"                         // DTLS 重密钥时间：1.5小时（与 anylink 保持一致）
 		response += "X-DTLS-Rekey-Method: new-tunnel\r\n"                 // DTLS 重密钥方法：新建隧道
 		response += "X-DTLS-CipherSuite: " + cipherSuiteHeader + "\r\n"   // DTLS 1.0/1.2 通用（单个短名称）
 		response += "X-DTLS12-CipherSuite: " + cipherSuiteHeader + "\r\n" // DTLS 1.2 专用（单个短名称）- 注意：必须使用连字符
@@ -953,7 +1091,7 @@ func (h *Handler) ConnectMiddleware(c *gin.Context) {
 
 	// 获取完整用户信息（包含策略）并存储到上下文中
 	var user models.User
-	if err := database.DB.Preload("Groups.Policies.Routes").First(&user, userID).Error; err != nil {
+	if err := database.DB.Preload("Groups.Policies.Routes").Preload("Groups.Policies.ExcludeRoutes").First(&user, userID).Error; err != nil {
 		log.Printf("OpenConnect: Failed to get user info: %v", err)
 		c.AbortWithStatus(http.StatusInternalServerError)
 		return
@@ -1214,18 +1352,13 @@ func (h *Handler) SendDTLSPacket(vpnIP string, packetType byte, data []byte) err
 // GET / 返回 HTML（用于浏览器访问）
 // OpenConnect/AnyConnect 客户端使用 POST / 获取 XML 配置
 func (h *Handler) Index(c *gin.Context) {
-	// 检查 Connection: close 和 User-Agent
-	// 如果是 anyconnect/openconnect 客户端且 Connection 是 close，拒绝连接
-	connection := strings.ToLower(c.GetHeader("Connection"))
-	userAgent := strings.ToLower(c.GetHeader("User-Agent"))
-	if connection == "close" && (strings.Contains(userAgent, "anyconnect") || strings.Contains(userAgent, "openconnect")) {
-		c.Header("Connection", "close")
-		c.AbortWithStatus(http.StatusBadRequest)
-		return
-	}
+	// 注意：connectHandler 已经处理了 Connection header
+	// 对于 VPN 客户端，即使发送了 Connection: close，也会被强制设置为 keep-alive
+	// 这里不再需要检查，因为 connectHandler 已经确保 VPN 客户端使用 keep-alive
 
 	// 检查 Accept 头，如果明确请求 XML，返回 XML 配置
 	accept := c.GetHeader("Accept")
+	userAgent := strings.ToLower(c.GetHeader("User-Agent"))
 	isXMLRequest := strings.Contains(accept, "text/xml") ||
 		strings.Contains(accept, "application/xml") ||
 		strings.Contains(userAgent, "anyconnect") ||
