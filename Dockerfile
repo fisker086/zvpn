@@ -13,13 +13,6 @@ FROM rockylinux:9 AS builder
 # 设置非交互式安装
 ENV DNF_FRONTEND=noninteractive
 
-# 替换为阿里云镜像源加速下载
-RUN sed -e 's|^mirrorlist=|#mirrorlist=|g' \
-         -e 's|^#baseurl=http://dl.rockylinux.org/$contentdir|baseurl=https://mirrors.aliyun.com/rockylinux|g' \
-         -e 's|^baseurl=http://dl.rockylinux.org/$contentdir|baseurl=https://mirrors.aliyun.com/rockylinux|g' \
-         -i /etc/yum.repos.d/rocky*.repo && \
-    sed -i 's|/pub/rocky/|/|g' /etc/yum.repos.d/rocky*.repo
-
 # 启用 CRB 仓库并安装基础依赖（包括 Go）
 RUN dnf install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
         dnf-plugins-core && \
@@ -37,13 +30,6 @@ RUN dnf install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
     go version && \
     dnf clean all && \
     rm -rf /var/cache/dnf /tmp/* /var/tmp/*
-
-# Go 代理设置（使用阿里云代理，更稳定且证书可靠）
-# GOSUMDB 使用官方 sum.golang.org（证书更可靠）
-ENV GOPROXY=https://mirrors.aliyun.com/goproxy/,direct \
-        GOSUMDB=sum.golang.org \
-        SSL_CERT_DIR=/etc/pki/ca-trust/extracted/pem \
-        SSL_CERT_FILE=/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem
 
 WORKDIR /app
 COPY go.mod go.sum ./
@@ -126,13 +112,6 @@ FROM rockylinux:9
 
 # 设置非交互式安装
 ENV DNF_FRONTEND=noninteractive
-
-# 替换为阿里云镜像源加速下载
-RUN sed -e 's|^mirrorlist=|#mirrorlist=|g' \
-         -e 's|^#baseurl=http://dl.rockylinux.org/$contentdir|baseurl=https://mirrors.aliyun.com/rockylinux|g' \
-         -e 's|^baseurl=http://dl.rockylinux.org/$contentdir|baseurl=https://mirrors.aliyun.com/rockylinux|g' \
-         -i /etc/yum.repos.d/rocky*.repo && \
-    sed -i 's|/pub/rocky/|/|g' /etc/yum.repos.d/rocky*.repo
 
 RUN dnf install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
         ca-certificates \
