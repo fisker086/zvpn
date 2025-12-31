@@ -13,8 +13,8 @@
 #### 1. 克隆项目
 
 ```bash
-git clone 
-cd zvpn-backend
+git clone https://github.com/fisker086/zvpn.git
+cd zvpn
 ```
 
 #### 2. 配置环境变量
@@ -38,7 +38,7 @@ JWT_SECRET=your-random-secret-key
 
 ```bash
 # 使用内置 MySQL
-docker-compose up --build -d
+docker-compose up -d
 
 # 或使用外部数据库
 docker-compose -f docker-compose.without-db.yml up -d

@@ -1,8 +1,6 @@
 services:
   zvpn:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ghcr.nju.edu.cn/fisker086/zvpn:latest
     container_name: zvpn-backend
     restart: unless-stopped
     # 如需 host 网络（仅 Linux），可改为 network_mode: host 并移除 ports
