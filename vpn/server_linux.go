@@ -328,16 +328,9 @@ func (s *VPNServer) processPacket(packet []byte, serverVPNIP net.IP, ipNet *net.
 	// Case 5: Packet from VPN client to external network
 	if ipNet.Contains(srcIP) && !ipNet.Contains(dstIP) {
 		if source != nil {
-			// TUN: write back for kernel routing
-			LogPacketAlways("%s: Warning: VPN client %s accessing external %s via %s (should route via eth0)",
-				sourceName, srcIP.String(), dstIP.String(), sourceName)
 			if _, err := source.Write(packet); err != nil {
 				LogPacketAlways("%s: Failed to write packet back to %s for external routing: %v", sourceName, sourceName, err)
 			}
-		} else {
-			// AF_XDP: this shouldn't happen, log and ignore
-			LogPacketAlways("%s: Warning: VPN client %s to external %s via %s (should come through OpenConnect)",
-				sourceName, srcIP.String(), dstIP.String(), sourceName)
 		}
 		return
 	}
