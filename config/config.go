@@ -141,6 +141,8 @@ func Load() *Config {
 
 	// 环境变量映射
 	viper.BindEnv("vpn.network", "VPN_NETWORK")
+        viper.BindEnv("vpn.certfile", "VPN_CERT")
+	viper.BindEnv("vpn.keyfile", "VPN_KEY")
 	viper.BindEnv("vpn.ebpfinterfacename", "VPN_EBPF_INTERFACE")
 	viper.BindEnv("vpn.enableafxdp", "VPN_ENABLE_AFXDP")
 	viper.BindEnv("vpn.afxdpqueueid", "VPN_AFXDP_QUEUE_ID")

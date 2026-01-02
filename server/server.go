@@ -64,21 +64,37 @@ func (cm *certManager) LoadDefaultCert(certFile, keyFile string) error {
 	cm.defaultCert = &cert
 	cm.mu.Unlock()
 
-	log.Printf("Certificate Manager: Loaded default certificate from %s, %s", certFile, keyFile)
-	if cert.Leaf != nil {
-		// 记录详细的证书信息，包括颁发者信息（用于诊断证书验证问题）
-		issuer := cert.Leaf.Issuer.String()
-		log.Printf("Certificate Manager: Default cert CN: %s, DNS Names: %v", cert.Leaf.Subject.CommonName, cert.Leaf.DNSNames)
-		log.Printf("Certificate Manager: Certificate Issuer: %s", issuer)
+	// 验证证书链是否正确加载
+	if len(cert.Certificate) < 1 {
+		return fmt.Errorf("certificate chain is empty")
+	}
 
-		// 检查是否是开发证书（mkcert 或其他自签名证书）
-		if strings.Contains(issuer, "mkcert") ||
-			strings.Contains(issuer, "development") ||
-			strings.Contains(issuer, "self-signed") ||
-			cert.Leaf.Issuer.String() == cert.Leaf.Subject.String() {
-			log.Printf("Certificate Manager: WARNING - This appears to be a development/self-signed certificate")
-			log.Printf("Certificate Manager: Clients may need to accept the certificate or install the CA certificate")
-			log.Printf("Certificate Manager: For OpenConnect clients, use: --servercert=pin-sha256:<hash>")
+	// 记录证书链信息（用于调试）
+	log.Printf("Certificate Manager: Certificate chain loaded - Server cert: %d bytes, Chain length: %d",
+		len(cert.Certificate[0]), len(cert.Certificate))
+	if len(cert.Certificate) > 1 {
+		log.Printf("Certificate Manager: Intermediate cert: %d bytes", len(cert.Certificate[1]))
+	}
+
+	// 参考 anylink：简单记录，不做严格检查
+	log.Printf("Certificate Manager: Loaded default certificate from %s, %s", certFile, keyFile)
+	log.Printf("Certificate Manager: Certificate chain contains %d certificate(s)", len(cert.Certificate))
+	if cert.Leaf != nil {
+		log.Printf("Certificate Manager: Server cert CN: %s", cert.Leaf.Subject.CommonName)
+		log.Printf("Certificate Manager: Certificate DNS Names: %v", cert.Leaf.DNSNames)
+
+		// 检查证书有效期
+		now := time.Now()
+		daysUntilExpiry := int(cert.Leaf.NotAfter.Sub(now).Hours() / 24)
+		log.Printf("Certificate Manager: Certificate valid until: %s (%d days remaining)",
+			cert.Leaf.NotAfter.Format("2006-01-02 15:04:05"), daysUntilExpiry)
+
+		if daysUntilExpiry < 0 {
+			log.Printf("Certificate Manager: ⚠️  FATAL - Certificate has EXPIRED! TLS connections will fail.")
+		} else if daysUntilExpiry <= 7 {
+			log.Printf("Certificate Manager: ⚠️  WARNING - Certificate expires in %d days - renew immediately!", daysUntilExpiry)
+		} else if daysUntilExpiry <= 30 {
+			log.Printf("Certificate Manager: ⚠️  WARNING - Certificate expires in %d days - plan renewal soon", daysUntilExpiry)
 		}
 	}
 
@@ -114,90 +130,118 @@ func (cm *certManager) AddCert(sni string, certFile, keyFile string) error {
 	return nil
 }
 
+// matchDomain 检查域名是否匹配证书的 DNS Names（支持通配符和多域名）
+func matchDomain(domain string, cert *tls.Certificate) bool {
+	if cert == nil || cert.Leaf == nil {
+		return false
+	}
+
+	domain = strings.ToLower(domain)
+
+	// 检查 CN（Common Name）
+	if cert.Leaf.Subject.CommonName != "" {
+		cn := strings.ToLower(cert.Leaf.Subject.CommonName)
+		if cn == domain {
+			return true
+		}
+		// 支持通配符 CN（如 *.example.com）
+		if strings.HasPrefix(cn, "*.") {
+			wildcardDomain := cn[2:]
+			if strings.HasSuffix(domain, "."+wildcardDomain) || domain == wildcardDomain {
+				return true
+			}
+		}
+	}
+
+	// 检查 DNS Names（Subject Alternative Name）
+	for _, dnsName := range cert.Leaf.DNSNames {
+		dnsNameLower := strings.ToLower(dnsName)
+		if dnsNameLower == domain {
+			return true
+		}
+		// 支持通配符 DNS Name（如 *.example.com）
+		if strings.HasPrefix(dnsNameLower, "*.") {
+			wildcardDomain := dnsNameLower[2:]
+			if strings.HasSuffix(domain, "."+wildcardDomain) || domain == wildcardDomain {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
 // GetCertificateBySNI 根据 SNI 获取证书（用于 TLS GetCertificate 回调）
-// 参考 anylink 的 GetCertificateBySNI 实现
+// 支持通配符和多域名证书匹配
 func (cm *certManager) GetCertificateBySNI(chi *tls.ClientHelloInfo) (*tls.Certificate, error) {
 	cm.mu.RLock()
 	defer cm.mu.RUnlock()
 
-	// 如果客户端提供了 SNI，尝试匹配
+	var cert *tls.Certificate
+
+	// 如果提供了 SNI，尝试匹配
 	if chi.ServerName != "" {
 		sni := strings.ToLower(chi.ServerName)
-		if cert, ok := cm.certs[sni]; ok {
-			if cert == nil {
-				// 错误情况：总是记录
-				log.Printf("Certificate Manager: ERROR - Certificate for SNI '%s' is nil!", chi.ServerName)
-				// 继续尝试使用默认证书
-			} else {
-				// 匹配成功：只在第一次记录
-				cm.loggedSNIsMu.RLock()
-				alreadyLogged := cm.loggedSNIs[sni]
-				cm.loggedSNIsMu.RUnlock()
-				if !alreadyLogged {
-					log.Printf("Certificate Manager: Matched SNI '%s' to specific certificate", chi.ServerName)
-					cm.loggedSNIsMu.Lock()
-					cm.loggedSNIs[sni] = true
-					cm.loggedSNIsMu.Unlock()
-				}
-				return cert, nil
-			}
-		}
 
-		// 如果没有精确匹配，尝试匹配通配符域名
-		// 例如：*.example.com 匹配 www.example.com
-		for sniKey, cert := range cm.certs {
-			if strings.HasPrefix(sniKey, "*.") {
-				domain := sniKey[2:] // 移除 "*."
-				if strings.HasSuffix(sni, "."+domain) || sni == domain {
-					if cert == nil {
-						log.Printf("Certificate Manager: ERROR - Wildcard certificate for '%s' is nil!", sniKey)
-						continue
+		// 1. 精确匹配 SNI 配置的证书
+		if c, ok := cm.certs[sni]; ok && c != nil {
+			cert = c
+		} else {
+			// 2. 尝试匹配通配符配置的证书（如 *.example.com）
+			for sniKey, c := range cm.certs {
+				if strings.HasPrefix(sniKey, "*.") {
+					domain := sniKey[2:]
+					if strings.HasSuffix(sni, "."+domain) || sni == domain {
+						if c != nil {
+							cert = c
+							break
+						}
 					}
-					// 匹配成功：只在第一次记录
-					cm.loggedSNIsMu.RLock()
-					alreadyLogged := cm.loggedSNIs[sni]
-					cm.loggedSNIsMu.RUnlock()
-					if !alreadyLogged {
-						log.Printf("Certificate Manager: Matched SNI '%s' to wildcard certificate '%s'", chi.ServerName, sniKey)
-						cm.loggedSNIsMu.Lock()
-						cm.loggedSNIs[sni] = true
-						cm.loggedSNIsMu.Unlock()
-					}
-					return cert, nil
 				}
 			}
 		}
 
-		// 没有找到匹配的SNI证书，使用默认证书（只在第一次记录）
-		cm.loggedSNIsMu.RLock()
-		alreadyLogged := cm.loggedSNIs[sni]
-		cm.loggedSNIsMu.RUnlock()
-		if !alreadyLogged {
-			log.Printf("Certificate Manager: No specific certificate found for SNI '%s', using default", chi.ServerName)
-			cm.loggedSNIsMu.Lock()
-			cm.loggedSNIs[sni] = true
-			cm.loggedSNIsMu.Unlock()
+		// 3. 如果还没有找到，检查默认证书是否匹配域名
+		if cert == nil && cm.defaultCert != nil {
+			if matchDomain(sni, cm.defaultCert) {
+				cert = cm.defaultCert
+			}
 		}
-	} else {
-		// 客户端没有提供SNI（只在第一次记录）
-		cm.loggedSNIsMu.RLock()
-		alreadyLogged := cm.loggedSNIs[""]
-		cm.loggedSNIsMu.RUnlock()
-		if !alreadyLogged {
-			log.Printf("Certificate Manager: Client did not provide SNI, using default certificate")
-			cm.loggedSNIsMu.Lock()
-			cm.loggedSNIs[""] = true
-			cm.loggedSNIsMu.Unlock()
+
+		// 4. 检查所有已配置的证书，看是否有匹配的（支持通配符和多域名）
+		if cert == nil {
+			for _, c := range cm.certs {
+				if matchDomain(sni, c) {
+					cert = c
+					break
+				}
+			}
 		}
 	}
 
-	// 如果没有匹配的证书，使用默认证书
-	if cm.defaultCert == nil {
-		log.Printf("Certificate Manager: ERROR - Default certificate is nil! TLS handshake will fail.")
-		return nil, fmt.Errorf("no certificate available for SNI '%s' and no default certificate configured", chi.ServerName)
+	// 如果没有找到匹配的证书，使用默认证书
+	if cert == nil {
+		cert = cm.defaultCert
 	}
 
-	return cm.defaultCert, nil
+	// 如果证书为 nil，返回错误（这不应该发生，因为启动时已经验证过）
+	if cert == nil {
+		return nil, fmt.Errorf("no certificate available")
+	}
+
+	// 深拷贝证书以避免并发问题
+	// Go 的 TLS 库要求 GetCertificate 返回的证书是只读的
+	certCopy := &tls.Certificate{
+		Certificate: make([][]byte, len(cert.Certificate)),
+		PrivateKey:  cert.PrivateKey,
+		Leaf:        cert.Leaf,
+	}
+	for i, certBytes := range cert.Certificate {
+		certCopy.Certificate[i] = make([]byte, len(certBytes))
+		copy(certCopy.Certificate[i], certBytes)
+	}
+
+	return certCopy, nil
 }
 
 // keepAliveResponseWriter 包装 http.ResponseWriter，强制设置 Connection: keep-alive
@@ -320,8 +364,11 @@ func New(cfg *config.Config, vpnServer *vpn.VPNServer) *Server {
 
 	// 加载默认证书
 	if err := server.certManager.LoadDefaultCert(cfg.VPN.CertFile, cfg.VPN.KeyFile); err != nil {
-		log.Printf("Warning: Failed to load default certificate: %v", err)
-		log.Printf("Server will start but TLS connections may fail")
+		log.Printf("ERROR: Failed to load default certificate: %v", err)
+		log.Printf("ERROR: Certificate file: %s, Key file: %s", cfg.VPN.CertFile, cfg.VPN.KeyFile)
+		log.Printf("ERROR: Server will start but TLS connections will fail")
+	} else {
+		log.Printf("Certificate Manager: Successfully loaded default certificate")
 	}
 
 	return server
@@ -423,56 +470,163 @@ func (s *Server) startHTTPSServer() {
 		ocHandler:  s.ocHandler,
 	}
 
-	// 配置 TLS 以支持现代加密套件并兼容 AnyConnect 客户端
-	// AnyConnect 客户端要求：
-	// - TLS 1.2+ (AnyConnect 4.2+)
-	// - TLS 1.3 (AnyConnect 5.0+)
-	// - 支持 ECDHE 密码套件（推荐）和 RSA 密码套件（兼容性）
-	// 注意：OpenConnect/AnyConnect 协议只使用 HTTP/1.1，不支持 HTTP/2
+	// 配置 TLS - 参考 anylink 的简单配置方式
+	// 修复 CVE-2016-2183: 使用所有可用的密码套件
+	// https://segmentfault.com/a/1190000038486901
+	cipherSuites := tls.CipherSuites()
+	selectedCipherSuites := make([]uint16, 0, len(cipherSuites))
+	for _, s := range cipherSuites {
+		selectedCipherSuites = append(selectedCipherSuites, s.ID)
+	}
+
+	// 设置 TLS 配置 - 参考 anylink 的简单方式
+	// 重要：不设置 CipherSuites，允许 TLS 1.3
+	// TLS 1.3 使用固定的密码套件，不需要在 CipherSuites 中配置
+	// 设置 CipherSuites 会禁用 TLS 1.3，只支持 TLS 1.2
 	tlsConfig := &tls.Config{
-		MinVersion: tls.VersionTLS12, // TLS 1.2+ (AnyConnect 4.2+ 要求)
-		MaxVersion: tls.VersionTLS13, // TLS 1.3 (AnyConnect 5.0+ 支持)
-		// 密码套件列表（按优先级排序）
-		// 优先使用 ECDHE（前向保密），同时保留 RSA 套件以兼容旧版客户端
-		CipherSuites: []uint16{
-			// ECDHE 套件（推荐，支持前向保密）
-			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,   // 优先：256位 AES，更强的安全性
-			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,   // 128位 AES，性能更好
-			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384, // ECDSA 证书
-			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256, // ECDSA 证书
-			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305,    // ChaCha20-Poly1305（移动设备优化）
-			// RSA 套件（兼容性，某些旧版客户端可能需要）
-			tls.TLS_RSA_WITH_AES_256_GCM_SHA384, // RSA 密钥交换（无前向保密，但兼容性好）
-			tls.TLS_RSA_WITH_AES_128_GCM_SHA256, // RSA 密钥交换
-		},
-		PreferServerCipherSuites: true, // 优先使用服务器选择的密码套件
-		NextProtos:               []string{"http/1.1"},
-		// SNI 支持：根据客户端提供的 ServerName 选择对应的证书
-		// 参考 anylink 的 GetCertificateBySNI 实现
+		NextProtos: []string{"http/1.1"}, // OpenConnect VPN 只使用 HTTP/1.1，不需要 HTTP/2
+		MinVersion: tls.VersionTLS12,
+		// 不设置 MaxVersion，允许 TLS 1.3
+		// 不设置 CipherSuites，允许 TLS 1.3 和 TLS 1.2
+		// 如果只想支持 TLS 1.2，可以设置 MaxVersion: tls.VersionTLS12 和 CipherSuites: selectedCipherSuites
 		GetCertificate: func(chi *tls.ClientHelloInfo) (*tls.Certificate, error) {
-			return s.certManager.GetCertificateBySNI(chi)
+			// 详细记录客户端信息
+			remoteAddr := chi.Conn.RemoteAddr().String()
+			log.Printf("TLS: ClientHello from %s", remoteAddr)
+			os.Stderr.Sync() // 强制刷新日志
+			log.Printf("TLS:   - SNI: '%s'", chi.ServerName)
+			log.Printf("TLS:   - Supported TLS versions: %v", chi.SupportedVersions)
+			log.Printf("TLS:   - Cipher suites count: %d", len(chi.CipherSuites))
+			if len(chi.CipherSuites) > 0 {
+				log.Printf("TLS:   - First cipher suite: 0x%04x", chi.CipherSuites[0])
+			}
+			log.Printf("TLS:   - Supported curves: %v", chi.SupportedCurves)
+			log.Printf("TLS:   - Supported points: %v", chi.SupportedPoints)
+
+			cert, err := s.certManager.GetCertificateBySNI(chi)
+			if err != nil {
+				log.Printf("TLS: ERROR - GetCertificate failed for SNI '%s' from %s: %v", chi.ServerName, remoteAddr, err)
+				return nil, err
+			}
+			if cert == nil {
+				log.Printf("TLS: ERROR - No certificate available for SNI '%s' from %s", chi.ServerName, remoteAddr)
+				return nil, fmt.Errorf("no certificate available for SNI '%s'", chi.ServerName)
+			}
+
+			// 记录证书信息
+			log.Printf("TLS: Certificate selected for SNI '%s' from %s", chi.ServerName, remoteAddr)
+			log.Printf("TLS:   - Certificate chain length: %d", len(cert.Certificate))
+			if cert.Leaf != nil {
+				log.Printf("TLS:   - Certificate CN: %s", cert.Leaf.Subject.CommonName)
+				log.Printf("TLS:   - Certificate DNS Names: %v", cert.Leaf.DNSNames)
+				log.Printf("TLS:   - Certificate Issuer: %s", cert.Leaf.Issuer.String())
+
+				// 检查证书有效期
+				now := time.Now()
+				daysUntilExpiry := int(cert.Leaf.NotAfter.Sub(now).Hours() / 24)
+				log.Printf("TLS:   - Certificate valid until: %s (%d days remaining)",
+					cert.Leaf.NotAfter.Format("2006-01-02 15:04:05"), daysUntilExpiry)
+
+				if daysUntilExpiry < 0 {
+					log.Printf("TLS:   - ⚠️  WARNING: Certificate has EXPIRED!")
+				} else if daysUntilExpiry <= 7 {
+					log.Printf("TLS:   - ⚠️  WARNING: Certificate expires in %d days - renew soon!", daysUntilExpiry)
+				} else if daysUntilExpiry <= 30 {
+					log.Printf("TLS:   - ⚠️  WARNING: Certificate expires in %d days - plan renewal", daysUntilExpiry)
+				}
+			}
+
+			return cert, nil
+		},
+		// 添加 VerifyConnection 回调以记录握手成功信息
+		VerifyConnection: func(cs tls.ConnectionState) error {
+			log.Printf("TLS: ✅ Handshake completed successfully")
+			if len(cs.PeerCertificates) > 0 {
+				log.Printf("TLS:   - Remote address: %s", cs.PeerCertificates[0].Subject.String())
+			}
+			log.Printf("TLS:   - TLS version: 0x%04x (%s)", cs.Version, tlsVersionString(cs.Version))
+			log.Printf("TLS:   - Cipher suite: 0x%04x (%s)", cs.CipherSuite, tls.CipherSuiteName(cs.CipherSuite))
+			log.Printf("TLS:   - SNI: '%s'", cs.ServerName)
+			log.Printf("TLS:   - Negotiated protocol: %s", cs.NegotiatedProtocol)
+			return nil
+		},
+		// 添加 GetConfigForClient 回调以记录服务器选择的配置
+		GetConfigForClient: func(chi *tls.ClientHelloInfo) (*tls.Config, error) {
+			log.Printf("TLS: GetConfigForClient called for SNI '%s'", chi.ServerName)
+			log.Printf("TLS:   - Will negotiate TLS version from: %v", chi.SupportedVersions)
+			log.Printf("TLS:   - Server will use: MinVersion=%d (TLS 1.2), MaxVersion=0 (allow TLS 1.3)", tls.VersionTLS12)
+			os.Stderr.Sync() // 强制刷新日志
+			// 返回 nil 使用默认配置
+			return nil, nil
 		},
 	}
 
+	// 创建详细的错误日志记录器
+	detailedLogger := &detailedTLSLogger{
+		logger:   log.New(os.Stderr, "HTTPS Server: ", log.LstdFlags),
+		certFile: s.cfg.VPN.CertFile,
+	}
+	errorLogger := log.New(detailedLogger, "HTTPS Server: ", log.LstdFlags)
+
+	// 参考 anylink 的服务器配置
 	s.httpsServer = &http.Server{
-		Addr:              s.cfg.Server.Host + ":" + s.cfg.VPN.OpenConnectPort,
-		Handler:           customHandler,
-		TLSConfig:         tlsConfig,
-		ReadTimeout:       0,
-		WriteTimeout:      0,
-		IdleTimeout:       300 * time.Second,
-		ReadHeaderTimeout: 0,
-		// 重要：确保启用 keep-alive，即使客户端没有明确请求
-		// 这对于 OpenConnect/AnyConnect 协议是必需的
+		Addr:         s.cfg.Server.Host + ":" + s.cfg.VPN.OpenConnectPort,
+		Handler:      customHandler,
+		TLSConfig:    tlsConfig,
+		ErrorLog:     errorLogger,
+		ReadTimeout:  100 * time.Second,
+		WriteTimeout: 100 * time.Second,
 	}
 
 	go func() {
 		log.Printf("HTTPS server (OpenConnect) starting on %s:%s", s.cfg.Server.Host, s.cfg.VPN.OpenConnectPort)
 		log.Printf("Using default certificates: %s, %s", s.cfg.VPN.CertFile, s.cfg.VPN.KeyFile)
 		log.Printf("SNI (Server Name Indication) support enabled - certificates can be configured per domain")
-		// 注意：当使用 GetCertificate 回调时，ListenAndServeTLS 的 certFile 和 keyFile 参数会被忽略
-		// 但我们仍然需要提供它们作为后备（如果 GetCertificate 返回错误）
-		if err := s.httpsServer.ListenAndServeTLS(s.cfg.VPN.CertFile, s.cfg.VPN.KeyFile); err != nil && err != http.ErrServerClosed {
+
+		// 验证默认证书是否加载成功
+		s.certManager.mu.RLock()
+		defaultCert := s.certManager.defaultCert
+		s.certManager.mu.RUnlock()
+
+		// 严格检查证书是否加载成功
+		if defaultCert == nil {
+			log.Fatalf("HTTPS: FATAL - Default certificate is nil! TLS connections will fail. Please check certificate files: %s, %s",
+				s.cfg.VPN.CertFile, s.cfg.VPN.KeyFile)
+		}
+
+		// 验证证书链是否有效
+		if len(defaultCert.Certificate) == 0 {
+			log.Fatalf("HTTPS: FATAL - Default certificate chain is empty! Please check certificate file: %s",
+				s.cfg.VPN.CertFile)
+		}
+
+		// 验证私钥是否有效
+		if defaultCert.PrivateKey == nil {
+			log.Fatalf("HTTPS: FATAL - Default certificate private key is nil! Please check key file: %s",
+				s.cfg.VPN.KeyFile)
+		}
+
+		log.Printf("HTTPS: Default certificate verified - Chain length: %d, Has private key: %v",
+			len(defaultCert.Certificate), defaultCert.PrivateKey != nil)
+
+		// 参考 anylink：使用 ServeTLS 启动 HTTPS 服务器
+		// 注意：certFile 和 keyFile 传入空字符串，因为证书通过 GetCertificate 回调提供
+		addr := s.cfg.Server.Host + ":" + s.cfg.VPN.OpenConnectPort
+		listener, err := net.Listen("tcp", addr)
+		if err != nil {
+			log.Fatalf("HTTPS: Failed to listen on %s: %v", addr, err)
+		}
+
+		log.Printf("HTTPS: Listening on %s", addr)
+
+		// 包装 listener 以记录所有连接
+		wrappedListener := &connectionLoggingListener{
+			Listener: listener,
+		}
+
+		// 使用 ServeTLS，传入空字符串因为证书通过 GetCertificate 回调提供
+		// 这是 anylink 的做法，更简单且可靠
+		if err := s.httpsServer.ServeTLS(wrappedListener, "", ""); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("HTTPS server error: %v", err)
 		}
 	}()
@@ -527,6 +681,187 @@ func (s *Server) AddSNICert(sni string, certFile, keyFile string) error {
 	return s.certManager.AddCert(sni, certFile, keyFile)
 }
 
+// connectionLoggingListener 包装 net.Listener，记录所有连接
+type connectionLoggingListener struct {
+	net.Listener
+}
+
+func (l *connectionLoggingListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		return nil, err
+	}
+
+	remoteAddr := conn.RemoteAddr().String()
+	// 立即输出日志，不缓冲
+	log.Printf("TLS: New TCP connection from %s", remoteAddr)
+	os.Stderr.Sync() // 强制刷新日志
+
+	return conn, nil
+}
+
+// errorLoggingListener 包装 net.Listener，记录连接错误
+type errorLoggingListener struct {
+	net.Listener
+	serverName string
+}
+
+func (l *errorLoggingListener) Accept() (net.Conn, error) {
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		log.Printf("TLS: Accept error on %s: %v", l.serverName, err)
+		return nil, err
+	}
+
+	// 记录新连接
+	remoteAddr := conn.RemoteAddr().String()
+	log.Printf("TLS: New connection from %s", remoteAddr)
+
+	// 包装连接以记录 TLS 握手错误
+	return &errorLoggingConn{
+		Conn:       conn,
+		serverName: l.serverName,
+		remoteAddr: remoteAddr,
+	}, nil
+}
+
+// errorLoggingConn 包装 net.Conn，记录 TLS 握手错误
+type errorLoggingConn struct {
+	net.Conn
+	serverName      string
+	handshakeLogged bool
+	remoteAddr      string
+}
+
+func (c *errorLoggingConn) Read(b []byte) (n int, err error) {
+	n, err = c.Conn.Read(b)
+	if err != nil && !c.handshakeLogged {
+		// 记录读取错误（可能是 TLS 握手失败）
+		errStr := err.Error()
+		if strings.Contains(errStr, "tls") ||
+			strings.Contains(errStr, "handshake") ||
+			strings.Contains(errStr, "certificate") ||
+			strings.Contains(errStr, "EOF") {
+			log.Printf("TLS: Connection error from %s: %v", c.RemoteAddr(), err)
+			c.handshakeLogged = true
+		}
+	}
+	return n, err
+}
+
+func (c *errorLoggingConn) Write(b []byte) (n int, err error) {
+	n, err = c.Conn.Write(b)
+	if err != nil && !c.handshakeLogged {
+		// 记录写入错误（可能是 TLS 握手失败）
+		errStr := err.Error()
+		if strings.Contains(errStr, "tls") ||
+			strings.Contains(errStr, "handshake") ||
+			strings.Contains(errStr, "certificate") ||
+			strings.Contains(errStr, "broken pipe") ||
+			strings.Contains(errStr, "connection reset") {
+			log.Printf("TLS: Write error to %s: %v", c.RemoteAddr(), err)
+			// 如果是连接重置，提供更详细的诊断信息
+			if strings.Contains(errStr, "connection reset") {
+				log.Printf("TLS: Connection reset by peer - This may indicate:")
+				log.Printf("TLS:   1. Client rejected the certificate chain (check certificate chain completeness)")
+				log.Printf("TLS:   2. TLS version/cipher suite mismatch")
+				log.Printf("TLS:   3. Network issue (firewall, load balancer, etc.)")
+				log.Printf("TLS:   4. Client-side certificate validation failure")
+			}
+			c.handshakeLogged = true
+		}
+	}
+	return n, err
+}
+
+// tlsVersionString 将 TLS 版本号转换为字符串
+func tlsVersionString(version uint16) string {
+	switch version {
+	case tls.VersionTLS10:
+		return "TLS 1.0"
+	case tls.VersionTLS11:
+		return "TLS 1.1"
+	case tls.VersionTLS12:
+		return "TLS 1.2"
+	case tls.VersionTLS13:
+		return "TLS 1.3"
+	default:
+		return fmt.Sprintf("Unknown (0x%04x)", version)
+	}
+}
+
+// detailedTLSLogger 详细的 TLS 错误日志记录器
+type detailedTLSLogger struct {
+	logger   *log.Logger
+	certFile string
+}
+
+func (l *detailedTLSLogger) Write(p []byte) (n int, err error) {
+	msg := string(p)
+
+	// 提取错误信息
+	if strings.Contains(msg, "TLS handshake error") {
+		// 解析错误信息 - 格式: "http: TLS handshake error from <ip>:<port>: <error>"
+		// 例如: "http: TLS handshake error from 122.97.148.0:62044: write tcp 192.168.144.3:443->122.97.148.0:62044: write: connection reset by peer"
+		remoteAddrStart := strings.Index(msg, "from ")
+		if remoteAddrStart > 0 {
+			afterFrom := msg[remoteAddrStart+5:]
+			// 找到 IP:PORT 后的第一个 ": "（错误信息的开始）
+			errorStart := strings.Index(afterFrom, ": ")
+			if errorStart > 0 {
+				remoteAddr := strings.TrimSpace(afterFrom[:errorStart])
+				errorMsg := strings.TrimSpace(afterFrom[errorStart+2:])
+				errorMsgLower := strings.ToLower(errorMsg)
+
+				// 对于常见的 "connection reset" 错误，简化日志输出（通常是扫描/攻击尝试）
+				// 这种错误在生产环境中很常见，不需要详细的诊断信息
+				if strings.Contains(errorMsgLower, "connection reset") {
+					// 简化日志：只记录一行基本信息，避免日志噪音
+					l.logger.Printf("TLS handshake failed: connection reset by peer from %s (likely scan/attack attempt)", remoteAddr)
+					// 不再输出详细的诊断信息，减少日志噪音
+					return len(p), nil
+				}
+
+				// 对于其他错误（证书错误、握手错误等），输出详细的诊断信息
+				// 这些错误可能表示配置问题，需要详细诊断
+				l.logger.Printf("==========================================")
+				l.logger.Printf("TLS Handshake Error Details:")
+				l.logger.Printf("  Remote Address: %s", remoteAddr)
+				l.logger.Printf("  Error: %s", errorMsg)
+				l.logger.Printf("  Timestamp: %s", time.Now().Format("2006/01/02 15:04:05"))
+
+				// 分析错误原因
+				if strings.Contains(errorMsgLower, "certificate") {
+					l.logger.Printf("  Possible Causes:")
+					l.logger.Printf("    1. Certificate not found for SNI")
+					l.logger.Printf("    2. Certificate file read error")
+					l.logger.Printf("    3. Certificate format invalid")
+				} else if strings.Contains(errorMsgLower, "handshake") {
+					l.logger.Printf("  Possible Causes:")
+					l.logger.Printf("    1. TLS version mismatch")
+					l.logger.Printf("    2. Cipher suite mismatch")
+					l.logger.Printf("    3. Protocol negotiation failure")
+				}
+
+				l.logger.Printf("  Troubleshooting Steps:")
+				if l.certFile != "" {
+					l.logger.Printf("    1. Check certificate file: %s", l.certFile)
+				}
+				l.logger.Printf("    2. Verify certificate matches SNI domain")
+				l.logger.Printf("    3. Test with: openssl s_client -connect <host>:443 -servername <sni>")
+				l.logger.Printf("    4. Check firewall/NAT/load balancer logs")
+				l.logger.Printf("    5. Review server logs for 'TLS: GetCertificate' messages")
+				l.logger.Printf("==========================================")
+			}
+		}
+	} else {
+		// 其他错误正常记录
+		return l.logger.Writer().Write(p)
+	}
+
+	return len(p), nil
+}
+
 // tlsErrorFilter 过滤 TLS 扫描/攻击相关的错误日志
 type tlsErrorFilter struct{}
 
@@ -569,3 +904,4 @@ func (f *tlsErrorFilter) Write(p []byte) (n int, err error) {
 	// 其他错误正常记录到标准错误输出
 	return os.Stderr.Write(p)
 }
+

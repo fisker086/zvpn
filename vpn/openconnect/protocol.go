@@ -145,6 +145,17 @@ func (tc *TunnelClient) HandleTunnelData() error {
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				// Timeout - send keepalive
+				// 关键：在发送 keepalive 前，检查客户端是否还存在
+				// 如果客户端已经断开连接，不应该继续发送 keepalive
+				if tc.VPNServer != nil {
+					_, stillExists := tc.VPNServer.GetClient(tc.User.ID)
+					if !stillExists {
+						log.Printf("OpenConnect: 客户端 %s (VPN IP: %s) 已从 VPNServer 中移除，停止发送 keepalive",
+							tc.User.Username, tc.IP.String())
+						return fmt.Errorf("client disconnected")
+					}
+				}
+				
 				timeoutCount++
 				if timeoutCount >= maxTimeouts {
 					log.Printf("OpenConnect: Too many timeouts for user %s", tc.User.Username)
@@ -154,6 +165,8 @@ func (tc *TunnelClient) HandleTunnelData() error {
 				// Send keepalive packet
 				if err := tc.sendKeepalive(); err != nil {
 					log.Printf("OpenConnect: Failed to send keepalive: %v", err)
+					// 如果发送失败，连接可能已关闭，退出循环
+					return err
 				}
 				continue
 			}
@@ -197,26 +210,7 @@ func (tc *TunnelClient) HandleTunnelData() error {
 			// No need to sync to VPNClient since server-to-client packets always use BIG-ENDIAN regardless of client preference
 
 			// Log packet type for debugging (especially for ICMP packets)
-			if packet.Type == PacketTypeData && len(packet.Payload) >= 20 {
-				protocol := packet.Payload[9]
-				if protocol == 1 { // ICMP
-					icmpType := "unknown"
-					if len(packet.Payload) >= 28 {
-						switch packet.Payload[20] {
-						case 0:
-							icmpType = "echo reply"
-						case 8:
-							icmpType = "echo request"
-						default:
-							icmpType = fmt.Sprintf("type %d", packet.Payload[20])
-						}
-					}
-					srcIP := net.IP(packet.Payload[12:16])
-					dstIP := net.IP(packet.Payload[16:20])
-					log.Printf("OpenConnect: Received ICMP %s packet from client %s (VPN IP: %s) to %s, payload length: %d",
-						icmpType, tc.User.Username, srcIP.String(), dstIP.String(), len(packet.Payload))
-				}
-			}
+			// ICMP packet logging removed for performance
 
 			// Process packet
 			if err := tc.processPacket(packet.Type, packet.Payload); err != nil {
@@ -679,21 +673,7 @@ func (p *CSTPParser) nextPacket() (*ParsedPacket, error) {
 					if len(payload) > payloadEnd-actualPayloadStart {
 						payload = payload[:payloadEnd-actualPayloadStart]
 					}
-					// Log ICMP packets for debugging
-					if p.packetType == PacketTypeData && len(payload) >= 28 && payload[9] == 1 {
-						icmpType := payload[20]
-						icmpTypeStr := "unknown"
-						switch icmpType {
-						case 0:
-							icmpTypeStr = "echo reply"
-						case 8:
-							icmpTypeStr = "echo request"
-						}
-						srcIP := net.IP(payload[12:16])
-						dstIP := net.IP(payload[16:20])
-						log.Printf("OpenConnect: Extracted ICMP %s packet from payload: %s -> %s, payloadLen=%d, actualPayloadStart=%d, packetLen=%d",
-							icmpTypeStr, srcIP.String(), dstIP.String(), len(payload), actualPayloadStart, p.packetLen)
-					}
+					// ICMP packet logging removed for performance
 				} else {
 					// Invalid extraction range
 					log.Printf("OpenConnect: WARNING - Invalid payload extraction range: actualPayloadStart=%d, payloadEnd=%d, packetLen=%d",
@@ -951,13 +931,8 @@ func (tc *TunnelClient) processDataPacket(payload []byte) error {
 			if isVPNInternalTraffic(srcIP, dstIP, ipNet) && !dstIP.Equal(serverVPNIP) {
 				// Client-to-client communication - forward directly, bypassing TUN device
 				// This is the optimal path: no TUN read/write, no kernel routing overhead
-				if protocol == 1 { // ICMP - always log for debugging
-					log.Printf("OpenConnect: Direct forwarding ICMP packet from client %s to client %s (bypassing TUN device)",
-						srcIP.String(), dstIP.String())
-				} else {
-					vpn.LogPacket("OpenConnect: Direct forwarding packet from client %s to client %s (bypassing TUN device)",
-						srcIP.String(), dstIP.String())
-				}
+				vpn.LogPacket("OpenConnect: Direct forwarding packet from client %s to client %s (bypassing TUN device)",
+					srcIP.String(), dstIP.String())
 
 				// Perform policy check before forwarding
 				if err := tc.performPolicyCheck(payload); err != nil {
@@ -981,11 +956,6 @@ func (tc *TunnelClient) processDataPacket(payload []byte) error {
 						// Other errors should be logged
 						log.Printf("OpenConnect: Failed to forward packet from client %s to %s: %v",
 							srcIP.String(), dstIP.String(), err)
-					}
-				} else {
-					if protocol == 1 { // ICMP - always log for debugging
-						log.Printf("OpenConnect: Successfully forwarded ICMP packet from client %s to client %s (direct path)",
-							srcIP.String(), dstIP.String())
 					}
 				}
 				// Return early - don't write to TUN device
@@ -1429,3 +1399,4 @@ func inferApplicationProtocol(netProtocol string, dstPort uint16) string {
 		return netProtocol
 	}
 }
+

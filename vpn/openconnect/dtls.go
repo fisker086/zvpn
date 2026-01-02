@@ -414,6 +414,7 @@ func (h *Handler) handleDTLSConnection(conn net.Conn) {
 	h.dtlsLock.Lock()
 	var matchedClient *TunnelClient
 	var matchedClientKey string
+	var matchedVPNIP string // 保存 VPN IP，用于后续检查客户端是否还存在
 
 	// 步骤1：优先使用DTLSSessionID进行快速匹配（最精确、最快速）
 	if sessionID != "" {
@@ -421,6 +422,7 @@ func (h *Handler) handleDTLSConnection(conn net.Conn) {
 			if clientInfo != nil && clientInfo.DTLSSessionID == sessionID {
 				matchedClient = clientInfo.Client
 				matchedClientKey = vpnIP
+				matchedVPNIP = vpnIP // 保存 VPN IP
 				// 更新连接信息
 				clientInfo.DTLSConn = conn
 				clientInfo.UDPAddr = udpAddr
@@ -439,6 +441,7 @@ func (h *Handler) handleDTLSConnection(conn net.Conn) {
 				clientInfo.UDPAddr.IP.Equal(udpAddr.IP) && clientInfo.UDPAddr.Port == udpAddr.Port {
 				matchedClient = clientInfo.Client
 				matchedClientKey = vpnIP
+				matchedVPNIP = vpnIP // 保存 VPN IP
 				// 更新会话ID映射（如果还没有的话）
 				if clientInfo.DTLSSessionID == "" && sessionID != "" {
 					clientInfo.DTLSSessionID = sessionID
@@ -460,6 +463,7 @@ func (h *Handler) handleDTLSConnection(conn net.Conn) {
 			if clientInfo != nil && clientInfo.Client != nil && clientInfo.DTLSConn == nil {
 				matchedClient = clientInfo.Client
 				matchedClientKey = vpnIP
+				matchedVPNIP = vpnIP // 保存 VPN IP
 				// 建立会话ID映射（用于后续快速匹配）
 				if sessionID != "" {
 					clientInfo.DTLSSessionID = sessionID
@@ -483,24 +487,28 @@ func (h *Handler) handleDTLSConnection(conn net.Conn) {
 				log.Printf("DTLS: 更新VPNClient DTLS连接 - 用户: %s (VPN IP: %s)",
 					matchedClient.User.Username, matchedClient.IP.String())
 
-				// 优化：DTLS 连接建立后，立即通过 DTLS 通道发送 DPD 响应
-				// 这可以触发客户端路由生效，而不需要等待客户端发送 DPD 请求
+				// 优化：DTLS 连接建立后，立即通过 DTLS 通道发送多个 DPD 响应
+				// 这可以快速触发客户端路由生效，而不需要等待客户端发送 DPD 请求
 				// 使用 goroutine 异步发送，避免阻塞 DTLS 连接处理
 				go func() {
-					// 等待一小段时间，确保 DTLS 连接已经完全建立
-					time.Sleep(100 * time.Millisecond)
-					// 通过 DTLS 通道发送 DPD 响应，触发客户端路由生效
-					// 注意：DPD 响应通过 DTLS 通道发送，而不是 TCP 通道
-					// 这样可以更快地触发客户端的路由生效
-					if conn != nil {
-						// 构建 DPD-RESP 包：第一个字节是包类型 (0x04)，后面是空的 payload
-						dpdResp := []byte{PacketTypeDPDResp}
-						if _, err := conn.Write(dpdResp); err != nil {
-							log.Printf("DTLS: 通过 DTLS 通道发送 DPD 响应以触发路由生效失败: %v", err)
-						} else {
-							log.Printf("DTLS: 已通过 DTLS 通道发送 DPD 响应以触发客户端路由生效 - 用户: %s", matchedClient.User.Username)
+					// 等待极短时间（10ms），确保 DTLS 连接已经完全建立
+					time.Sleep(10 * time.Millisecond)
+					// 构建 DPD-RESP 包：第一个字节是包类型 (0x04)，后面是空的 payload
+					dpdResp := []byte{PacketTypeDPDResp}
+					// 连续发送3个DPD响应，确保客户端收到并快速触发路由生效
+					for i := 0; i < 3; i++ {
+						if conn != nil {
+							if _, err := conn.Write(dpdResp); err != nil {
+								log.Printf("DTLS: 通过 DTLS 通道发送 DPD 响应 #%d 失败: %v", i+1, err)
+								break // 如果发送失败，停止后续发送
+							}
+							// 每次发送间隔5ms，避免网络拥塞
+							if i < 2 {
+								time.Sleep(5 * time.Millisecond)
+							}
 						}
 					}
+					log.Printf("DTLS: 已通过 DTLS 通道发送 DPD 响应以快速触发客户端路由生效 - 用户: %s", matchedClient.User.Username)
 				}()
 			}
 		}
@@ -551,15 +559,35 @@ func (h *Handler) handleDTLSConnection(conn net.Conn) {
 				// - TCP keepalive: 只通过 TCP 通道发送（在 protocol.go 的 sendKeepalive 中处理）
 				// - 如果客户端禁用了 UDP (--disable-udp)，DTLS 连接不存在，不会发送 DTLS keepalive
 				// 两个通道独立处理，各自在自己的超时时发送自己的 keepalive
-				if matchedClient != nil {
-					dtlsKeepalive := []byte{PacketTypeKeepalive} // 0x07
-					if _, writeErr := conn.Write(dtlsKeepalive); writeErr != nil {
-						log.Printf("DTLS: 发送 keepalive 失败: %v (连接可能已关闭)", writeErr)
-						// 如果写入失败，连接可能已关闭，退出循环
+
+				// 关键：在发送 keepalive 前，检查客户端是否还存在
+				// 如果客户端已经断开连接，不应该继续发送 keepalive
+				if matchedClient != nil && matchedVPNIP != "" {
+					// 检查客户端是否还在 dtlsClients 中
+					h.dtlsLock.RLock()
+					clientInfo, stillExists := h.dtlsClients[matchedVPNIP]
+					h.dtlsLock.RUnlock()
+
+					// 只有当客户端仍然存在时，才发送 keepalive
+					if stillExists && clientInfo != nil {
+						dtlsKeepalive := []byte{PacketTypeKeepalive} // 0x07
+						if _, writeErr := conn.Write(dtlsKeepalive); writeErr != nil {
+							log.Printf("DTLS: 发送 keepalive 失败: %v (连接可能已关闭)", writeErr)
+							// 如果写入失败，连接可能已关闭，退出循环
+							return
+						}
+						log.Printf("DTLS: ✓ 发送 keepalive 包到客户端 %s (VPN IP: %s, Session ID: %s) - DTLS keepalive active",
+							matchedClient.User.Username, matchedClient.IP.String(), sessionID[:16]+"...")
+					} else {
+						// 客户端已断开，退出循环
+						log.Printf("DTLS: 客户端 %s (VPN IP: %s) 已从 dtlsClients 中移除，停止发送 keepalive",
+							matchedClient.User.Username, matchedVPNIP)
 						return
 					}
-					log.Printf("DTLS: ✓ 发送 keepalive 包到客户端 %s (VPN IP: %s, Session ID: %s) - DTLS keepalive active",
-						matchedClient.User.Username, matchedClient.IP.String(), sessionID[:16]+"...")
+				} else {
+					// matchedClient 为 nil，退出循环
+					log.Printf("DTLS: matchedClient 为 nil，停止发送 keepalive")
+					return
 				}
 				continue
 			}
@@ -664,3 +692,4 @@ func (h *Handler) handleDTLSConnection(conn net.Conn) {
 		}
 	}
 }
+

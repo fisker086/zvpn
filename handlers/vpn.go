@@ -149,11 +149,6 @@ func (h *VPNHandler) Connect(c *gin.Context) {
 			}
 		}
 
-		// Apply policy routes
-		if user.PolicyID != 0 {
-			h.applyPolicyRoutes(&user)
-		}
-
 		// Create policy hooks
 		if err := h.vpnServer.CreatePolicyHooks(&user); err != nil {
 			fmt.Printf("Warning: Failed to create policy hooks: %v\n", err)
@@ -325,64 +320,6 @@ func (h *VPNHandler) buildVPNConfig(user *models.User) *VPNConfig {
 		ServerPort: customPort,
 		Routes:     routes,
 		MTU:        h.config.VPN.MTU,
-	}
-}
-
-// applyPolicyRoutes applies policy routes to eBPF and kernel routing table
-func (h *VPNHandler) applyPolicyRoutes(user *models.User) {
-	if h.vpnServer == nil {
-		return
-	}
-
-	// 获取VPN网关IP（优先使用TUN设备IP，支持多服务器横向扩容）
-	var gateway net.IP
-	if h.vpnServer != nil {
-		gateway = h.vpnServer.GetVPNGatewayIP()
-	}
-	if gateway == nil {
-		// Fallback to configured gateway IP
-		_, vpnNet, _ := net.ParseCIDR(h.config.VPN.Network)
-		gateway = make(net.IP, len(vpnNet.IP))
-		copy(gateway, vpnNet.IP)
-		gateway[len(gateway)-1] = 1
-	}
-
-	// 获取路由管理器
-	routeMgr := h.vpnServer.GetRouteManager()
-
-	// 应用策略路由
-	if user.PolicyID != 0 && len(user.Policy.Routes) > 0 {
-		for _, route := range user.Policy.Routes {
-			_, ipNet, err := net.ParseCIDR(route.Network)
-			if err != nil {
-				continue
-			}
-
-			var routeGateway net.IP
-			if route.Gateway != "" {
-				routeGateway = net.ParseIP(route.Gateway)
-			} else {
-				routeGateway = gateway
-			}
-
-			// 添加到内核路由表（通过netlink）
-			if routeMgr != nil {
-				if err := routeMgr.AddRoute(ipNet, routeGateway, route.Metric); err != nil {
-					fmt.Printf("Warning: Failed to add route %s: %v\n", route.Network, err)
-				}
-			}
-
-			// 注意：eBPF的AddRoute现在是no-op，路由通过内核路由表管理
-			// 但eBPF可以用于策略匹配和流量控制
-			if h.vpnServer.GetEBPFProgram() != nil {
-				// eBPF主要用于策略匹配，路由由内核管理
-				// 这里可以添加eBPF策略规则
-			}
-		}
-	}
-
-	// 应用域名路由（如果域名关联了用户策略）
-	if user.PolicyID != 0 {
 	}
 }
 
@@ -756,3 +693,4 @@ func (h *VPNHandler) applyCompressionToRuntime() {
 		h.vpnServer.CompressionMgr = vpn.NewCompressionManager(vpn.CompressionNone)
 	}
 }
+

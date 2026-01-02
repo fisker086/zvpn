@@ -399,63 +399,9 @@ func (h *Handler) handleConnect(c *gin.Context) {
 		log.Printf("OpenConnect: Warning - Failed to create policy hooks: %v", err)
 	}
 
-	userPolicy := user.GetPolicy()
-	if userPolicy != nil && len(userPolicy.Routes) > 0 {
-		log.Printf("OpenConnect: Adding %d policy routes immediately for user %s (no need to wait for DPD)",
-			len(userPolicy.Routes), user.Username)
-
-		// 获取VPN网关IP（优先使用TUN设备IP，支持多服务器横向扩容）
-		var gateway net.IP
-		if h.vpnServer != nil {
-			gateway = h.vpnServer.GetVPNGatewayIP()
-		}
-		if gateway == nil {
-			// Fallback to configured gateway IP（使用统一的辅助函数）
-			if ipNet, err := parseVPNNetwork(h.config.VPN.Network); err == nil {
-				gateway = getServerVPNIP(ipNet)
-			}
-		}
-
-		// 获取路由管理器
-		routeMgr := h.vpnServer.GetRouteManager()
-		if routeMgr == nil {
-			log.Printf("OpenConnect: Warning - RouteManager is nil, cannot add routes for user %s", user.Username)
-		} else {
-			addedCount := 0
-			skippedCount := 0
-			for _, route := range userPolicy.Routes {
-				// 跳过VPN网络本身
-				if route.Network == h.config.VPN.Network {
-					skippedCount++
-					continue
-				}
-
-				_, ipNet, err := net.ParseCIDR(route.Network)
-				if err != nil {
-					log.Printf("OpenConnect: Warning - Failed to parse route %s: %v", route.Network, err)
-					continue
-				}
-
-				var routeGateway net.IP
-				if route.Gateway != "" {
-					routeGateway = net.ParseIP(route.Gateway)
-				} else {
-					routeGateway = gateway
-				}
-
-				// 添加到内核路由表（通过netlink）
-				if err := routeMgr.AddRoute(ipNet, routeGateway, route.Metric); err != nil {
-					// 路由可能已存在，这是正常的（例如多个用户共享同一路由）
-					log.Printf("OpenConnect: Route %s via %s: %v (may already exist)",
-						route.Network, routeGateway.String(), err)
-				} else {
-					log.Printf("OpenConnect: ✓ Added route %s via %s (metric: %d) for user %s",
-						route.Network, routeGateway.String(), route.Metric, user.Username)
-					addedCount++
-				}
-			}
-		}
-	}
+	// 注意：策略路由不应该在服务端添加，而是通过 X-CSTP-Split-Include 头部发送给客户端
+	// 客户端会根据这些路由信息在自己的系统上添加路由
+	// 服务端只需要通过 NAT 转发流量即可，不需要在服务端内核路由表中添加这些路由
 
 	userAgent := c.Request.UserAgent()
 	clientOS, clientVer := parseClientInfo(userAgent)
@@ -497,6 +443,27 @@ func (h *Handler) handleConnect(c *gin.Context) {
 	h.vpnServer.RegisterClient(user.ID, vpnClient)
 
 	go vpnClient.WriteLoop()
+
+	// 优化：TCP连接建立后，立即通过TCP通道发送DPD响应以快速触发客户端路由生效
+	// 这样可以与DTLS通道的DPD响应配合，确保客户端路由尽快生效
+	go func() {
+		// 等待一小段时间，确保TCP连接已经完全建立
+		time.Sleep(10 * time.Millisecond)
+		// 构建空的DPD响应payload
+		dpdRespPayload := []byte{}
+		// 连续发送2个DPD响应，确保客户端收到
+		for i := 0; i < 2; i++ {
+			if err := tunnelClient.sendPacket(PacketTypeDPDResp, dpdRespPayload); err != nil {
+				log.Printf("OpenConnect: 通过TCP通道发送DPD响应 #%d失败: %v", i+1, err)
+				break // 如果发送失败，停止后续发送
+			}
+			// 每次发送间隔5ms
+			if i < 1 {
+				time.Sleep(5 * time.Millisecond)
+			}
+		}
+		log.Printf("OpenConnect: 已通过TCP通道发送DPD响应以快速触发客户端路由生效 - 用户: %s", user.Username)
+	}()
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -1435,3 +1402,4 @@ func closeConnectionGracefully(conn net.Conn) {
 		}
 	}
 }
+

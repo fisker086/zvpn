@@ -32,6 +32,8 @@ RUN dnf install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
     rm -rf /var/cache/dnf /tmp/* /var/tmp/*
 
 WORKDIR /app
+ENV GO111MODULE=on 
+ENV GOPROXY=https://goproxy.cn
 COPY go.mod go.sum ./
 RUN go mod download
 
@@ -117,7 +119,8 @@ RUN dnf install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
         ca-certificates \
         libbpf \
         iproute kmod bash openssl nc wget \
-        nftables tcpdump \
+        nftables tcpdump iptables \
+        iputils  \
         kernel-tools || true && \
     dnf clean all && \
     rm -rf /var/cache/dnf /tmp/* /var/tmp/*

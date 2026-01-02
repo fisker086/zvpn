@@ -36,30 +36,73 @@ import (
 func validateSecureHeaders(c *gin.Context) bool {
 	xAggregateAuth := c.Request.Header.Get("X-Aggregate-Auth")
 	xTranscendVersion := c.Request.Header.Get("X-Transcend-Version")
+	userAgent := strings.ToLower(c.GetHeader("User-Agent"))
 
-	if xAggregateAuth != "1" || xTranscendVersion != "1" {
-		log.Printf("OpenConnect: Security header validation failed - X-Aggregate-Auth: %s, X-Transcend-Version: %s (from %s)",
-			xAggregateAuth, xTranscendVersion, c.ClientIP())
-		c.AbortWithStatus(http.StatusForbidden)
-		return false
+	// 检查是否是 OpenConnect/AnyConnect 客户端
+	isOpenConnectClient := strings.Contains(userAgent, "openconnect") ||
+		strings.Contains(userAgent, "anyconnect") ||
+		strings.Contains(userAgent, "cisco secure client") ||
+		strings.Contains(userAgent, "cisco anyconnect")
+
+	// 对于 OpenConnect/AnyConnect 客户端，要求必须有安全头部
+	if isOpenConnectClient {
+		if xAggregateAuth != "1" || xTranscendVersion != "1" {
+			log.Printf("OpenConnect: Security header validation failed for VPN client - X-Aggregate-Auth: %s, X-Transcend-Version: %s (from %s, User-Agent: %s)",
+				xAggregateAuth, xTranscendVersion, c.ClientIP(), c.GetHeader("User-Agent"))
+			c.AbortWithStatus(http.StatusForbidden)
+			return false
+		}
+		return true
 	}
 
+	// 对于非 VPN 客户端（如浏览器、OpenSSL s_client 等），允许通过
+	// 这样可以避免 OpenSSL s_client 等工具返回 403
+	// 但是会在 GetConfig 中根据其他条件判断是否返回配置
+	if xAggregateAuth == "" && xTranscendVersion == "" {
+		log.Printf("OpenConnect: Non-VPN client request (no security headers) - User-Agent: %s (from %s)",
+			c.GetHeader("User-Agent"), c.ClientIP())
+		// 不返回错误，让后续处理决定如何响应
+		return true
+	}
+
+	// 如果提供了头部但不是 "1"，也允许通过（可能是其他类型的客户端）
 	return true
 }
 
 func (h *Handler) GetConfig(c *gin.Context) {
 	// 记录请求的所有重要 header（用于调试）
 	log.Printf("OpenConnect: GET/POST / - Request headers from %s:", c.ClientIP())
+	log.Printf("  Method: %s", c.Request.Method)
+	log.Printf("  Path: %s", c.Request.URL.Path)
 	log.Printf("  Connection: %s", c.GetHeader("Connection"))
 	log.Printf("  User-Agent: %s", c.GetHeader("User-Agent"))
 	log.Printf("  X-Aggregate-Auth: %s", c.GetHeader("X-Aggregate-Auth"))
 	log.Printf("  X-Transcend-Version: %s", c.GetHeader("X-Transcend-Version"))
 	log.Printf("  Accept: %s", c.GetHeader("Accept"))
 	log.Printf("  Content-Type: %s", c.GetHeader("Content-Type"))
+	log.Printf("  Content-Length: %s", c.GetHeader("Content-Length"))
 
 	// 安全验证：验证 X-Aggregate-Auth 和 X-Transcend-Version 头部
 	// 先验证安全头部，这样可以准确识别 VPN 客户端
 	if !validateSecureHeaders(c) {
+		return
+	}
+
+	// 检查是否是 OpenConnect/AnyConnect 客户端
+	xAggregateAuth := c.GetHeader("X-Aggregate-Auth")
+	xTranscendVersion := c.GetHeader("X-Transcend-Version")
+	userAgent := strings.ToLower(c.GetHeader("User-Agent"))
+	isVPNClient := (xAggregateAuth == "1" && xTranscendVersion == "1") ||
+		strings.Contains(userAgent, "openconnect") ||
+		strings.Contains(userAgent, "anyconnect") ||
+		strings.Contains(userAgent, "cisco secure client") ||
+		strings.Contains(userAgent, "cisco anyconnect")
+
+	// 如果不是 VPN 客户端，返回友好的错误信息（而不是 400）
+	if !isVPNClient && c.Request.Method == "POST" {
+		log.Printf("OpenConnect: Non-VPN client POST request detected, returning auth form")
+		// 对于非 VPN 客户端的 POST 请求，返回认证表单而不是错误
+		h.sendAuthForm(c)
 		return
 	}
 
@@ -1990,3 +2033,4 @@ func (h *Handler) sendOTPSetupRequest(c *gin.Context, username string) {
 	// 使用公共函数发送响应
 	h.sendAuthRequestResponse(c, xml)
 }
+

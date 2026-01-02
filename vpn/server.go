@@ -523,25 +523,13 @@ func (s *VPNServer) BuildCSTPPacket(payload []byte) ([]byte, error) {
 	return packet, nil
 }
 
-// Start 已不再需要，因为我们使用OpenConnect协议
-// 此函数已被废弃，由openconnect.Handler处理所有连接
-func (s *VPNServer) Start() error {
-	log.Printf("Custom VPN protocol is disabled. Using OpenConnect protocol instead.")
-	return nil
-}
-
-// handleClient 已不再需要，由OpenConnect协议处理
-func (s *VPNServer) handleClient(conn net.Conn) {
-	defer conn.Close()
-	log.Printf("Custom VPN protocol is disabled. Connection from %s ignored.", conn.RemoteAddr())
-}
 
 // GetPolicyManager returns the policy manager
 func (s *VPNServer) GetPolicyManager() *policy.Manager {
 	return s.policyMgr
 }
 
-// GetRouteManager returns the route manager
+// GetRouteManager 已废弃
 func (s *VPNServer) GetRouteManager() *RouteManager {
 	return s.routeMgr
 }
