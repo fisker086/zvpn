@@ -14,21 +14,16 @@ type Policy struct {
 	Name        string `gorm:"uniqueIndex;not null;size:255" json:"name"`
 	Description string `json:"description"`
 
-	// Routing rules
 	AllowedNetworks []AllowedNetwork `gorm:"foreignKey:PolicyID" json:"allowed_networks"`
 	Routes          []Route          `gorm:"foreignKey:PolicyID" json:"routes"`
 	ExcludeRoutes   []ExcludeRoute   `gorm:"foreignKey:PolicyID" json:"exclude_routes"` // 排除路由（用于全局模式）
 
-	// Bandwidth limits (bytes per second)
 	MaxBandwidth int64 `json:"max_bandwidth"` // 0 means unlimited
 
-	// DNS servers (comma-separated or JSON array)
 	DNSServers string `gorm:"type:text" json:"dns_servers"` // JSON array of DNS server IPs, e.g. ["8.8.8.8","8.8.4.4"]
 
-	// Time restrictions
 	TimeRestrictions []TimeRestriction `gorm:"foreignKey:PolicyID" json:"time_restrictions"`
 
-	// Relations
 	Groups []UserGroup `gorm:"many2many:user_group_policies;" json:"groups,omitempty"`
 }
 

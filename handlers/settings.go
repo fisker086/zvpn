@@ -18,7 +18,6 @@ import (
 	"gorm.io/gorm/clause"
 )
 
-// DB-first defaults for security settings (config.yaml is ignored for these fields)
 const (
 	defaultEnableRateLimit                  = false
 	defaultRateLimitPerIP             int64 = 1000
@@ -32,13 +31,11 @@ const (
 	defaultLoginLockoutDuration       int   = 900
 	defaultLoginAttemptWindow         int   = 300
 
-	// Distributed sync defaults (used when DB record is missing)
 	defaultEnableDistributedSync = false
 	defaultSyncInterval          = 120 // seconds
 	defaultChangeCheckInterval   = 10  // seconds
 )
 
-// boolToUint8 converts bool to uint8 (0 or 1)
 func boolToUint8(b bool) uint8 {
 	if b {
 		return 1
@@ -53,7 +50,6 @@ type SettingsHandler struct {
 
 func NewSettingsHandler(cfg *config.Config) *SettingsHandler {
 	h := &SettingsHandler{config: cfg}
-	// Reset security-related fields to code defaults; config.yaml/env are ignored for these settings.
 	h.applySecurityConfig(&SecuritySettingsRequest{
 		EnableRateLimit:            defaultEnableRateLimit,
 		RateLimitPerIP:             defaultRateLimitPerIP,
@@ -68,23 +64,19 @@ func NewSettingsHandler(cfg *config.Config) *SettingsHandler {
 		LoginAttemptWindow:         defaultLoginAttemptWindow,
 	})
 
-	// hydrate config from DB if available
 	h.loadPersistedSecuritySettings()
 	h.loadPersistedPerformanceSettings()
 	h.loadPersistedDistributedSyncSettings()
 	return h
 }
 
-// SetVPNServer sets the VPN server instance
 func (h *SettingsHandler) SetVPNServer(server *vpn.VPNServer) {
 	h.vpnServer = server
-	// apply persisted values to runtime after server is attached
 	h.applyPerformanceToRuntime()
 	h.applySecurityToRuntime()
 	h.applyDistributedSyncToRuntime()
 }
 
-// GetPerformanceSettings returns performance settings
 func (h *SettingsHandler) GetPerformanceSettings(c *gin.Context) {
 	settings := PerformanceSettingsRequest{
 		EnablePolicyCache: true,
@@ -110,13 +102,11 @@ func (h *SettingsHandler) GetPerformanceSettings(c *gin.Context) {
 	})
 }
 
-// UpdatePerformanceSettings updates performance settings
 type PerformanceSettingsRequest struct {
 	EnablePolicyCache bool `json:"enable_policy_cache"`
 	CacheSize         int  `json:"cache_size" binding:"required,min=100,max=10000"`
 }
 
-// DistributedSyncSettingsRequest for distributed hook synchronization
 type DistributedSyncSettingsRequest struct {
 	EnableDistributedSync bool `json:"enable_distributed_sync"`
 	SyncInterval          int  `json:"sync_interval" binding:"min=5,max=3600"`        // seconds
@@ -150,7 +140,6 @@ func (h *SettingsHandler) UpdatePerformanceSettings(c *gin.Context) {
 	})
 }
 
-// GetSecuritySettings returns security and protection settings
 func (h *SettingsHandler) GetSecuritySettings(c *gin.Context) {
 	stored := SecuritySettingsRequest{
 		EnableRateLimit:            defaultEnableRateLimit,
@@ -168,7 +157,6 @@ func (h *SettingsHandler) GetSecuritySettings(c *gin.Context) {
 	if err := h.loadSecurityFromDB(&stored); err != nil && err != gorm.ErrRecordNotFound {
 		log.Printf("Failed to load security settings from DB: %v", err)
 	}
-	// apply loaded values to config/runtime
 	h.applySecurityConfig(&stored)
 
 	c.JSON(http.StatusOK, gin.H{
@@ -186,7 +174,6 @@ func (h *SettingsHandler) GetSecuritySettings(c *gin.Context) {
 	})
 }
 
-// GetDistributedSyncSettings returns distributed sync settings
 func (h *SettingsHandler) GetDistributedSyncSettings(c *gin.Context) {
 	settings := DistributedSyncSettingsRequest{
 		EnableDistributedSync: defaultEnableDistributedSync,
@@ -209,7 +196,6 @@ func (h *SettingsHandler) GetDistributedSyncSettings(c *gin.Context) {
 	})
 }
 
-// UpdateDistributedSyncSettings updates distributed sync settings and applies to runtime
 func (h *SettingsHandler) UpdateDistributedSyncSettings(c *gin.Context) {
 	var req DistributedSyncSettingsRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -217,12 +203,10 @@ func (h *SettingsHandler) UpdateDistributedSyncSettings(c *gin.Context) {
 		return
 	}
 
-	// Persist
 	if err := h.saveDistributedSyncToDB(&req); err != nil {
 		log.Printf("Failed to persist distributed sync settings: %v", err)
 	}
 
-	// Update config/runtime
 	h.applyDistributedSyncConfig(&req)
 	h.applyDistributedSyncToRuntime()
 
@@ -234,12 +218,10 @@ func (h *SettingsHandler) UpdateDistributedSyncSettings(c *gin.Context) {
 	})
 }
 
-// AuditLogSettingsRequest for audit log protocol filtering
 type AuditLogSettingsRequest struct {
 	EnabledProtocols map[string]bool `json:"enabled_protocols"` // protocol -> enabled
 }
 
-// GetAuditLogSettings returns audit log protocol settings
 func (h *SettingsHandler) GetAuditLogSettings(c *gin.Context) {
 	settings := AuditLogSettingsRequest{
 		EnabledProtocols: getDefaultAuditLogProtocols(),
@@ -252,7 +234,6 @@ func (h *SettingsHandler) GetAuditLogSettings(c *gin.Context) {
 	})
 }
 
-// UpdateAuditLogSettings updates audit log protocol settings
 func (h *SettingsHandler) UpdateAuditLogSettings(c *gin.Context) {
 	var req AuditLogSettingsRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -260,17 +241,13 @@ func (h *SettingsHandler) UpdateAuditLogSettings(c *gin.Context) {
 		return
 	}
 
-	// Persist
 	if err := h.saveAuditLogToDB(&req); err != nil {
 		log.Printf("Failed to persist audit log settings: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save settings"})
 		return
 	}
 
-	// Clear cache in policy and eBPF packages to force reload on next access
-	// This ensures that settings changes take effect immediately without waiting for cache TTL
 	policy.ClearAuditLogProtocolCache()
-	// Clear eBPF cache (stub implementation when eBPF is not compiled)
 	ebpf.ClearEBPFAuditLogProtocolCache()
 	log.Println("Audit log settings updated - caches cleared, new settings will be loaded on next access")
 
@@ -280,8 +257,6 @@ func (h *SettingsHandler) UpdateAuditLogSettings(c *gin.Context) {
 	})
 }
 
-// getDefaultAuditLogProtocols returns default enabled protocols
-// Default: TCP, UDP, HTTP, HTTPS enabled; DNS, ICMP disabled
 func getDefaultAuditLogProtocols() map[string]bool {
 	return map[string]bool{
 		"tcp":   true,
@@ -320,7 +295,6 @@ func (h *SettingsHandler) loadAuditLogFromDB(out *AuditLogSettingsRequest) error
 	return json.Unmarshal([]byte(setting.Value), out)
 }
 
-// UpdateSecuritySettings updates security and protection settings
 type SecuritySettingsRequest struct {
 	EnableRateLimit            bool  `json:"enable_rate_limit"`
 	RateLimitPerIP             int64 `json:"rate_limit_per_ip" binding:"min=1,max=100000"`
@@ -346,10 +320,8 @@ func (h *SettingsHandler) UpdateSecuritySettings(c *gin.Context) {
 		log.Printf("Failed to persist security settings: %v", err)
 	}
 
-	// Update config/runtime
 	h.applySecurityConfig(&req)
 
-	// 动态更新密码爆破防护配置（无需重启）
 	if h.vpnServer != nil {
 		bpInterface := h.vpnServer.GetBruteforceProtection()
 		if bpInterface != nil {
@@ -373,7 +345,6 @@ func (h *SettingsHandler) UpdateSecuritySettings(c *gin.Context) {
 		}
 	}
 
-	// Update eBPF rate limiting and DDoS protection config if eBPF program is loaded
 	if h.vpnServer != nil {
 		ebpfProg := h.vpnServer.GetEBPFProgram()
 		if ebpfProg != nil {
@@ -409,7 +380,6 @@ func (h *SettingsHandler) UpdateSecuritySettings(c *gin.Context) {
 	})
 }
 
-// GetBruteforceStats 获取密码爆破防护统计信息
 func (h *SettingsHandler) GetBruteforceStats(c *gin.Context) {
 	if h.vpnServer == nil {
 		c.JSON(http.StatusOK, gin.H{
@@ -439,7 +409,6 @@ func (h *SettingsHandler) GetBruteforceStats(c *gin.Context) {
 	}
 }
 
-// GetBlockedIPs 获取所有被封禁的IP
 func (h *SettingsHandler) GetBlockedIPs(c *gin.Context) {
 	if h.vpnServer == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "VPN server not initialized"})
@@ -473,13 +442,11 @@ func (h *SettingsHandler) GetBlockedIPs(c *gin.Context) {
 	})
 }
 
-// BlockIPRequest 手动封禁IP请求
 type BlockIPRequest struct {
 	IP       string `json:"ip" binding:"required"`
 	Duration int    `json:"duration"` // 封禁时长（分钟），0表示永久封禁
 }
 
-// BlockIP 手动封禁IP
 func (h *SettingsHandler) BlockIP(c *gin.Context) {
 	if h.vpnServer == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "VPN server not initialized"})
@@ -523,12 +490,10 @@ func (h *SettingsHandler) BlockIP(c *gin.Context) {
 	})
 }
 
-// UnblockIPRequest 解封IP请求
 type UnblockIPRequest struct {
 	IP string `json:"ip" binding:"required"`
 }
 
-// UnblockIP 手动解封IP
 func (h *SettingsHandler) UnblockIP(c *gin.Context) {
 	if h.vpnServer == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "VPN server not initialized"})
@@ -561,7 +526,6 @@ func (h *SettingsHandler) UnblockIP(c *gin.Context) {
 	})
 }
 
-// --- persistence helpers ---
 
 const (
 	perfSettingKey     = "performance_settings"
@@ -585,7 +549,6 @@ func (h *SettingsHandler) loadPerformanceFromDB(out *PerformanceSettingsRequest)
 	var setting models.SystemSetting
 	err := database.DB.Where("`key` = ?", perfSettingKey).First(&setting).Error
 	if err != nil {
-		// Don't log ErrRecordNotFound as it's expected when settings don't exist yet
 		if err == gorm.ErrRecordNotFound {
 			return err
 		}
@@ -609,7 +572,6 @@ func (h *SettingsHandler) loadDistributedSyncFromDB(out *DistributedSyncSettings
 	var setting models.SystemSetting
 	err := database.DB.Where("`key` = ?", distributedSyncKey).First(&setting).Error
 	if err != nil {
-		// Don't log ErrRecordNotFound as it's expected when settings don't exist yet
 		if err == gorm.ErrRecordNotFound {
 			return err
 		}
@@ -633,7 +595,6 @@ func (h *SettingsHandler) loadSecurityFromDB(out *SecuritySettingsRequest) error
 	var setting models.SystemSetting
 	err := database.DB.Where("`key` = ?", securitySettingKey).First(&setting).Error
 	if err != nil {
-		// Don't log ErrRecordNotFound as it's expected when settings don't exist yet
 		if err == gorm.ErrRecordNotFound {
 			return err
 		}
@@ -642,14 +603,12 @@ func (h *SettingsHandler) loadSecurityFromDB(out *SecuritySettingsRequest) error
 	return json.Unmarshal([]byte(setting.Value), out)
 }
 
-// loadPersistedSecuritySettings hydrates config from DB at startup.
 func (h *SettingsHandler) loadPersistedSecuritySettings() {
 	stored := SecuritySettingsRequest{}
 	if err := h.loadSecurityFromDB(&stored); err != nil {
 		if err != gorm.ErrRecordNotFound {
 			log.Printf("Failed to load security settings from DB: %v", err)
 		}
-		// DB missing → fall back to code defaults (config/env ignored)
 		stored = SecuritySettingsRequest{
 			EnableRateLimit:            defaultEnableRateLimit,
 			RateLimitPerIP:             defaultRateLimitPerIP,
@@ -667,14 +626,12 @@ func (h *SettingsHandler) loadPersistedSecuritySettings() {
 	h.applySecurityConfig(&stored)
 }
 
-// loadPersistedPerformanceSettings hydrates runtime cache defaults from DB at startup.
 func (h *SettingsHandler) loadPersistedPerformanceSettings() {
 	stored := PerformanceSettingsRequest{}
 	if err := h.loadPerformanceFromDB(&stored); err != nil {
 		if err != gorm.ErrRecordNotFound {
 			log.Printf("Failed to load performance settings from DB: %v", err)
 		}
-		// Fall back to code defaults; ignore config/env
 		stored = PerformanceSettingsRequest{
 			EnablePolicyCache: true,
 			CacheSize:         1000,
@@ -689,14 +646,12 @@ func (h *SettingsHandler) loadPersistedPerformanceSettings() {
 	}
 }
 
-// loadPersistedDistributedSyncSettings hydrates distributed sync settings from DB at startup.
 func (h *SettingsHandler) loadPersistedDistributedSyncSettings() {
 	stored := DistributedSyncSettingsRequest{}
 	if err := h.loadDistributedSyncFromDB(&stored); err != nil {
 		if err != gorm.ErrRecordNotFound {
 			log.Printf("Failed to load distributed sync settings from DB: %v", err)
 		}
-		// Fall back to code defaults (config file is ignored for this setting)
 		stored = DistributedSyncSettingsRequest{
 			EnableDistributedSync: defaultEnableDistributedSync,
 			SyncInterval:          defaultSyncInterval,
@@ -706,7 +661,6 @@ func (h *SettingsHandler) loadPersistedDistributedSyncSettings() {
 	h.applyDistributedSyncConfig(&stored)
 }
 
-// applySecurityConfig updates in-memory config from settings.
 func (h *SettingsHandler) applySecurityConfig(req *SecuritySettingsRequest) {
 	h.config.VPN.EnableRateLimit = req.EnableRateLimit
 	h.config.VPN.RateLimitPerIP = req.RateLimitPerIP
@@ -721,7 +675,6 @@ func (h *SettingsHandler) applySecurityConfig(req *SecuritySettingsRequest) {
 	h.config.VPN.LoginAttemptWindow = req.LoginAttemptWindow
 }
 
-// applySecurityToRuntime pushes current config security fields to runtime components.
 func (h *SettingsHandler) applySecurityToRuntime() {
 	req := SecuritySettingsRequest{
 		EnableRateLimit:            h.config.VPN.EnableRateLimit,
@@ -792,7 +745,6 @@ func (h *SettingsHandler) applyPerformanceToRuntime() {
 	}
 }
 
-// applyDistributedSyncConfig updates in-memory config from settings.
 func (h *SettingsHandler) applyDistributedSyncConfig(req *DistributedSyncSettingsRequest) {
 	if req.SyncInterval == 0 {
 		req.SyncInterval = defaultSyncInterval
@@ -805,7 +757,6 @@ func (h *SettingsHandler) applyDistributedSyncConfig(req *DistributedSyncSetting
 	h.config.VPN.ChangeCheckInterval = req.ChangeCheckInterval
 }
 
-// applyDistributedSyncToRuntime starts/stops distributed sync according to current config.
 func (h *SettingsHandler) applyDistributedSyncToRuntime() {
 	if h.vpnServer == nil {
 		return
@@ -815,7 +766,6 @@ func (h *SettingsHandler) applyDistributedSyncToRuntime() {
 		return
 	}
 
-	// Always stop current sync manager before applying new config
 	policyMgr.StopHookSync()
 
 	if !h.config.VPN.EnableDistributedSync {
@@ -838,7 +788,6 @@ func (h *SettingsHandler) applyDistributedSyncToRuntime() {
 		nodeID, changeInterval, syncInterval)
 }
 
-// GetWhitelistIPs 获取所有白名单IP
 func (h *SettingsHandler) GetWhitelistIPs(c *gin.Context) {
 	if h.vpnServer == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "VPN server not initialized"})
@@ -864,12 +813,10 @@ func (h *SettingsHandler) GetWhitelistIPs(c *gin.Context) {
 	})
 }
 
-// AddWhitelistIPRequest 添加白名单IP请求
 type AddWhitelistIPRequest struct {
 	IP string `json:"ip" binding:"required"`
 }
 
-// AddWhitelistIP 添加白名单IP
 func (h *SettingsHandler) AddWhitelistIP(c *gin.Context) {
 	if h.vpnServer == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "VPN server not initialized"})
@@ -905,12 +852,10 @@ func (h *SettingsHandler) AddWhitelistIP(c *gin.Context) {
 	})
 }
 
-// RemoveWhitelistIPRequest 移除白名单IP请求
 type RemoveWhitelistIPRequest struct {
 	IP string `json:"ip" binding:"required"`
 }
 
-// RemoveWhitelistIP 移除白名单IP
 func (h *SettingsHandler) RemoveWhitelistIP(c *gin.Context) {
 	if h.vpnServer == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "VPN server not initialized"})

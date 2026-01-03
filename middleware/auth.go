@@ -15,7 +15,6 @@ func AuthMiddleware(cfg *config.Config) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var token string
 		
-		// Try to get token from Authorization header first
 		authHeader := c.GetHeader("Authorization")
 		if authHeader != "" {
 			parts := strings.Split(authHeader, " ")
@@ -24,7 +23,6 @@ func AuthMiddleware(cfg *config.Config) gin.HandlerFunc {
 			}
 		}
 		
-		// If no token in header, try query parameter (for SSE connections)
 		if token == "" {
 			token = c.Query("token")
 		}
@@ -42,7 +40,6 @@ func AuthMiddleware(cfg *config.Config) gin.HandlerFunc {
 			return
 		}
 
-		// 检查用户是否仍然激活
 		var user models.User
 		if err := database.DB.First(&user, claims.UserID).Error; err != nil {
 			c.JSON(http.StatusUnauthorized, gin.H{"error": "User not found"})
@@ -56,7 +53,6 @@ func AuthMiddleware(cfg *config.Config) gin.HandlerFunc {
 			return
 		}
 
-		// Set user info in context
 		c.Set("user_id", claims.UserID)
 		c.Set("username", claims.Username)
 		c.Set("is_admin", claims.IsAdmin)

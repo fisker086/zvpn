@@ -16,12 +16,10 @@ func NewAuditLogHandler() *AuditLogHandler {
 	return &AuditLogHandler{}
 }
 
-// ListAuditLogs 获取审计日志列表
 func (h *AuditLogHandler) ListAuditLogs(c *gin.Context) {
 	var logs []models.AuditLog
 	query := database.DB.Model(&models.AuditLog{})
 
-	// 查询参数
 	userID := c.Query("user_id")
 	username := c.Query("username")
 	logType := c.Query("type")
@@ -32,7 +30,6 @@ func (h *AuditLogHandler) ListAuditLogs(c *gin.Context) {
 	endTime := c.Query("end_time")
 	result := c.Query("result")
 
-	// 应用过滤条件
 	if userID != "" {
 		if id, err := strconv.ParseUint(userID, 10, 32); err == nil {
 			query = query.Where("user_id = ?", uint(id))
@@ -67,18 +64,10 @@ func (h *AuditLogHandler) ListAuditLogs(c *gin.Context) {
 		}
 	}
 
-	// 默认排除系统自动生成的日志，只审计用户的实际操作
-	// 1. 排除DNS解析记录（DNS解析太频繁）
-	//    DNS解析记录的特征：protocol = 'dns' 或 resource_type = 'dns_query'
-	// 2. 排除eBPF自动允许的事件（系统级别的网络包处理，太频繁）
-	//    eBPF事件的特征：hook_id LIKE 'ebpf-policy-%' 且 result = 'allowed'
-	//    但保留eBPF拒绝的事件（blocked），因为这是重要的安全事件
-	//    注意：认证类型的日志（如登录、断开连接）不应该被过滤，所以只对access类型应用eBPF过滤
 	query = query.Where("NOT (protocol = ? OR resource_type = ?)", "dns", "dns_query").
 		Where("(type != ? OR NOT (COALESCE(hook_id, '') LIKE ? AND result = ?))", 
 			models.AuditLogTypeAccess, "ebpf-policy-%", "allowed")
 
-	// 分页
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	pageSize, _ := strconv.Atoi(c.DefaultQuery("page_size", "50"))
 	if page < 1 {
@@ -90,11 +79,9 @@ func (h *AuditLogHandler) ListAuditLogs(c *gin.Context) {
 
 	offset := (page - 1) * pageSize
 
-	// 获取总数
 	var total int64
 	query.Count(&total)
 
-	// 获取数据
 	if err := query.Order("created_at DESC").Offset(offset).Limit(pageSize).Find(&logs).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -109,7 +96,6 @@ func (h *AuditLogHandler) ListAuditLogs(c *gin.Context) {
 	})
 }
 
-// GetAuditLog 获取审计日志详情
 func (h *AuditLogHandler) GetAuditLog(c *gin.Context) {
 	id := c.Param("id")
 
@@ -122,7 +108,6 @@ func (h *AuditLogHandler) GetAuditLog(c *gin.Context) {
 	c.JSON(http.StatusOK, log)
 }
 
-// GetAuditLogStats 获取审计日志统计
 func (h *AuditLogHandler) GetAuditLogStats(c *gin.Context) {
 	startTime := c.Query("start_time")
 	endTime := c.Query("end_time")
@@ -140,11 +125,6 @@ func (h *AuditLogHandler) GetAuditLogStats(c *gin.Context) {
 		}
 	}
 
-	// 默认排除系统自动生成的日志，只审计用户的实际操作
-	// 1. 排除DNS解析记录（DNS解析太频繁）
-	// 2. 排除eBPF自动允许的事件（系统级别的网络包处理，太频繁）
-	//    但保留eBPF拒绝的事件（blocked），因为这是重要的安全事件
-	//    注意：认证类型的日志（如登录、断开连接）不应该被过滤，所以只对access类型应用eBPF过滤
 	query = query.Where("NOT (protocol = ? OR resource_type = ?)", "dns", "dns_query").
 		Where("(type != ? OR NOT (COALESCE(hook_id, '') LIKE ? AND result = ?))", 
 			models.AuditLogTypeAccess, "ebpf-policy-%", "allowed")
@@ -167,10 +147,8 @@ func (h *AuditLogHandler) GetAuditLogStats(c *gin.Context) {
 		} `json:"top_destinations"`
 	}
 
-	// 总数
 	query.Count(&stats.TotalLogs)
 
-	// 按类型统计
 	stats.TotalByType = make(map[string]int64)
 	var typeStats []struct {
 		Type  string
@@ -181,7 +159,6 @@ func (h *AuditLogHandler) GetAuditLogStats(c *gin.Context) {
 		stats.TotalByType[ts.Type] = ts.Count
 	}
 
-	// 按动作统计
 	stats.TotalByAction = make(map[string]int64)
 	var actionStats []struct {
 		Action string
@@ -192,12 +169,10 @@ func (h *AuditLogHandler) GetAuditLogStats(c *gin.Context) {
 		stats.TotalByAction[as.Action] = as.Count
 	}
 
-	// 访问统计（使用已过滤的query，已排除DNS记录）
 	query.Where("type = ?", models.AuditLogTypeAccess).Count(&stats.TotalAccess)
 	query.Where("result = ?", "blocked").Count(&stats.TotalBlocked)
 	query.Where("result = ?", "allowed").Count(&stats.TotalAllowed)
 
-	// Top users
 	var topUsers []struct {
 		UserID   uint   `json:"user_id"`
 		Username string `json:"username"`
@@ -211,7 +186,6 @@ func (h *AuditLogHandler) GetAuditLogStats(c *gin.Context) {
 		Scan(&topUsers)
 	stats.TopUsers = topUsers
 
-	// Top destinations
 	var topDests []struct {
 		DestinationIP string `json:"destination_ip"`
 		Count         int64  `json:"count"`
@@ -227,7 +201,6 @@ func (h *AuditLogHandler) GetAuditLogStats(c *gin.Context) {
 	c.JSON(http.StatusOK, stats)
 }
 
-// DeleteAuditLogs 删除审计日志（按条件）
 func (h *AuditLogHandler) DeleteAuditLogs(c *gin.Context) {
 	var req struct {
 		BeforeDate string `json:"before_date"` // 删除此日期之前的日志

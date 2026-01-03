@@ -695,8 +695,189 @@
           </a-form-item>
         </a-form>
           </a-tab-pane>
+
+          <!-- SSL 证书管理 -->
+          <a-tab-pane key="certificates" title="SSL 证书">
+            <a-space direction="vertical" :size="16" fill>
+              <a-alert type="info">
+                <template #title>证书管理说明</template>
+                <div style="font-size: 12px">
+                  <p>• 默认证书：用于所有未配置 SNI 证书的域名连接</p>
+                  <p>• SNI 证书：为特定域名配置专用证书（支持通配符，如 *.example.com）</p>
+                  <p>• 上传的证书会保存到配置文件指定的路径，重启后仍然有效</p>
+                </div>
+              </a-alert>
+
+              <!-- 默认证书 -->
+              <a-card title="默认证书" :bordered="true">
+                <template v-if="certificates.default_cert">
+                  <a-descriptions :column="2" bordered>
+                    <a-descriptions-item label="CN">
+                      {{ certificates.default_cert.common_name || '-' }}
+                    </a-descriptions-item>
+                    <a-descriptions-item label="颁发者">
+                      {{ certificates.default_cert.issuer || '-' }}
+                    </a-descriptions-item>
+                    <a-descriptions-item label="DNS 名称" :span="2">
+                      <a-tag v-for="dns in certificates.default_cert.dns_names" :key="dns" style="margin-right: 8px">
+                        {{ dns }}
+                      </a-tag>
+                      <span v-if="certificates.default_cert.dns_names.length === 0">-</span>
+                    </a-descriptions-item>
+                    <a-descriptions-item label="有效期">
+                      {{ certificates.default_cert.not_after }}
+                    </a-descriptions-item>
+                    <a-descriptions-item label="剩余天数">
+                      <a-tag :color="certificates.default_cert.is_expired ? 'red' : certificates.default_cert.days_remaining <= 30 ? 'orange' : 'green'">
+                        {{ certificates.default_cert.days_remaining }} 天
+                      </a-tag>
+                    </a-descriptions-item>
+                  </a-descriptions>
+                </template>
+                <template v-else>
+                  <a-empty description="未配置默认证书" />
+                </template>
+
+                <a-divider />
+
+                <a-form :model="defaultCertForm" layout="vertical">
+                  <a-form-item label="证书文件">
+                    <a-upload
+                      v-model:file-list="defaultCertForm.certFileList"
+                      :before-upload="() => false"
+                      accept=".pem,.crt,.cert"
+                      :max-count="1"
+                    >
+                      <template #upload-button>
+                        <a-button>
+                          <template #icon><icon-upload /></template>
+                          选择证书文件
+                        </a-button>
+                      </template>
+                    </a-upload>
+                  </a-form-item>
+
+                  <a-form-item label="私钥文件">
+                    <a-upload
+                      v-model:file-list="defaultCertForm.keyFileList"
+                      :before-upload="() => false"
+                      accept=".pem,.key"
+                      :max-count="1"
+                    >
+                      <template #upload-button>
+                        <a-button>
+                          <template #icon><icon-upload /></template>
+                          选择私钥文件
+                        </a-button>
+                      </template>
+                    </a-upload>
+                  </a-form-item>
+
+                  <a-form-item>
+                    <a-button type="primary" @click="handleUpdateDefaultCert" :loading="certLoading">
+                      更新默认证书
+                    </a-button>
+                    <a-button @click="loadCertificates" style="margin-left: 8px">
+                      刷新列表
+                    </a-button>
+                  </a-form-item>
+                </a-form>
+              </a-card>
+
+              <!-- SNI 证书列表 -->
+              <a-card title="SNI 证书列表" :bordered="true">
+                <template #extra>
+                  <a-button type="primary" @click="showAddSNIModal = true">
+                    <template #icon><icon-plus /></template>
+                    添加 SNI 证书
+                  </a-button>
+                </template>
+
+                <a-table
+                  :columns="sniCertColumns"
+                  :data="sniCertList"
+                  :pagination="false"
+                  :loading="certLoading"
+                >
+                  <template #dns_names="{ record }">
+                    <a-tag v-for="dns in record.dns_names" :key="dns" style="margin-right: 4px">
+                      {{ dns }}
+                    </a-tag>
+                  </template>
+
+                  <template #days_remaining="{ record }">
+                    <a-tag :color="record.is_expired ? 'red' : record.days_remaining <= 30 ? 'orange' : 'green'">
+                      {{ record.days_remaining }} 天
+                    </a-tag>
+                  </template>
+
+                  <template #actions="{ record }">
+                    <a-button type="text" status="danger" @click="handleRemoveSNICert(record.sni)">
+                      删除
+                    </a-button>
+                  </template>
+                </a-table>
+              </a-card>
+            </a-space>
+          </a-tab-pane>
         </a-tabs>
       </a-card>
+
+      <!-- 添加 SNI 证书弹窗 -->
+      <a-modal
+        v-model:visible="showAddSNIModal"
+        title="添加 SNI 证书"
+        :width="600"
+        @ok="handleAddSNICert"
+        @cancel="resetSNIForm"
+        :ok-loading="certLoading"
+      >
+        <a-form :model="sniCertForm" layout="vertical">
+          <a-form-item label="SNI 域名" required>
+            <a-input
+              v-model="sniCertForm.sni"
+              placeholder="例如: vpn.example.com 或 *.example.com"
+            />
+            <template #extra>
+              <a-typography-text type="secondary" style="font-size: 12px">
+                支持通配符，如 *.example.com
+              </a-typography-text>
+            </template>
+          </a-form-item>
+
+          <a-form-item label="证书文件" required>
+            <a-upload
+              v-model:file-list="sniCertForm.certFileList"
+              :before-upload="() => false"
+              accept=".pem,.crt,.cert"
+              :max-count="1"
+            >
+              <template #upload-button>
+                <a-button>
+                  <template #icon><icon-upload /></template>
+                  选择证书文件
+                </a-button>
+              </template>
+            </a-upload>
+          </a-form-item>
+
+          <a-form-item label="私钥文件" required>
+            <a-upload
+              v-model:file-list="sniCertForm.keyFileList"
+              :before-upload="() => false"
+              accept=".pem,.key"
+              :max-count="1"
+            >
+              <template #upload-button>
+                <a-button>
+                  <template #icon><icon-upload /></template>
+                  选择私钥文件
+                </a-button>
+              </template>
+            </a-upload>
+          </a-form-item>
+        </a-form>
+      </a-modal>
 
       <!-- LDAP 认证测试弹窗 -->
       <a-modal
@@ -789,10 +970,19 @@
 </template>
 
 <script setup lang="ts">
-import { ref, reactive, onMounted } from 'vue'
+import { ref, reactive, onMounted, computed } from 'vue'
 import { ldapApi, type UpdateLDAPConfigRequest, type LDAPAuthTestRequest, type LDAPSyncResponse, type LDAPAttributeMapping } from '@/api/ldap'
 import { Message, Modal } from '@arco-design/web-vue'
 import request from '@/api/request'
+import {
+  getCertificates,
+  addSNICertificate,
+  removeSNICertificate,
+  updateDefaultCertificate,
+  type CertInfo,
+  type CertificateListResponse,
+} from '@/api/certificates'
+import { IconUpload, IconPlus } from '@arco-design/web-vue/es/icon'
 
 const submitLoading = ref(false)
 const testLoading = ref(false)
@@ -834,6 +1024,64 @@ const performanceLoading = ref(false)
 const securityLoading = ref(false)
 const distributedLoading = ref(false)
 const auditLogLoading = ref(false)
+
+// 证书管理相关
+const certLoading = ref(false)
+const certificates = ref<CertificateListResponse>({
+  default_cert: null,
+  sni_certs: {},
+  total: 0,
+})
+const showAddSNIModal = ref(false)
+const defaultCertForm = reactive({
+  certFileList: [] as any[],
+  keyFileList: [] as any[],
+})
+const sniCertForm = reactive({
+  sni: '',
+  certFileList: [] as any[],
+  keyFileList: [] as any[],
+})
+
+// SNI 证书列表
+const sniCertList = computed(() => {
+  return Object.entries(certificates.value.sni_certs).map(([sni, info]) => ({
+    ...info,
+    sni,
+  }))
+})
+
+// SNI 证书表格列
+const sniCertColumns = [
+  {
+    title: 'SNI 域名',
+    dataIndex: 'sni',
+  },
+  {
+    title: 'CN',
+    dataIndex: 'common_name',
+  },
+  {
+    title: 'DNS 名称',
+    slotName: 'dns_names',
+  },
+  {
+    title: '颁发者',
+    dataIndex: 'issuer',
+  },
+  {
+    title: '有效期至',
+    dataIndex: 'not_after',
+  },
+  {
+    title: '剩余天数',
+    slotName: 'days_remaining',
+  },
+  {
+    title: '操作',
+    slotName: 'actions',
+  },
+]
 
 // 流量压缩配置
 const compressionForm = reactive({
@@ -1320,9 +1568,109 @@ const handleAuditLogSubmit = async () => {
   }
 }
 
+// 加载证书列表
+const loadCertificates = async () => {
+  certLoading.value = true
+  try {
+    const data = await getCertificates()
+    certificates.value = data
+  } catch (error: any) {
+    Message.error(error.response?.data?.error || '获取证书列表失败')
+  } finally {
+    certLoading.value = false
+  }
+}
+
+// 更新默认证书
+const handleUpdateDefaultCert = async () => {
+  if (defaultCertForm.certFileList.length === 0 || defaultCertForm.keyFileList.length === 0) {
+    Message.warning('请选择证书文件和私钥文件')
+    return
+  }
+
+  certLoading.value = true
+  try {
+    const formData = new FormData()
+    formData.append('cert', defaultCertForm.certFileList[0].file as File)
+    formData.append('key', defaultCertForm.keyFileList[0].file as File)
+
+    await updateDefaultCertificate(formData)
+    Message.success('默认证书更新成功')
+    defaultCertForm.certFileList = []
+    defaultCertForm.keyFileList = []
+    await loadCertificates()
+  } catch (error: any) {
+    Message.error(error.response?.data?.error || '更新默认证书失败')
+  } finally {
+    certLoading.value = false
+  }
+}
+
+// 添加 SNI 证书
+const handleAddSNICert = async () => {
+  if (!sniCertForm.sni) {
+    Message.warning('请输入 SNI 域名')
+    return
+  }
+
+  if (sniCertForm.certFileList.length === 0 || sniCertForm.keyFileList.length === 0) {
+    Message.warning('请选择证书文件和私钥文件')
+    return
+  }
+
+  certLoading.value = true
+  try {
+    const formData = new FormData()
+    formData.append('sni', sniCertForm.sni)
+    formData.append('cert', sniCertForm.certFileList[0].file as File)
+    formData.append('key', sniCertForm.keyFileList[0].file as File)
+
+    await addSNICertificate(formData)
+    Message.success('SNI 证书添加成功')
+    resetSNIForm()
+    showAddSNIModal.value = false
+    await loadCertificates()
+  } catch (error: any) {
+    Message.error(error.response?.data?.error || '添加 SNI 证书失败')
+  } finally {
+    certLoading.value = false
+  }
+}
+
+// 删除 SNI 证书
+const handleRemoveSNICert = async (sni: string) => {
+  Modal.confirm({
+    title: '确认删除',
+    content: `确定要删除 SNI 证书 "${sni}" 吗？`,
+    okText: '确认删除',
+    cancelText: '取消',
+    okButtonProps: { status: 'danger' },
+    onOk: async () => {
+      certLoading.value = true
+      try {
+        await removeSNICertificate(sni)
+        Message.success('SNI 证书删除成功')
+        await loadCertificates()
+      } catch (error: any) {
+        Message.error(error.response?.data?.error || '删除 SNI 证书失败')
+      } finally {
+        certLoading.value = false
+      }
+    },
+  })
+}
+
+// 重置 SNI 表单
+const resetSNIForm = () => {
+  sniCertForm.sni = ''
+  sniCertForm.certFileList = []
+  sniCertForm.keyFileList = []
+}
+
 onMounted(() => {
   fetchConfig()
   fetchVPNConfig()
+  loadCertificates()
 })
 </script>
 
@@ -1362,4 +1710,5 @@ onMounted(() => {
   height: auto !important;
 }
 </style>
+
 

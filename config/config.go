@@ -38,7 +38,6 @@ type VPNConfig struct {
 	KeyFile           string `mapstructure:"keyfile"`
 	EBPFInterfaceName string `mapstructure:"ebpfinterfacename"` // Network interface for eBPF XDP program
 
-	// Protocol configuration
 	EnableCustomProtocol bool   `mapstructure:"enablecustomprotocol"` // Enable custom SSL VPN protocol
 	CustomPort           string `mapstructure:"customport"`           // Custom protocol port (default: 443)
 	EnableOpenConnect    bool   `mapstructure:"enableopenconnect"`    // Enable OpenConnect protocol
@@ -46,11 +45,9 @@ type VPNConfig struct {
 	EnableDTLS           bool   `mapstructure:"enabledtls"`           // Enable DTLS (UDP) for better performance
 	DTLSPort             string `mapstructure:"dtlsport"`             // DTLS UDP port (default: 443, UDP)
 
-	// Zero-copy optimization (AF_XDP)
 	EnableAFXDP  bool `mapstructure:"enableafxdp"`  // Enable AF_XDP zero-copy (experimental)
 	AFXDPQueueID int  `mapstructure:"afxdpqueueid"` // AF_XDP queue ID (default: 0)
 
-	// Performance optimizations
 	EnableBatchProcessing bool  `mapstructure:"enablebatchprocessing"` // Enable batch TUN processing (epoll)
 	LogSampleRate         int64 `mapstructure:"logsamplerate"`         // Log sampling rate (0=all, N=every N packets)
 	EnableShardedLocks    bool  `mapstructure:"enableshardedlocks"`    // Enable sharded locks for better concurrency
@@ -64,30 +61,23 @@ type VPNConfig struct {
 	WriteBatchSize        int   `mapstructure:"writebatchsize"`        // Max packets per write batch (default: 10)
 	WriteBatchTimeout     int   `mapstructure:"writebatchtimeout"`     // Write batch timeout in milliseconds (default: 1)
 
-	// Distributed synchronization
 	EnableDistributedSync bool `mapstructure:"enabledistributedsync"` // Enable distributed sync for multi-node (default: true)
 	SyncInterval          int  `mapstructure:"syncinterval"`          // Full sync interval in seconds (default: 60)
 	ChangeCheckInterval   int  `mapstructure:"changecheckinterval"`   // Change check interval in seconds (default: 5)
 
-	// Compression configuration
 	EnableCompression bool   `mapstructure:"enablecompression"` // Enable traffic compression (default: false)
 	CompressionType   string `mapstructure:"compressiontype"`   // Compression type: none, lz4, gzip (default: none)
 
-	// Upstream DNS configuration (for fallback DNS in full tunnel mode)
 	UpstreamDNS string `mapstructure:"upstreamdns"` // Upstream DNS servers (comma-separated, default: 8.8.8.8:53,8.8.4.4:53)
 
-	// CSTP/DTLS keepalive configuration
 	CSTPDPD       int `mapstructure:"cstpdpd"`       // CSTP dead peer detection interval in seconds (default: 30)
 	CSTPKeepalive int `mapstructure:"cstpkeepalive"` // CSTP keepalive interval in seconds (default: 20)
 
-	// VPN profile configuration
 	VPNProfileName string `mapstructure:"vpnprofilename"` // VPN profile name shown in client (default: "ZVPN")
 
-	// Cisco client compatibility (ocserv protocol parameters)
 	CiscoClientCompat bool `mapstructure:"ciscoclientcompat"` // Enable Cisco client compatibility mode (default: true for AnyConnect support)
 	DTLSLegacy        bool `mapstructure:"dtlslegacy"`        // Enable legacy DTLS protocol support (default: true, supported by both OpenConnect and AnyConnect clients)
 
-	// Security and protection settings
 	EnableRateLimit      bool  `mapstructure:"enableratelimit"`      // Enable rate limiting (default: true)
 	RateLimitPerIP       int64 `mapstructure:"ratelimitperip"`       // Rate limit per IP (packets per second, default: 1000)
 	RateLimitPerUser     int64 `mapstructure:"ratelimitperuser"`     // Rate limit per user (bytes per second, default: 10485760 = 10MB/s)
@@ -95,19 +85,13 @@ type VPNConfig struct {
 	DDoSThreshold        int64 `mapstructure:"ddosthreshold"`        // DDoS detection threshold (packets per second per IP, default: 10000)
 	DDoSBlockDuration    int   `mapstructure:"ddosblockduration"`    // DDoS block duration in seconds (default: 300 = 5 minutes)
 
-	// Bruteforce protection settings
 	EnableBruteforceProtection bool `mapstructure:"enablebruteforceprotection"` // Enable bruteforce protection (default: true)
 	MaxLoginAttempts           int  `mapstructure:"maxloginattempts"`           // Maximum failed login attempts before blocking (default: 5)
 	LoginLockoutDuration       int  `mapstructure:"loginlockoutduration"`       // Lockout duration in seconds (default: 900 = 15 minutes)
 	LoginAttemptWindow         int  `mapstructure:"loginattemptwindow"`         // Time window for counting attempts in seconds (default: 300 = 5 minutes)
 
-	// Session/concurrency settings
 	AllowMultiClientLogin bool `mapstructure:"allowmulticlientlogin"` // Allow same account multiple concurrent logins
 
-	// Local network access control (similar to AnyLink's allow_lan)
-	// When allow_lan=true, excludes local network traffic in full tunnel mode (priority over global route settings)
-	// Requires client to enable "Allow Local Lan" option to take effect
-	// Behavior: Local network traffic bypasses VPN, all other traffic goes through VPN tunnel
 	AllowLan bool `mapstructure:"allow_lan"`
 }
 
@@ -127,19 +111,15 @@ type LDAPConfig struct {
 	AdminGroup   string
 }
 
-// Load 加载配置文件
 func Load() *Config {
-	// 设置配置文件名和路径
 	viper.SetConfigName("config")
 	viper.SetConfigType("yaml")
 	viper.AddConfigPath(".")
 	viper.AddConfigPath("./config")
 	viper.AddConfigPath("/etc/zvpn")
 
-	// 设置默认值
 	setDefaults()
 
-	// 环境变量映射
 	viper.BindEnv("vpn.network", "VPN_NETWORK")
         viper.BindEnv("vpn.certfile", "VPN_CERT")
 	viper.BindEnv("vpn.keyfile", "VPN_KEY")
@@ -166,47 +146,37 @@ func Load() *Config {
 	viper.BindEnv("vpn.loginattemptwindow", "VPN_LOGIN_ATTEMPT_WINDOW")
 	viper.BindEnv("vpn.allowmulticlientlogin", "VPN_ALLOW_MULTI_CLIENT_LOGIN")
 
-	// 允许环境变量覆盖配置文件
 	viper.AutomaticEnv()
 
-	// 读取配置文件
 	if err := viper.ReadInConfig(); err != nil {
 		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
-			// 配置文件不存在，使用默认值
 			log.Println("⚠️  配置文件未找到，使用默认配置")
 		} else {
-			// 配置文件存在但读取失败
 			log.Fatalf("❌ 读取配置文件失败: %v", err)
 		}
 	} else {
 		log.Printf("✓ 配置文件加载成功: %s", viper.ConfigFileUsed())
 	}
 
-	// 解析配置到结构体
 	var config Config
 	if err := viper.Unmarshal(&config); err != nil {
 		log.Fatalf("❌ 解析配置失败: %v", err)
 	}
 
-	// 验证配置
 	if err := validateConfig(&config); err != nil {
 		log.Fatalf("❌ 配置验证失败: %v", err)
 	}
 
-	// 打印配置摘要
 	printConfigSummary(&config)
 
 	return &config
 }
 
-// setDefaults 设置默认配置
 func setDefaults() {
-	// 服务器默认配置
 	viper.SetDefault("server.host", "0.0.0.0")
 	viper.SetDefault("server.port", "18080")
 	viper.SetDefault("server.mode", "debug")
 
-	// 数据库默认配置
 	viper.SetDefault("database.type", "mysql")
 	viper.SetDefault("database.dsn", "zvpn:zvpn@tcp(127.0.0.1:3306)/zvpn?charset=utf8mb4&parseTime=True&loc=Local")
 	viper.SetDefault("database.maxopenconns", 25)     // 最大打开连接数
@@ -214,7 +184,6 @@ func setDefaults() {
 	viper.SetDefault("database.connmaxlifetime", 300) // 连接最大生存时间（秒）
 	viper.SetDefault("database.connmaxidletime", 60)  // 连接最大空闲时间（秒）
 
-	// VPN 默认配置
 	viper.SetDefault("vpn.interfacename", "zvpn0")
 	viper.SetDefault("vpn.ebpfinterfacename", "eth0")
 	viper.SetDefault("vpn.network", "10.8.0.0/24")
@@ -238,22 +207,18 @@ func setDefaults() {
 	viper.SetDefault("vpn.cstpbatchmaxsize", 8192)      // Max 8KB per batch
 	viper.SetDefault("vpn.cstpbatchtimeout", 10)        // 10ms timeout
 
-	// Distributed synchronization defaults
 	viper.SetDefault("vpn.enabledistributedsync", true) // Enabled by default for multi-node support
 	viper.SetDefault("vpn.syncinterval", 60)            // Full sync every 60 seconds
 
-	// Compression defaults
 	viper.SetDefault("vpn.enablecompression", false) // Disabled by default
 	viper.SetDefault("vpn.compressiontype", "none")  // none, lz4, gzip
 
-	// Upstream DNS defaults (for fallback DNS in full tunnel mode)
 	viper.SetDefault("vpn.upstreamdns", "8.8.8.8:53,8.8.4.4:53") // Upstream DNS servers
 	viper.SetDefault("vpn.changecheckinterval", 5)               // Check for changes every 5 seconds
 	viper.SetDefault("vpn.cstpbatchmaxpackets", 10)              // Max 10 packets per batch
 	viper.SetDefault("vpn.cstpbatchmaxsize", 8192)               // Max 8KB per batch
 	viper.SetDefault("vpn.cstpbatchtimeout", 10)                 // 10ms timeout
 
-	// Security and protection defaults (disabled by default, no rate limiting)
 	viper.SetDefault("vpn.enableratelimit", false)      // Disable rate limiting by default
 	viper.SetDefault("vpn.ratelimitperip", 1000)        // 1000 packets per second per IP (when enabled)
 	viper.SetDefault("vpn.ratelimitperuser", 10485760)  // 10MB/s per user (bytes per second, when enabled)
@@ -262,20 +227,16 @@ func setDefaults() {
 	viper.SetDefault("vpn.ddosblockduration", 300)      // Block for 5 minutes (when enabled)
 	viper.SetDefault("vpn.allowmulticlientlogin", true) // Allow same account multiple concurrent logins by default
 
-	// Bruteforce protection defaults
 	viper.SetDefault("vpn.enablebruteforceprotection", true) // Enable bruteforce protection by default
 	viper.SetDefault("vpn.maxloginattempts", 5)              // 5 failed attempts before blocking
 	viper.SetDefault("vpn.loginlockoutduration", 900)        // Block for 15 minutes
 	viper.SetDefault("vpn.loginattemptwindow", 300)          // Count attempts within 5 minutes
 
-	// Local network access control defaults (similar to AnyLink's allow_lan)
 	viper.SetDefault("vpn.allow_lan", true) // Enable by default to exclude local network traffic in full tunnel mode
 
-	// JWT 默认配置
 	viper.SetDefault("jwt.secret", "your-secret-key-change-this")
 	viper.SetDefault("jwt.expiration", 24)
 
-	// LDAP 默认配置
 	viper.SetDefault("ldap.enabled", false)
 	viper.SetDefault("ldap.host", "ldap.company.com")
 	viper.SetDefault("ldap.port", 389)
@@ -288,24 +249,19 @@ func setDefaults() {
 	viper.SetDefault("ldap.skiptlsverify", false)
 }
 
-// validateConfig 验证配置
 func validateConfig(cfg *Config) error {
-	// 验证数据库类型
 	if cfg.Database.Type != "mysql" && cfg.Database.Type != "postgres" && cfg.Database.Type != "postgresql" {
 		return fmt.Errorf("不支持的数据库类型: %s (仅支持 mysql 或 postgres)", cfg.Database.Type)
 	}
 
-	// 验证数据库 DSN
 	if cfg.Database.DSN == "" {
 		return fmt.Errorf("数据库 DSN 不能为空")
 	}
 
-	// 验证 JWT Secret
 	if cfg.JWT.Secret == "your-secret-key-change-this" {
 		log.Println("⚠️  警告: 使用默认 JWT Secret，生产环境请修改！")
 	}
 
-	// 验证 LDAP 配置
 	if cfg.LDAP.Enabled {
 		if cfg.LDAP.Host == "" || cfg.LDAP.BindDN == "" || cfg.LDAP.BaseDN == "" {
 			return fmt.Errorf("LDAP 已启用，但配置不完整")
@@ -315,7 +271,6 @@ func validateConfig(cfg *Config) error {
 	return nil
 }
 
-// printConfigSummary 打印配置摘要
 func printConfigSummary(cfg *Config) {
 	log.Println("==================== 当前配置 ====================")
 	log.Printf("管理 API: http://%s:%s (mode: %s)", cfg.Server.Host, cfg.Server.Port, cfg.Server.Mode)

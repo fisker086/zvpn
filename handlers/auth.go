@@ -45,10 +45,8 @@ func NewAuthHandler(cfg *config.Config, vpnServer interface{}) *AuthHandler {
 		log.Println("LDAP authentication enabled")
 	}
 
-	// 从 VPNServer 获取密码爆破防护实例（如果已初始化）
 	var bruteforceProtection *security.BruteforceProtection
 	if vpnServer != nil {
-		// 使用类型断言获取 VPNServer
 		if vs, ok := vpnServer.(interface{ GetBruteforceProtection() interface{} }); ok {
 			if bpInterface := vs.GetBruteforceProtection(); bpInterface != nil {
 				if bp, ok := bpInterface.(*security.BruteforceProtection); ok {
@@ -59,7 +57,6 @@ func NewAuthHandler(cfg *config.Config, vpnServer interface{}) *AuthHandler {
 		}
 	}
 
-	// 如果 VPNServer 中没有，则创建新实例（向后兼容）
 	if bruteforceProtection == nil && cfg.VPN.EnableBruteforceProtection {
 		maxAttempts := cfg.VPN.MaxLoginAttempts
 		if maxAttempts <= 0 {
@@ -74,7 +71,6 @@ func NewAuthHandler(cfg *config.Config, vpnServer interface{}) *AuthHandler {
 			windowDuration = 5 * time.Minute // 默认5分钟
 		}
 		bruteforceProtection = security.NewBruteforceProtection(maxAttempts, lockoutDuration, windowDuration)
-		// 如果 eBPF 程序可用，设置它
 		if vpnServer != nil {
 			if vs, ok := vpnServer.(interface{ GetEBPFProgram() *ebpf.XDPProgram }); ok {
 				if ebpfProg := vs.GetEBPFProgram(); ebpfProg != nil {
@@ -119,15 +115,12 @@ func (h *AuthHandler) Login(c *gin.Context) {
 	clientIP := c.ClientIP()
 	log.Printf("Backend Login: Attempting login for user '%s' from IP %s", req.Username, clientIP)
 
-	// 后台登录不需要OTP验证，直接验证密码即可
-	// 注意：OTP双因素认证仅用于OpenConnect客户端登录，后台登录不使用OTP
 	if req.Password == "" {
 		log.Printf("Backend Login: Password is empty for user '%s'", req.Username)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Password is required"})
 		return
 	}
 
-	// 检查密码爆破防护
 	if h.bruteforceProtection != nil {
 		blocked, blockedUntil := h.bruteforceProtection.IsBlocked(clientIP)
 		if blocked {
@@ -142,17 +135,13 @@ func (h *AuthHandler) Login(c *gin.Context) {
 
 	var user models.User
 
-	// 从数据库读取LDAP配置
 	var ldapConfig models.LDAPConfig
 	if err := database.DB.First(&ldapConfig).Error; err != nil {
-		// 如果不存在，使用默认配置（禁用）
 		ldapConfig = models.LDAPConfig{Enabled: false}
 	}
 
-	// 如果LDAP启用，创建LDAP认证器（使用属性映射配置）
 	var ldapAuth *auth.LDAPAuthenticator
 	if ldapConfig.Enabled {
-		// 获取属性映射配置
 		mapping := ldapConfig.GetAttributeMapping()
 		authConfig := &auth.LDAPConfig{
 			Enabled:       ldapConfig.Enabled,
@@ -177,17 +166,13 @@ func (h *AuthHandler) Login(c *gin.Context) {
 			ldapConfig.Host, ldapConfig.Port, ldapConfig.UseSSL, ldapConfig.SkipTLSVerify)
 	}
 
-	// 认证逻辑：先查数据库，根据Source字段决定认证方式
-	// 1. 先检查用户是否存在于数据库中
 	var existingUser models.User
 	userExistsInDB := database.DB.Where("username = ?", req.Username).First(&existingUser).Error == nil
 
 	if userExistsInDB {
-		// 用户存在于数据库中，根据Source字段决定认证方式
 		log.Printf("Backend Login: User '%s' found in database (Source: %s)", req.Username, existingUser.Source)
 
 		if existingUser.Source == models.UserSourceLDAP {
-			// LDAP用户，使用LDAP认证
 			if ldapAuth == nil || !ldapConfig.Enabled {
 				log.Printf("Backend Login: User '%s' is LDAP user but LDAP is disabled", req.Username)
 				auditLogger := policy.GetAuditLogger()
@@ -202,13 +187,11 @@ func (h *AuthHandler) Login(c *gin.Context) {
 			log.Printf("Backend Login: Authenticating LDAP user '%s' via LDAP server", req.Username)
 			ldapUser, err := ldapAuth.Authenticate(req.Username, req.Password)
 			if err == nil {
-				// LDAP认证成功
 				if err := database.DB.Where("username = ?", req.Username).First(&user).Error; err != nil {
 					c.JSON(http.StatusInternalServerError, gin.H{"error": "User data error"})
 					return
 				}
 
-				// 检查账户是否被禁用
 				if !user.IsActive {
 					auditLogger := policy.GetAuditLogger()
 					auditLogger.LogAuthWithIP(user.ID, user.Username, models.AuditLogActionLogin, "failed", "Account disabled", clientIP, 0)
@@ -216,7 +199,6 @@ func (h *AuthHandler) Login(c *gin.Context) {
 					return
 				}
 
-				// 同步LDAP用户信息（如果需要）
 				updated := false
 				if user.Email != ldapUser.Email && ldapUser.Email != "" {
 					user.Email = ldapUser.Email
@@ -250,9 +232,7 @@ func (h *AuthHandler) Login(c *gin.Context) {
 				}
 
 				log.Printf("Backend Login: ✓ LDAP user '%s' authenticated successfully", req.Username)
-				// LDAP认证成功，继续后续流程生成JWT token
 			} else {
-				// LDAP认证失败
 				auditLogger := policy.GetAuditLogger()
 				auditLogger.LogAuthWithIP(existingUser.ID, req.Username, models.AuditLogActionLogin, "failed",
 					fmt.Sprintf("LDAP authentication failed: %v. Source IP: %s", err, clientIP), clientIP, 0)
@@ -278,7 +258,6 @@ func (h *AuthHandler) Login(c *gin.Context) {
 				return
 			}
 		} else {
-			// 系统账户，使用数据库认证
 			log.Printf("Backend Login: Authenticating system user '%s' via database", req.Username)
 			if err := database.DB.Where("username = ?", req.Username).First(&user).Error; err != nil {
 				log.Printf("Backend Login: User '%s' not found in database: %v", req.Username, err)
@@ -305,7 +284,6 @@ func (h *AuthHandler) Login(c *gin.Context) {
 				return
 			}
 
-			// 检查账户是否被禁用
 			if !user.IsActive {
 				log.Printf("Backend Login: User '%s' account is disabled", req.Username)
 				auditLogger := policy.GetAuditLogger()
@@ -314,7 +292,6 @@ func (h *AuthHandler) Login(c *gin.Context) {
 				return
 			}
 
-			// 验证密码
 			log.Printf("Backend Login: Checking password for system user '%s' (PasswordHash length: %d)", req.Username, len(user.PasswordHash))
 			if !user.CheckPassword(req.Password) {
 				log.Printf("Backend Login: Password check failed for system user '%s'", req.Username)
@@ -342,16 +319,12 @@ func (h *AuthHandler) Login(c *gin.Context) {
 			}
 
 			log.Printf("Backend Login: ✓ System user '%s' authenticated successfully", req.Username)
-			// 数据库认证成功，继续后续流程生成JWT token
 		}
 	} else {
-		// 用户不存在于数据库中
-		// 如果LDAP启用，尝试LDAP认证（可能是新的LDAP用户）
 		if ldapAuth != nil && ldapConfig.Enabled {
 			log.Printf("Backend Login: User '%s' not in database, trying LDAP authentication", req.Username)
 			ldapUser, err := ldapAuth.Authenticate(req.Username, req.Password)
 			if err == nil {
-				// LDAP认证成功，创建新用户
 				user = models.User{
 					Username: req.Username,
 					Email:    ldapUser.Email,
@@ -372,7 +345,6 @@ func (h *AuthHandler) Login(c *gin.Context) {
 					return
 				}
 
-				// 分配默认用户组
 				var defaultGroup models.UserGroup
 				groupName := "default"
 				if ldapUser.IsAdmin {
@@ -383,9 +355,7 @@ func (h *AuthHandler) Login(c *gin.Context) {
 				}
 
 				log.Printf("Backend Login: ✓ LDAP user '%s' created and authenticated", req.Username)
-				// LDAP认证成功，继续后续流程生成JWT token
 			} else {
-				// LDAP认证失败，用户不存在
 				auditLogger := policy.GetAuditLogger()
 				auditLogger.LogAuthWithIP(0, req.Username, models.AuditLogActionLogin, "failed",
 					fmt.Sprintf("User not found and LDAP authentication failed: %v. Source IP: %s", err, clientIP), clientIP, 0)
@@ -411,7 +381,6 @@ func (h *AuthHandler) Login(c *gin.Context) {
 				return
 			}
 		} else {
-			// LDAP未启用，用户不存在
 			log.Printf("Backend Login: User '%s' not found in database and LDAP is disabled", req.Username)
 			auditLogger := policy.GetAuditLogger()
 			auditLogger.LogAuthWithIP(0, req.Username, models.AuditLogActionLogin, "failed", "User not found", clientIP, 0)
@@ -437,7 +406,6 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		}
 	}
 
-	// 生成 JWT token（认证成功）
 	log.Printf("Backend Login: Generating JWT token for user '%s' (ID: %d)", req.Username, user.ID)
 	token, err := auth.GenerateToken(user.ID, user.Username, user.IsAdmin, h.config.JWT.Secret, h.config.JWT.Expiration)
 	if err != nil {
@@ -447,7 +415,6 @@ func (h *AuthHandler) Login(c *gin.Context) {
 	}
 	log.Printf("Backend Login: JWT token generated successfully for user '%s'", req.Username)
 
-	// 创建会话
 	session := &models.Session{
 		UserID:    user.ID,
 		Token:     token,
@@ -458,14 +425,11 @@ func (h *AuthHandler) Login(c *gin.Context) {
 	}
 	database.DB.Create(session)
 
-	// 清除密码哈希
 	user.PasswordHash = ""
 
-	// 记录审计日志
 	auditLogger := policy.GetAuditLogger()
 	auditLogger.LogAuthWithIP(user.ID, user.Username, models.AuditLogActionLogin, "success", "", clientIP, 0)
 
-	// 登录成功，清除该IP的失败记录
 	if h.bruteforceProtection != nil {
 		h.bruteforceProtection.RecordSuccess(clientIP)
 	}
@@ -477,7 +441,6 @@ func (h *AuthHandler) Login(c *gin.Context) {
 }
 
 func (h *AuthHandler) Logout(c *gin.Context) {
-	// Get user ID from context (set by auth middleware)
 	userID, exists := c.Get("user_id")
 	var username string
 	if exists {
@@ -487,7 +450,6 @@ func (h *AuthHandler) Logout(c *gin.Context) {
 		}
 	}
 
-	// Get token from header
 	authHeader := c.GetHeader("Authorization")
 	if authHeader != "" {
 		parts := c.GetHeader("Authorization")
@@ -497,7 +459,6 @@ func (h *AuthHandler) Logout(c *gin.Context) {
 		}
 	}
 
-	// 记录审计日志
 	if exists {
 		auditLogger := policy.GetAuditLogger()
 		clientIP := c.ClientIP()
@@ -520,15 +481,12 @@ func (h *AuthHandler) Profile(c *gin.Context) {
 	c.JSON(http.StatusOK, user)
 }
 
-// generatePasswordToken 生成密码验证token（用于多步骤认证）
 func (h *AuthHandler) generatePasswordToken(username string) string {
 	timestamp := time.Now().Unix()
 	message := fmt.Sprintf("%s:%d", username, timestamp)
 
-	// 使用JWT密钥生成密码验证token（与JWT使用相同的密钥）
 	secret := h.config.JWT.Secret
 	if secret == "" {
-		// 如果未配置，使用默认密钥（仅用于开发环境）
 		secret = "zvpn-default-secret-key-change-in-production"
 	}
 
@@ -539,9 +497,7 @@ func (h *AuthHandler) generatePasswordToken(username string) string {
 	return base64.URLEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", message, signature)))
 }
 
-// verifyPasswordToken 验证密码验证token
 func (h *AuthHandler) verifyPasswordToken(token string, username string) bool {
-	// 解码token
 	data, err := base64.URLEncoding.DecodeString(token)
 	if err != nil {
 		return false
@@ -556,12 +512,10 @@ func (h *AuthHandler) verifyPasswordToken(token string, username string) bool {
 	timestampStr := parts[1]
 	signature := parts[2]
 
-	// 验证用户名
 	if tokenUsername != username {
 		return false
 	}
 
-	// 验证时间戳（token有效期5分钟）
 	timestamp, err := strconv.ParseInt(timestampStr, 10, 64)
 	if err != nil {
 		return false
@@ -570,7 +524,6 @@ func (h *AuthHandler) verifyPasswordToken(token string, username string) bool {
 		return false
 	}
 
-	// 验证签名
 	message := fmt.Sprintf("%s:%d", username, timestamp)
 	secret := h.config.JWT.Secret
 	if secret == "" {
@@ -583,3 +536,4 @@ func (h *AuthHandler) verifyPasswordToken(token string, username string) bool {
 
 	return hmac.Equal([]byte(signature), []byte(expectedSignature))
 }
+

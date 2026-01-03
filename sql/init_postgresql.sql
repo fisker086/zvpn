@@ -237,6 +237,28 @@ CREATE TABLE IF NOT EXISTS system_settings (
     updated_at TIMESTAMP(3)
 );
 
+-- 证书表（SNI 证书管理）
+CREATE TABLE IF NOT EXISTS certificates (
+    id BIGSERIAL PRIMARY KEY,
+    sni VARCHAR(255) NOT NULL UNIQUE,
+    cert_data TEXT NOT NULL,
+    key_data TEXT NOT NULL,
+    common_name VARCHAR(255),
+    dns_names TEXT,
+    issuer VARCHAR(255),
+    not_before TIMESTAMP(3),
+    not_after TIMESTAMP(3),
+    is_active BOOLEAN DEFAULT TRUE,
+    description VARCHAR(500),
+    created_at TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP,
+    deleted_at TIMESTAMP(3) NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_certificates_sni ON certificates(sni);
+CREATE INDEX IF NOT EXISTS idx_certificates_is_active ON certificates(is_active);
+CREATE INDEX IF NOT EXISTS idx_certificates_deleted_at ON certificates(deleted_at);
+
 -- ============================================
 -- 初始数据
 -- ============================================
@@ -266,4 +288,5 @@ ON CONFLICT (id) DO NOTHING;
 INSERT INTO user_user_groups (user_id, user_group_id) 
 VALUES (1, 1)
 ON CONFLICT DO NOTHING;
+
 

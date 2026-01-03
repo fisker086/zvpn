@@ -19,7 +19,6 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -70,6 +69,15 @@ func validateSecureHeaders(c *gin.Context) bool {
 }
 
 func (h *Handler) GetConfig(c *gin.Context) {
+	// 检查连接是否仍然有效（避免在TLS握手失败后继续处理）
+	select {
+	case <-c.Request.Context().Done():
+		log.Printf("OpenConnect: GetConfig - Request context cancelled, connection may be closed (client: %s)", c.ClientIP())
+		return
+	default:
+		// 连接仍然有效，继续处理
+	}
+
 	// 记录请求的所有重要 header（用于调试）
 	log.Printf("OpenConnect: GET/POST / - Request headers from %s:", c.ClientIP())
 	log.Printf("  Method: %s", c.Request.Method)
@@ -154,11 +162,14 @@ func (h *Handler) GetConfig(c *gin.Context) {
 	}
 
 	log.Printf("OpenConnect: Processing request type: %s", requestType)
+	log.Printf("OpenConnect: Request details - Method: %s, Path: %s, RemoteAddr: %s, ContentLength: %d",
+		c.Request.Method, c.Request.URL.Path, c.ClientIP(), c.Request.ContentLength)
 
 	switch requestType {
 	case "init":
-		log.Printf("OpenConnect: Sending auth form (init request)")
+		log.Printf("OpenConnect: Handling init request - About to send auth form")
 		h.sendAuthForm(c)
+		log.Printf("OpenConnect: Init request completed - Auth form sent")
 		return
 
 	case "logout":
@@ -1425,6 +1436,16 @@ func (h *Handler) getConnectionHeader(c *gin.Context) string {
 
 // sendAuthForm 发送认证表单（用于初始化请求）
 func (h *Handler) sendAuthForm(c *gin.Context) {
+	// 检查连接是否仍然有效（避免在TLS握手失败后继续发送响应）
+	// 检查请求的context是否已取消
+	select {
+	case <-c.Request.Context().Done():
+		log.Printf("OpenConnect: sendAuthForm - Request context cancelled, connection may be closed (client: %s)", c.ClientIP())
+		return
+	default:
+		// 连接仍然有效，继续处理
+	}
+
 	// 检查客户端是否发送了 group-select 参数（Cisco Secure Client 的 default_group）
 	// 如果客户端发送了 group-select，使用客户端选择的组；否则使用 "default"
 	tunnelGroup := "default"
@@ -1462,12 +1483,12 @@ func (h *Handler) sendAuthForm(c *gin.Context) {
 	configHash := fmt.Sprintf("%d", time.Now().UnixNano()%10000000000)
 
 	// 构建 auth 部分的内容（添加 title 和 message，符合 AnyConnect 标准）
-	// form 必须包含 action 和 method 属性，AnyConnect 客户端才能正确提交
+	// 参考 anylink：form 标签不包含 method 和 action 属性
 	authContent := "    <auth id=\"main\">\n"
 	authContent += "        <title>Login</title>\n"
 	authContent += "        <message>Please enter your username and password.</message>\n"
 	authContent += "        <banner></banner>\n"
-	authContent += "        <form method=\"post\" action=\"/\">\n"
+	authContent += "        <form>\n"
 	authContent += "            <input type=\"text\" name=\"username\" label=\"Username:\"></input>\n"
 	authContent += "            <input type=\"password\" name=\"password\" label=\"Password:\"></input>\n"
 	authContent += "            <select name=\"group_list\" label=\"GROUP:\">\n"
@@ -1501,91 +1522,38 @@ func (h *Handler) sendAuthForm(c *gin.Context) {
 	// 记录完整的 XML 内容（用于调试）
 	log.Printf("OpenConnect: [RESPONSE] Server sending XML (type=\"auth-request\"):\n%s", xmlContent)
 
+	log.Printf("OpenConnect: sendAuthForm - About to send response - Status: %d, Content-Length: %d", http.StatusOK, len(xmlContent))
+
+	// 再次检查连接状态（在发送响应前）
+	select {
+	case <-c.Request.Context().Done():
+		log.Printf("OpenConnect: sendAuthForm - Connection closed before sending response (client: %s)", c.ClientIP())
+		return
+	default:
+		// 连接仍然有效，继续发送
+	}
+
+	// 使用Gin的Data方法发送响应
+	// 注意：如果连接已关闭，写入会失败，但Gin不会返回错误
+	// 错误会在底层的ResponseWriter中处理，由HTTP服务器的ErrorLog记录
+	// 使用defer recover来捕获可能的panic（如果连接已关闭）
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("OpenConnect: sendAuthForm - Panic while sending response (connection may be closed): %v", r)
+		}
+	}()
+
 	c.Data(http.StatusOK, "text/xml; charset=utf-8", []byte(xmlContent))
+	log.Printf("OpenConnect: sendAuthForm - Response sent successfully")
 
 	if flusher, ok := c.Writer.(http.Flusher); ok {
+		log.Printf("OpenConnect: sendAuthForm - Flushing response to client")
+		// 捕获flush错误
 		flusher.Flush()
 		log.Printf("OpenConnect: sendAuthForm - Response flushed, waiting for next request on keep-alive connection")
 	} else {
-		log.Printf("OpenConnect: sendAuthForm - Warning: ResponseWriter does not implement Flusher")
+		log.Printf("OpenConnect: sendAuthForm - Warning: ResponseWriter does not implement Flusher, cannot flush")
 	}
-}
-
-// extractVersionFromUserAgent 从 User-Agent 中提取客户端版本号
-// 支持多种格式：
-// - AnyConnect Linux_Arm64 5.1.13.177 -> 5.1.13.177
-// - AnyConnect Windows 5.1.13.177 -> 5.1.13.177
-// - OpenConnect 9.01 -> 9.01
-func extractVersionFromUserAgent(userAgent string) string {
-	if userAgent == "" {
-		return ""
-	}
-
-	// 匹配 AnyConnect 版本号格式：AnyConnect [OS] 版本号
-	// 例如：AnyConnect Linux_Arm64 5.1.13.177
-	re1 := regexp.MustCompile(`(?i)anyconnect[^0-9]*([0-9]+(?:\.[0-9]+){2,})`)
-	if matches := re1.FindStringSubmatch(userAgent); len(matches) >= 2 {
-		return matches[1]
-	}
-
-	// 匹配 OpenConnect 版本号格式：OpenConnect/版本号
-	// 例如：OpenConnect/9.01
-	re2 := regexp.MustCompile(`(?i)openconnect[/\s]+([0-9]+(?:\.[0-9]+)+)`)
-	if matches := re2.FindStringSubmatch(userAgent); len(matches) >= 2 {
-		return matches[1]
-	}
-
-	return ""
-}
-
-// extractDeviceIDFromUserAgent 从 User-Agent 中提取设备ID
-// 例如：AnyConnect Linux_Arm64 5.1.13.177 -> linux-64
-// 支持多种格式：
-// - AnyConnect Linux_Arm64 -> linux-64
-// - AnyConnect Windows_x64 -> win-64
-// - AnyConnect MacOS -> mac
-func extractDeviceIDFromUserAgent(userAgent string) string {
-	if userAgent == "" {
-		return ""
-	}
-
-	ua := strings.ToLower(userAgent)
-
-	// 提取操作系统和架构信息
-	var osName, arch string
-
-	// 操作系统（按优先级匹配，避免误匹配）
-	if strings.Contains(ua, "windows") || strings.Contains(ua, "win_") {
-		osName = "win"
-	} else if strings.Contains(ua, "macos") || strings.Contains(ua, "mac_") || (strings.Contains(ua, "mac") && !strings.Contains(ua, "arm")) {
-		osName = "mac"
-	} else if strings.Contains(ua, "linux") || strings.Contains(ua, "linux_") {
-		osName = "linux"
-	} else if strings.Contains(ua, "android") {
-		osName = "android"
-	} else if strings.Contains(ua, "iphone") || strings.Contains(ua, "ipad") || strings.Contains(ua, "ios") {
-		osName = "ios"
-	}
-
-	// 架构（按优先级匹配，避免误匹配）
-	// 优先匹配明确的架构标识
-	if strings.Contains(ua, "arm64") || strings.Contains(ua, "aarch64") {
-		arch = "arm64"
-	} else if strings.Contains(ua, "arm") && !strings.Contains(ua, "arm64") {
-		arch = "arm"
-	} else if strings.Contains(ua, "x86_64") || strings.Contains(ua, "amd64") || strings.Contains(ua, "_x64") || strings.Contains(ua, "_64") {
-		arch = "64"
-	} else if strings.Contains(ua, "x86") || strings.Contains(ua, "_32") {
-		arch = "32"
-	}
-
-	// 组合设备ID
-	if osName != "" && arch != "" {
-		return osName + "-" + arch
-	} else if osName != "" {
-		return osName
-	}
-	return ""
 }
 
 // buildAuthRequestXML 构建 auth-request 类型的 XML 响应的公共部分
@@ -1596,16 +1564,8 @@ func extractDeviceIDFromUserAgent(userAgent string) string {
 // aggauthHandle: 认证句柄（如果为空，使用默认值）
 // configHash: 配置哈希（如果为空，使用默认值）
 func (h *Handler) buildAuthRequestXML(c *gin.Context, authContent, tunnelGroup, groupAlias, aggauthHandle, configHash string) string {
-	// 根据实际请求判断 scheme（支持反向代理场景）
-	// 优先检查 X-Forwarded-Proto（反向代理场景），然后检查 TLS 连接
-	scheme := "https"
-	if proto := c.GetHeader("X-Forwarded-Proto"); proto != "" {
-		scheme = strings.ToLower(proto)
-	} else if c.Request.TLS == nil {
-		// 如果没有 TLS 连接且没有 X-Forwarded-Proto，则使用 http
-		scheme = "http"
-	}
-	serverURL := scheme + "://" + c.Request.Host
+	// 注意：认证阶段不包含 profile-url，所以不需要 serverURL
+	// profile-url 只在认证成功后的 auth-reply 响应中包含
 
 	// 使用默认值（如果未提供）
 	if aggauthHandle == "" {
@@ -1621,28 +1581,10 @@ func (h *Handler) buildAuthRequestXML(c *gin.Context, authContent, tunnelGroup, 
 		groupAlias = "default"
 	}
 
-	// 从 User-Agent 提取版本号和设备信息
-	userAgent := c.Request.UserAgent()
-	version := extractVersionFromUserAgent(userAgent)
-	deviceID := extractDeviceIDFromUserAgent(userAgent)
-
+	// 参考 anylink：auth_request XML 格式完全一致
+	// 不包含 version、device-id 和 group-select 标签，只包含 opaque 和 auth
 	xml := "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
 	xml += "<config-auth client=\"vpn\" type=\"auth-request\" aggregate-auth-version=\"2\">\n"
-
-	// 添加 version 标签（如果提取到版本号）
-	if version != "" {
-		xml += "    <version who=\"vpn\">" + version + "</version>\n"
-	}
-
-	// 添加 device-id 标签（可选，如果提取到设备信息）
-	if deviceID != "" {
-		xml += "    <device-id>" + deviceID + "</device-id>\n"
-	}
-
-	// 添加 group-select（可选，表示支持组选择）
-	xml += "    <group-select>true</group-select>\n"
-
-	// opaque 标签用于传递服务器组信息
 	xml += "    <opaque is-for=\"sg\">\n"
 	xml += "        <tunnel-group>" + tunnelGroup + "</tunnel-group>\n"
 	xml += "        <group-alias>" + groupAlias + "</group-alias>\n"
@@ -1651,9 +1593,9 @@ func (h *Handler) buildAuthRequestXML(c *gin.Context, authContent, tunnelGroup, 
 	xml += "        <auth-method>password</auth-method>\n"
 	xml += "    </opaque>\n"
 	xml += authContent
-	xml += "    <config>\n"
-	xml += "        <profile-url>" + serverURL + "/profile.xml</profile-url>\n"
-	xml += "    </config>\n"
+	// 注意：认证阶段不包含 profile-url，避免客户端立即尝试下载 profile.xml
+	// profile-url 只在认证成功后的 auth-reply 响应中包含（在 vpn-profile-manifest 中）
+	// 参考 anylink 的实现：auth_request 模板不包含 profile-url
 	xml += "</config-auth>"
 
 	return xml

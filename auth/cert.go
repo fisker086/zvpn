@@ -9,13 +9,11 @@ import (
 	"log"
 )
 
-// CertAuthenticator 证书认证器
 type CertAuthenticator struct {
 	caCertPool *x509.CertPool
 	clientCerts map[string]*x509.Certificate // username -> certificate
 }
 
-// NewCertAuthenticator 创建证书认证器
 func NewCertAuthenticator(caCertPath string) (*CertAuthenticator, error) {
 	caCertPool := x509.NewCertPool()
 	
@@ -45,7 +43,6 @@ func NewCertAuthenticator(caCertPath string) (*CertAuthenticator, error) {
 	}, nil
 }
 
-// VerifyClientCert 验证客户端证书
 func (c *CertAuthenticator) VerifyClientCert(conn *tls.Conn) (string, error) {
 	state := conn.ConnectionState()
 	
@@ -55,7 +52,6 @@ func (c *CertAuthenticator) VerifyClientCert(conn *tls.Conn) (string, error) {
 	
 	clientCert := state.PeerCertificates[0]
 	
-	// 验证证书链
 	opts := x509.VerifyOptions{
 		Roots: c.caCertPool,
 	}
@@ -64,7 +60,6 @@ func (c *CertAuthenticator) VerifyClientCert(conn *tls.Conn) (string, error) {
 		return "", fmt.Errorf("certificate verification failed: %w", err)
 	}
 	
-	// 从证书的CN或SAN中提取用户名
 	username := clientCert.Subject.CommonName
 	if username == "" && len(clientCert.DNSNames) > 0 {
 		username = clientCert.DNSNames[0]
@@ -74,19 +69,16 @@ func (c *CertAuthenticator) VerifyClientCert(conn *tls.Conn) (string, error) {
 		return "", fmt.Errorf("no username found in certificate")
 	}
 	
-	// 缓存客户端证书
 	c.clientCerts[username] = clientCert
 	
 	log.Printf("Certificate authenticator: Verified certificate for user %s", username)
 	return username, nil
 }
 
-// GetClientCert 获取客户端证书
 func (c *CertAuthenticator) GetClientCert(username string) *x509.Certificate {
 	return c.clientCerts[username]
 }
 
-// LoadClientCert 加载客户端证书（用于预配置）
 func (c *CertAuthenticator) LoadClientCert(username, certPath string) error {
 	certPEM, err := os.ReadFile(certPath)
 	if err != nil {

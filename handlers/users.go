@@ -50,7 +50,6 @@ func (h *UserHandler) ListUsers(c *gin.Context) {
 		return
 	}
 
-	// 清除密码哈希，不返回策略信息（策略只在用户组中管理）
 	for i := range users {
 		users[i].PasswordHash = ""
 	}
@@ -67,7 +66,6 @@ func (h *UserHandler) GetUser(c *gin.Context) {
 	}
 
 	user.PasswordHash = ""
-	// 不返回策略信息（策略只在用户组中管理）
 	c.JSON(http.StatusOK, user)
 }
 
@@ -78,7 +76,6 @@ func (h *UserHandler) CreateUser(c *gin.Context) {
 		return
 	}
 
-	// 验证用户组是否存在（必填）
 	if len(req.GroupIDs) == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "用户必须属于至少一个用户组"})
 		return
@@ -110,7 +107,6 @@ func (h *UserHandler) CreateUser(c *gin.Context) {
 		return
 	}
 
-	// 记录配置变更审计日志
 	auditLogger := policy.GetAuditLogger()
 	if auditLogger != nil {
 		operatorID, _ := c.Get("user_id")
@@ -130,11 +126,9 @@ func (h *UserHandler) CreateUser(c *gin.Context) {
 		})
 	}
 
-	// 预加载用户组（不加载策略，策略只在用户组中管理）
 	database.DB.Preload("Groups").First(user, user.ID)
 
 	user.PasswordHash = ""
-	// 不返回策略信息
 	c.JSON(http.StatusCreated, user)
 }
 
@@ -155,16 +149,12 @@ func (h *UserHandler) UpdateUser(c *gin.Context) {
 	if req.Email != "" {
 		user.Email = req.Email
 	}
-	// 更新FullName（如果提供了非空值则更新）
-	// 注意：空字符串不会更新，保持原值（如果需要清空，前端需要明确传递空字符串）
 	if req.FullName != "" {
 		user.FullName = req.FullName
 	}
-	// 更新IsAdmin
 	user.IsAdmin = req.IsAdmin
 	user.IsActive = req.IsActive
 
-	// 更新隧道模式（如果提供了）
 	updateTunnelMode := false
 	if req.TunnelMode != "" {
 		if req.TunnelMode != "split" && req.TunnelMode != "full" {
@@ -176,7 +166,6 @@ func (h *UserHandler) UpdateUser(c *gin.Context) {
 		updateTunnelMode = true
 	}
 
-	// 更新用户组（如果提供了，必须至少一个）
 	if req.GroupIDs != nil {
 		if len(req.GroupIDs) == 0 {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "用户必须属于至少一个用户组"})
@@ -187,24 +176,19 @@ func (h *UserHandler) UpdateUser(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "部分用户组不存在"})
 			return
 		}
-		// 更新关联关系
 		if err := database.DB.Model(&user).Association("Groups").Replace(groups); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
 	}
-	// 如果没有提供用户组字段（nil），保持原有用户组不变
 
-	// 处理密码更新（如果提供了密码字段）
 	updatePassword := false
 	if req.Password != "" {
-		// 检查是否是LDAP用户
 		if user.Source == models.UserSourceLDAP {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "Cannot change password for LDAP user. Password is managed by LDAP server."})
 			return
 		}
 
-		// 设置新密码
 		if err := user.SetPassword(req.Password); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to hash password"})
 			return
@@ -213,8 +197,6 @@ func (h *UserHandler) UpdateUser(c *gin.Context) {
 		log.Printf("UpdateUser: Password will be updated for user '%s'", user.Username)
 	}
 
-	// 使用 Select 明确指定要更新的字段
-	// 只更新实际需要更新的字段，避免意外覆盖其他字段
 	updateFields := []string{"email", "full_name", "is_admin", "is_active", "updated_at"}
 	if updateTunnelMode {
 		updateFields = append(updateFields, "tunnel_mode")
@@ -227,7 +209,6 @@ func (h *UserHandler) UpdateUser(c *gin.Context) {
 		return
 	}
 
-	// 记录配置变更审计日志
 	auditLogger := policy.GetAuditLogger()
 	if auditLogger != nil {
 		operatorID, _ := c.Get("user_id")
@@ -247,25 +228,21 @@ func (h *UserHandler) UpdateUser(c *gin.Context) {
 		})
 	}
 
-	// 预加载用户组（不加载策略，策略只在用户组中管理）
 	database.DB.Preload("Groups").First(&user, user.ID)
 
 	user.PasswordHash = ""
-	// 不返回策略信息
 	c.JSON(http.StatusOK, user)
 }
 
 func (h *UserHandler) DeleteUser(c *gin.Context) {
 	id := c.Param("id")
 
-	// 先获取用户信息用于审计日志
 	var user models.User
 	if err := database.DB.First(&user, id).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 		return
 	}
 
-	// 记录配置变更审计日志
 	auditLogger := policy.GetAuditLogger()
 	if auditLogger != nil {
 		operatorID, _ := c.Get("user_id")
@@ -285,7 +262,6 @@ func (h *UserHandler) DeleteUser(c *gin.Context) {
 		})
 	}
 
-	// 开始事务，确保所有删除操作原子性
 	tx := database.DB.Begin()
 	defer func() {
 		if r := recover(); r != nil {
@@ -293,28 +269,24 @@ func (h *UserHandler) DeleteUser(c *gin.Context) {
 		}
 	}()
 
-	// 1. 删除用户组关联关系（user_group_users 中间表）
 	if err := tx.Model(&user).Association("Groups").Clear(); err != nil {
 		tx.Rollback()
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to remove user from groups: %v", err)})
 		return
 	}
 
-	// 2. 删除用户的所有会话（sessions 表）
 	if err := tx.Where("user_id = ?", user.ID).Unscoped().Delete(&models.Session{}).Error; err != nil {
 		tx.Rollback()
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to delete user sessions: %v", err)})
 		return
 	}
 
-	// 3. 删除用户本身
 	if err := tx.Unscoped().Delete(&user).Error; err != nil {
 		tx.Rollback()
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to delete user: %v", err)})
 		return
 	}
 
-	// 提交事务
 	if err := tx.Commit().Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to commit transaction: %v", err)})
 		return
@@ -343,14 +315,12 @@ func (h *UserHandler) ChangePassword(c *gin.Context) {
 
 	log.Printf("ChangePassword: Changing password for user '%s' (ID: %d, Source: %s)", user.Username, user.ID, user.Source)
 
-	// 检查是否是LDAP用户
 	if user.Source == models.UserSourceLDAP {
 		log.Printf("ChangePassword: Cannot change password for LDAP user '%s' (password is managed by LDAP server)", user.Username)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Cannot change password for LDAP user. Password is managed by LDAP server."})
 		return
 	}
 
-	// 保存旧密码哈希长度用于日志
 	oldPasswordHashLen := len(user.PasswordHash)
 
 	if err := user.SetPassword(req.Password); err != nil {
@@ -362,15 +332,12 @@ func (h *UserHandler) ChangePassword(c *gin.Context) {
 	log.Printf("ChangePassword: Password hashed successfully for user '%s' (old hash length: %d, new hash length: %d)",
 		user.Username, oldPasswordHashLen, len(user.PasswordHash))
 
-	// 使用 Select 明确指定只更新 password_hash 字段，避免其他字段被覆盖
-	// 这样可以确保密码修改不会影响其他字段
 	if err := database.DB.Model(&user).Select("password_hash", "updated_at").Updates(user).Error; err != nil {
 		log.Printf("ChangePassword: Failed to save password for user '%s': %v", user.Username, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
-	// 验证密码是否真的被更新了
 	var verifyUser models.User
 	if err := database.DB.Select("password_hash").First(&verifyUser, user.ID).Error; err == nil {
 		if verifyUser.PasswordHash == user.PasswordHash {
@@ -386,7 +353,6 @@ func (h *UserHandler) ChangePassword(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Password changed"})
 }
 
-// GetOTP 获取用户OTP状态
 func (h *UserHandler) GetOTP(c *gin.Context) {
 	id := c.Param("id")
 	var user models.User
@@ -400,7 +366,6 @@ func (h *UserHandler) GetOTP(c *gin.Context) {
 	})
 }
 
-// GenerateOTP 为用户生成OTP密钥
 func (h *UserHandler) GenerateOTP(c *gin.Context) {
 	id := c.Param("id")
 	var user models.User
@@ -409,7 +374,6 @@ func (h *UserHandler) GenerateOTP(c *gin.Context) {
 		return
 	}
 
-	// 生成OTP密钥和key对象（用于生成二维码）
 	key, err := totp.Generate(totp.GenerateOpts{
 		Issuer:      "ZVPN",
 		AccountName: user.Username,
@@ -422,14 +386,12 @@ func (h *UserHandler) GenerateOTP(c *gin.Context) {
 	secret := key.Secret()
 	url := key.URL()
 
-	// 生成二维码图片
 	img, err := key.Image(200, 200)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate QR code"})
 		return
 	}
 
-	// 将图片转换为base64
 	var buf strings.Builder
 	buf.WriteString("data:image/png;base64,")
 	encoder := base64.NewEncoder(base64.StdEncoding, &buf)
@@ -440,8 +402,6 @@ func (h *UserHandler) GenerateOTP(c *gin.Context) {
 	encoder.Close()
 	qrCode := buf.String()
 
-	// 保存OTP密钥到用户
-	// 使用 Select 明确指定只更新 OTP 相关字段，避免覆盖密码
 	user.OTPSecret = secret
 	user.OTPEnabled = true
 	if err := database.DB.Model(&user).Select("otp_secret", "otp_enabled", "updated_at").Updates(user).Error; err != nil {
@@ -449,7 +409,6 @@ func (h *UserHandler) GenerateOTP(c *gin.Context) {
 		return
 	}
 
-	// 记录OTP配置变更审计日志
 	auditLogger := policy.GetAuditLogger()
 	if auditLogger != nil {
 		operatorID, _ := c.Get("user_id")
@@ -478,7 +437,6 @@ func (h *UserHandler) GenerateOTP(c *gin.Context) {
 	})
 }
 
-// DisableOTP 禁用用户OTP
 func (h *UserHandler) DisableOTP(c *gin.Context) {
 	id := c.Param("id")
 	var user models.User
@@ -487,8 +445,6 @@ func (h *UserHandler) DisableOTP(c *gin.Context) {
 		return
 	}
 
-	// 清除OTP密钥并禁用
-	// 使用 Select 明确指定只更新 OTP 相关字段，避免覆盖密码
 	user.OTPSecret = ""
 	user.OTPEnabled = false
 	if err := database.DB.Model(&user).Select("otp_secret", "otp_enabled", "updated_at").Updates(user).Error; err != nil {
@@ -496,7 +452,6 @@ func (h *UserHandler) DisableOTP(c *gin.Context) {
 		return
 	}
 
-	// 记录OTP配置变更审计日志
 	auditLogger := policy.GetAuditLogger()
 	if auditLogger != nil {
 		operatorID, _ := c.Get("user_id")

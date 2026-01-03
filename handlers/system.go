@@ -44,7 +44,6 @@ func NewSystemHandler(iface string) *SystemHandler {
 	return &SystemHandler{iface: iface}
 }
 
-// GetMetrics returns basic system resource usage (Linux)
 func (h *SystemHandler) GetMetrics(c *gin.Context) {
 	metrics := SystemMetrics{}
 
@@ -60,7 +59,6 @@ func (h *SystemHandler) GetMetrics(c *gin.Context) {
 
 	memTotal, memFree, memAvail, swapTotal, swapFree := readMemInfo()
 	metrics.MemTotal = memTotal
-	// 优先使用 MemAvailable 估算已用
 	if memAvail > 0 {
 		metrics.MemUsed = memTotal - memAvail
 		metrics.MemFree = memAvail
@@ -174,7 +172,6 @@ func readNetDevBytes(iface string) (tx uint64, rx uint64, err error) {
 		if len(fields) < 16 {
 			continue
 		}
-		// /proc/net/dev columns: rx bytes at index 0, tx bytes at index 8
 		rx, _ = strconv.ParseUint(fields[0], 10, 64)
 		tx, _ = strconv.ParseUint(fields[8], 10, 64)
 		return tx, rx, nil

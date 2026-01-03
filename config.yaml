@@ -21,7 +21,7 @@ vpn:
   # 网络配置
   interfacename: "zvpn0"
   network: "10.8.0.0/24"  # 使用与环境变量一致的网段
-  mtu: 1400
+  mtu: 1460
   ebpfinterfacename: "eth0"  # 指定eBPF程序要挂载的物理网卡（如eth0, ens33, enp0s3等）
   
   # SSL 证书配置

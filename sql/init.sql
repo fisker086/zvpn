@@ -230,6 +230,27 @@ CREATE TABLE IF NOT EXISTS system_settings (
     updated_at DATETIME(3)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- 证书表（SNI 证书管理）
+CREATE TABLE IF NOT EXISTS certificates (
+    id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    sni VARCHAR(255) NOT NULL UNIQUE COMMENT 'SNI 域名（唯一索引）',
+    cert_data LONGTEXT NOT NULL COMMENT '证书内容（PEM格式）',
+    key_data LONGTEXT NOT NULL COMMENT '私钥内容（PEM格式）',
+    common_name VARCHAR(255) COMMENT '证书 CN',
+    dns_names TEXT COMMENT 'DNS 名称列表（JSON格式）',
+    issuer VARCHAR(255) COMMENT '颁发者',
+    not_before DATETIME(3) COMMENT '有效期开始',
+    not_after DATETIME(3) COMMENT '有效期结束',
+    is_active BOOLEAN DEFAULT TRUE COMMENT '是否启用',
+    description VARCHAR(500) COMMENT '描述信息',
+    created_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
+    updated_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+    deleted_at DATETIME(3) NULL,
+    INDEX idx_sni (sni),
+    INDEX idx_is_active (is_active),
+    INDEX idx_deleted_at (deleted_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 -- ============================================
 -- 初始数据
 -- ============================================
@@ -254,4 +275,5 @@ VALUES (1, 'admin', '$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhW
 -- 关联管理员用户和管理员组
 INSERT IGNORE INTO user_user_groups (user_id, user_group_id) 
 VALUES (1, 1);
+
 
