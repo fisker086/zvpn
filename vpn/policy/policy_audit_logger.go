@@ -61,132 +61,17 @@ func (al *AuditLogger) IsEnabled() bool {
 	return al.enabled
 }
 
-// inferApplicationProtocol infers application layer protocol from network protocol and port
-// For TCP/UDP: infers application protocol from destination port (e.g., 80 -> http, 443 -> https)
-// For ICMP and other protocols: returns network protocol as-is (e.g., "icmp")
-func inferApplicationProtocol(netProtocol string, dstPort uint16) string {
-	// If not TCP or UDP (e.g., ICMP), return network protocol as-is
-	// ICMP doesn't have ports, so we can't infer application protocol from port
-	if netProtocol != "tcp" && netProtocol != "udp" {
-		return netProtocol
-	}
-
-	// Common port mappings for application protocols
-	switch dstPort {
-	case 20, 21:
-		return "ftp"
-	case 22:
-		return "ssh"
-	case 23:
-		return "telnet"
-	case 25:
-		return "smtp"
-	case 53:
-		if netProtocol == "udp" {
-			return "dns"
-		}
-		return netProtocol // TCP DNS is less common
-	case 67, 68:
-		return "dhcp"
-	case 69:
-		return "tftp"
-	case 80:
-		return "http"
-	case 443:
-		return "https"
-	case 8080:
-		return "http-alt"
-	case 8443:
-		return "https-alt"
-	case 3306:
-		return "mysql"
-	case 5432:
-		return "postgresql"
-	case 6379:
-		return "redis"
-	case 27017:
-		return "mongodb"
-	case 3389:
-		return "rdp"
-	case 5900:
-		return "vnc"
-	case 1433:
-		return "mssql"
-	case 1521:
-		return "oracle"
-	case 389:
-		return "ldap"
-	case 636:
-		return "ldaps"
-	case 143:
-		return "imap"
-	case 993:
-		return "imaps"
-	case 110:
-		return "pop3"
-	case 995:
-		return "pop3s"
-	case 9092:
-		return "kafka"
-	case 9200:
-		return "elasticsearch"
-	case 9300:
-		return "elasticsearch-cluster"
-	case 2181:
-		return "zookeeper"
-	case 9042:
-		return "cassandra"
-	case 7000, 7001:
-		return "cassandra-cluster"
-	case 27018:
-		return "mongodb-shard"
-	case 5984:
-		return "couchdb"
-	case 11211:
-		return "memcached"
-	case 5672:
-		return "amqp"
-	case 15672:
-		return "rabbitmq-management"
-	case 5671:
-		return "amqps"
-	case 1883:
-		return "mqtt"
-	case 8883:
-		return "mqtts"
-	case 2379, 2380:
-		return "etcd"
-	case 10250:
-		return "kubelet"
-	case 6443:
-		return "kubernetes-api"
-	default:
-		// Return network protocol if no application protocol can be inferred
-		return netProtocol
-	}
-}
-
 // LogAccess logs a resource access event
 func (al *AuditLogger) LogAccess(ctx *Context, hook Hook, action Action, result string, reason string) {
 	if !al.IsEnabled() {
 		return
 	}
 
-	// ctx.Protocol may already be inferred in protocol.go, but ensure it's set
-	// If ctx.Protocol is empty or still network layer, infer from port
+	// Use network protocol directly (tcp/udp/icmp) with port number
 	protocol := ctx.Protocol
 	if protocol == "" {
-		// If empty, default to tcp for inference
-		if ctx.DstPort > 0 {
-			protocol = inferApplicationProtocol("tcp", ctx.DstPort)
-		} else {
-			protocol = "tcp"
-		}
-	} else if protocol == "tcp" || protocol == "udp" {
-		// Still network layer, infer application protocol from destination port
-		protocol = inferApplicationProtocol(protocol, ctx.DstPort)
+		protocol = "tcp"
 	}
-	// If protocol is already an application protocol (http, https, ssh, etc.), use it as-is
 
 	// 根据设置决定是否记录该协议的日志
 	if !ShouldLogProtocol(protocol, ctx.DstPort) {
@@ -312,16 +197,10 @@ func (al *AuditLogger) LogHookExecution(ctx *Context, hook Hook, action Action, 
 		result = "no_match"
 	}
 
-	// Ensure protocol is inferred if still network layer or empty
+	// Use network protocol directly (tcp/udp/icmp) with port number
 	protocol := ctx.Protocol
 	if protocol == "" {
-		if ctx.DstPort > 0 {
-			protocol = inferApplicationProtocol("tcp", ctx.DstPort)
-		} else {
-			protocol = "tcp"
-		}
-	} else if protocol == "tcp" || protocol == "udp" {
-		protocol = inferApplicationProtocol(protocol, ctx.DstPort)
+		protocol = "tcp"
 	}
 
 	// 根据设置决定是否记录该协议的日志
@@ -367,11 +246,9 @@ func (al *AuditLogger) LogAuthWithIP(userID uint, username string, action models
 	}
 
 	// For auth events, infer protocol from source port if available
-	// Most auth events are over HTTPS (443) or HTTP (80) for web-based auth
-	protocol := ""
-	if sourcePort > 0 {
-		protocol = inferApplicationProtocol("tcp", sourcePort)
-	} else {
+	// Use network protocol directly
+	protocol := "tcp"
+	if sourcePort == 0 {
 		// Default to https for web-based authentication
 		protocol = "https"
 	}

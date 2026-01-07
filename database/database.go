@@ -267,6 +267,16 @@ func initDefaultSystemSettings() {
 		"compression_type":   "lz4",
 	}
 	createDefaultSystemSetting("compression_settings", compressionSettings)
+
+	bannerSettings := map[string]interface{}{
+		"banner": "您已接入公司网络，请按照公司规定使用.\n请勿进行非工作下载及视频行为！",
+	}
+	createDefaultSystemSetting("banner_settings", bannerSettings)
+
+	vpnProfileSettings := map[string]interface{}{
+		"vpn_profile_name": "ZVPN",
+	}
+	createDefaultSystemSetting("vpn_profile_settings", vpnProfileSettings)
 }
 
 func createDefaultSystemSetting(key string, defaultValue map[string]interface{}) {

@@ -359,6 +359,72 @@
             </a-form>
           </a-tab-pane>
 
+          <!-- VPN 配置 -->
+          <a-tab-pane key="vpn-config" title="VPN 配置">
+            <a-form :model="vpnConfigForm" layout="vertical" @submit="handleVPNConfigSubmit">
+              <a-alert type="info" style="margin-bottom: 16px">
+                <template #title>VPN 基本配置</template>
+                <div style="font-size: 12px">
+                  <p>配置 VPN 连接的基本参数，这些参数会影响客户端显示和连接行为。</p>
+                </div>
+              </a-alert>
+
+              <a-form-item label="VPN 连接名称">
+                <a-input
+                  v-model="vpnConfigForm.vpn_profile_name"
+                  placeholder="例如: ZVPN"
+                  :max-length="50"
+                  show-word-limit
+                />
+                <template #extra>
+                  <a-typography-text type="secondary" style="font-size: 12px">
+                    此名称会显示在客户端连接列表中，用于标识 VPN 服务器
+                  </a-typography-text>
+                </template>
+              </a-form-item>
+
+              <a-form-item>
+                <a-button type="primary" @click="handleVPNConfigSubmit" :loading="vpnConfigLoading">
+                  保存配置
+                </a-button>
+              </a-form-item>
+            </a-form>
+          </a-tab-pane>
+
+          <!-- Banner 配置 -->
+          <a-tab-pane key="banner" title="Banner 提示">
+            <a-form :model="bannerForm" layout="vertical" @submit="handleBannerSubmit">
+              <a-alert type="info" style="margin-bottom: 16px">
+                <template #title>Banner 提示信息</template>
+                <div style="font-size: 12px">
+                  <p>配置用户连接 VPN 后显示的提示信息。此信息会在用户成功连接后显示在客户端。</p>
+                  <p><strong>提示</strong>：支持换行符（\n），建议包含使用规范和注意事项。</p>
+                </div>
+              </a-alert>
+
+              <a-form-item label="Banner 内容">
+                <a-textarea
+                  v-model="bannerForm.banner"
+                  placeholder="请输入 Banner 提示信息，支持换行符（\n）"
+                  :auto-size="{ minRows: 5, maxRows: 10 }"
+                  :max-length="500"
+                  show-word-limit
+                />
+                <template #extra>
+                  <a-typography-text type="secondary" style="font-size: 12px">
+                    此信息会在用户成功连接 VPN 后显示在客户端。支持换行符（\n）分隔多行。
+                  </a-typography-text>
+                </template>
+              </a-form-item>
+
+              <a-form-item>
+                <a-button type="primary" @click="handleBannerSubmit" :loading="bannerLoading">
+                  保存配置
+                </a-button>
+              </a-form-item>
+            </a-form>
+          </a-tab-pane>
+
           <!-- 审计日志协议配置 -->
           <a-tab-pane key="audit-log" title="审计日志">
             <a-form :model="auditLogForm" layout="vertical" @submit="handleAuditLogSubmit">
@@ -1024,6 +1090,8 @@ const performanceLoading = ref(false)
 const securityLoading = ref(false)
 const distributedLoading = ref(false)
 const auditLogLoading = ref(false)
+const bannerLoading = ref(false)
+const vpnConfigLoading = ref(false)
 
 // 证书管理相关
 const certLoading = ref(false)
@@ -1136,6 +1204,16 @@ const auditLogForm = reactive({
   } as Record<string, boolean>,
 })
 
+// VPN 配置
+const vpnConfigForm = reactive({
+  vpn_profile_name: 'ZVPN',
+})
+
+// Banner 配置
+const bannerForm = reactive({
+  banner: '您已接入公司网络，请按照公司规定使用.\n请勿进行非工作下载及视频行为！',
+})
+
 const formData = reactive<UpdateLDAPConfigRequest>({
   enabled: false,
   host: '',
@@ -1203,7 +1281,6 @@ const fetchConfig = async () => {
       }
     } catch (error) {
       // 如果API失败，使用默认值（与后端一致）
-      console.log('Performance settings API not available, using defaults')
       performanceForm.enable_policy_cache = true
       performanceForm.cache_size = 1000
     }
@@ -1218,7 +1295,6 @@ const fetchConfig = async () => {
       }
     } catch (error) {
       // 如果API失败，使用默认值（与后端一致）
-      console.log('Distributed sync settings API not available, using defaults')
       distributedForm.enable_distributed_sync = false
       distributedForm.sync_interval = 120
       distributedForm.change_check_interval = 10
@@ -1242,7 +1318,6 @@ const fetchConfig = async () => {
       }
     } catch (error) {
       // 如果API失败，使用默认值（与后端一致）
-      console.log('Security settings API not available, using defaults')
       securityForm.enable_rate_limit = false
       securityForm.rate_limit_per_ip = 1000
       securityForm.rate_limit_per_user = 10485760
@@ -1254,6 +1329,26 @@ const fetchConfig = async () => {
       securityForm.max_login_attempts = 5
       securityForm.login_lockout_duration = 900
       securityForm.login_attempt_window = 300
+    }
+
+    // 获取 VPN 配置
+    try {
+      const vpnConfig = await request.get('/settings/vpn-profile')
+      if (vpnConfig && vpnConfig.vpn_profile_name) {
+        vpnConfigForm.vpn_profile_name = vpnConfig.vpn_profile_name
+      }
+    } catch (error) {
+      vpnConfigForm.vpn_profile_name = 'ZVPN'
+    }
+
+    // 获取 Banner 配置
+    try {
+      const bannerConfig = await request.get('/settings/banner')
+      if (bannerConfig && bannerConfig.banner) {
+        bannerForm.banner = bannerConfig.banner
+      }
+    } catch (error) {
+      bannerForm.banner = '您已接入公司网络，请按照公司规定使用.\n请勿进行非工作下载及视频行为！'
     }
 
     // 获取审计日志协议配置
@@ -1269,7 +1364,6 @@ const fetchConfig = async () => {
       }
     } catch (error) {
       // 如果API失败，使用默认值
-      console.log('Audit log settings API not available, using defaults')
     }
   } catch (error) {
     Message.error('获取LDAP配置失败')
@@ -1553,6 +1647,36 @@ const handleSecuritySubmit = async () => {
 }
 
 // 保存审计日志协议配置
+const handleVPNConfigSubmit = async () => {
+  vpnConfigLoading.value = true
+  try {
+    await request.post('/settings/vpn-profile', {
+      vpn_profile_name: vpnConfigForm.vpn_profile_name,
+    })
+    Message.success('VPN 配置保存成功')
+    await fetchConfig()
+  } catch (error: any) {
+    Message.error(error.response?.data?.error || '保存配置失败')
+  } finally {
+    vpnConfigLoading.value = false
+  }
+}
+
+const handleBannerSubmit = async () => {
+  bannerLoading.value = true
+  try {
+    await request.post('/settings/banner', {
+      banner: bannerForm.banner,
+    })
+    Message.success('Banner 配置保存成功')
+    await fetchConfig()
+  } catch (error: any) {
+    Message.error(error.response?.data?.error || '保存配置失败')
+  } finally {
+    bannerLoading.value = false
+  }
+}
+
 const handleAuditLogSubmit = async () => {
   auditLogLoading.value = true
   try {

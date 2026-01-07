@@ -176,6 +176,8 @@ func registerReadOnlyRoutes(
 		settings.GET("/security", settingsHandler.GetSecuritySettings)
 		settings.GET("/distributed-sync", settingsHandler.GetDistributedSyncSettings)
 		settings.GET("/audit-log", settingsHandler.GetAuditLogSettings)
+		settings.GET("/banner", settingsHandler.GetBannerSettings)
+		settings.GET("/vpn-profile", settingsHandler.GetVPNProfileSettings)
 	}
 }
 
@@ -244,6 +246,8 @@ func registerAdminRoutes(
 		settings.POST("/security", settingsHandler.UpdateSecuritySettings)
 		settings.POST("/distributed-sync", settingsHandler.UpdateDistributedSyncSettings)
 		settings.POST("/audit-log", settingsHandler.UpdateAuditLogSettings)
+		settings.POST("/banner", settingsHandler.UpdateBannerSettings)
+		settings.POST("/vpn-profile", settingsHandler.UpdateVPNProfileSettings)
 		settings.GET("/bruteforce/stats", settingsHandler.GetBruteforceStats)
 		settings.GET("/bruteforce/blocked", settingsHandler.GetBlockedIPs)
 		settings.POST("/bruteforce/block", settingsHandler.BlockIP)

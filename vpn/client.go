@@ -12,7 +12,15 @@ import (
 // If write batching is enabled, it collects multiple packets and writes them in batches
 func (c *VPNClient) WriteLoop() {
 	defer func() {
-		log.Printf("Write loop for client %d (IP: %s) stopped", c.UserID, c.IP.String())
+		// 检查是否是正常关闭（WriteClose channel 已关闭）
+		select {
+		case <-c.WriteClose:
+			// WriteClose 已关闭，这是正常的关闭流程
+			log.Printf("Write loop for client %d (IP: %s) stopped (normal shutdown)", c.UserID, c.IP.String())
+		default:
+			// WriteClose 未关闭，可能是异常退出（如 channel 关闭或错误）
+			log.Printf("Write loop for client %d (IP: %s) stopped (unexpected exit - check for errors above)", c.UserID, c.IP.String())
+		}
 	}()
 
 	// Get config from server if available
@@ -62,19 +70,20 @@ func (c *VPNClient) writeLoopSingle() {
 		select {
 		case packet, ok := <-c.WriteChan:
 			if !ok {
-				log.Printf("Write channel closed for client %d (IP: %s)", c.UserID, c.IP.String())
+				log.Printf("Write loop stopping for client %d (IP: %s): WriteChan closed (normal shutdown)", c.UserID, c.IP.String())
 				return
 			}
 			// Check if connection is closing before processing packet
 			select {
 			case <-c.WriteClose:
-				log.Printf("Write loop stopping for client %d (IP: %s): connection closing", c.UserID, c.IP.String())
+				log.Printf("Write loop stopping for client %d (IP: %s): WriteClose signal received (normal shutdown)", c.UserID, c.IP.String())
 				return
 			default:
 				c.writePacket(packet)
 			}
 
 		case <-c.WriteClose:
+			log.Printf("Write loop stopping for client %d (IP: %s): WriteClose signal received (normal shutdown)", c.UserID, c.IP.String())
 			return
 		}
 	}
@@ -94,7 +103,7 @@ func (c *VPNClient) writeLoopBatched(batchSize int, batchTimeout time.Duration) 
 				if len(batch) > 0 {
 					c.writeBatch(batch)
 				}
-				log.Printf("Write channel closed for client %d (IP: %s)", c.UserID, c.IP.String())
+				log.Printf("Write loop stopping for client %d (IP: %s): WriteChan closed (normal shutdown)", c.UserID, c.IP.String())
 				return
 			}
 
@@ -116,7 +125,7 @@ func (c *VPNClient) writeLoopBatched(batchSize int, batchTimeout time.Duration) 
 		case <-c.WriteClose:
 			// Stop signal: don't flush remaining packets if connection is closing
 			// Flushing would cause RST if client already sent FIN
-			log.Printf("Write loop stopping for client %d (IP: %s): connection closing (dropping %d queued packets)",
+			log.Printf("Write loop stopping for client %d (IP: %s): WriteClose signal received (normal shutdown, dropping %d queued packets)",
 				c.UserID, c.IP.String(), len(batch))
 			return
 		}

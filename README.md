@@ -2,6 +2,15 @@
 
 基于 Golang 实现的高性能 SSL VPN 服务器，支持 **OpenConnect** 和 **Cisco AnyConnect** 协议，提供完整的用户认证、策略管理和审计日志功能。
 
+## ✨ 核心特性
+
+- ✅ **完全兼容 Cisco AnyConnect 客户端** - 支持 Cisco AnyConnect Secure Mobility Client 和 Cisco Secure Client（Windows、macOS、iOS、Android）
+- ✅ **支持 OpenConnect 客户端** - 兼容开源 OpenConnect 客户端（Linux、macOS、Windows）
+- ✅ **高性能 eBPF 加速** - 基于 eBPF XDP 的零拷贝数据包处理，提供企业级性能
+- ✅ **完整的用户认证体系** - 支持本地认证、LDAP/AD 集成、OTP 双因素认证
+- ✅ **细粒度策略管理** - 支持基于用户、组、IP 的策略控制和流量审计
+- ✅ **Web 管理界面** - 现代化的 Vue.js 管理界面，支持用户、组、策略、证书等全功能管理
+
 ## 相关展示
 <img width="2968" height="1480" alt="image" src="https://github.com/user-attachments/assets/4031fd3d-36fd-4a78-94d4-aebbe6cef4d0" />
 
@@ -229,11 +238,13 @@ sudo dnf install -y libbpf clang llvm iproute nftables
 
 ### 支持的客户端
 
-ZVPN 完全兼容以下客户端：
+ZVPN 完全兼容以下客户端，**特别支持 Cisco AnyConnect 协议**：
 
-- **OpenConnect** - 开源客户端（Linux、macOS、Windows）
-- **Cisco AnyConnect Secure Mobility Client** - 思科官方客户端（Windows、macOS、iOS、Android）
-- **Cisco Secure Client** - 思科新一代客户端（Windows、macOS、iOS、Android）
+- ✅ **Cisco AnyConnect Secure Mobility Client** - 思科官方客户端（Windows、macOS、iOS、Android）
+- ✅ **Cisco Secure Client** - 思科新一代客户端（Windows、macOS、iOS、Android）
+- ✅ **OpenConnect** - 开源客户端（Linux、macOS、Windows）
+
+> **注意**：ZVPN 实现了完整的 Cisco AnyConnect 协议栈，包括 CSTP、DTLS、认证流程等，可以无缝替代 Cisco ASA 设备作为 VPN 服务器使用。
 
 ### 安装客户端
 
@@ -274,16 +285,27 @@ sudo openconnect --user=your-username --no-dtls https://your-vpn-server.com
 
 #### 使用 Cisco AnyConnect / Secure Client
 
-1. 打开 Cisco Secure Client
-2. 添加服务器地址：`https://your-vpn-server.com`
-3. 输入用户名和密码
+ZVPN 完全兼容 Cisco AnyConnect 协议，支持所有标准的 AnyConnect 客户端功能：
+
+**连接步骤**：
+1. 打开 Cisco Secure Client（或 Cisco AnyConnect Secure Mobility Client）
+2. 添加服务器地址：`https://your-vpn-server.com` 或 `your-vpn-server.com`
+3. 输入用户名和密码（支持 OTP 双因素认证）
 4. 点击连接
+
+**支持的功能**：
+- ✅ 标准 AnyConnect 认证流程（用户名/密码、OTP）
+- ✅ DTLS 加速连接（UDP 443 端口）
+- ✅ 自动重连和故障转移
+- ✅ 路由推送和 DNS 配置
+- ✅ 证书验证和信任链检查
 
 **重要提示**：
 - **Cisco Secure Client 需要有效的 CA 签发的证书**，不支持自签名证书
 - 自签名证书仅适用于 OpenConnect 客户端（开发/测试环境）
 - 生产环境必须使用有效的 SSL/TLS 证书（如 Let's Encrypt、商业 CA 证书等）
 - 如果使用自签名证书，Cisco Secure Client 会拒绝连接并显示证书错误
+- ZVPN 已通过 Cisco AnyConnect 客户端兼容性测试，可以替代 Cisco ASA 设备使用
 
 ### 环境变量
 

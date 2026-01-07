@@ -68,15 +68,11 @@ type VPNConfig struct {
 	EnableCompression bool   `mapstructure:"enablecompression"` // Enable traffic compression (default: false)
 	CompressionType   string `mapstructure:"compressiontype"`   // Compression type: none, lz4, gzip (default: none)
 
-	UpstreamDNS string `mapstructure:"upstreamdns"` // Upstream DNS servers (comma-separated, default: 8.8.8.8:53,8.8.4.4:53)
-
-	CSTPDPD       int `mapstructure:"cstpdpd"`       // CSTP dead peer detection interval in seconds (default: 30)
-	CSTPKeepalive int `mapstructure:"cstpkeepalive"` // CSTP keepalive interval in seconds (default: 20)
-
-	VPNProfileName string `mapstructure:"vpnprofilename"` // VPN profile name shown in client (default: "ZVPN")
-
-	CiscoClientCompat bool `mapstructure:"ciscoclientcompat"` // Enable Cisco client compatibility mode (default: true for AnyConnect support)
-	DTLSLegacy        bool `mapstructure:"dtlslegacy"`        // Enable legacy DTLS protocol support (default: true, supported by both OpenConnect and AnyConnect clients)
+	CSTPDPD         int    `mapstructure:"cstpdpd"`         // CSTP dead peer detection interval in seconds (default: 30)
+	CSTPKeepalive   int    `mapstructure:"cstpkeepalive"`   // CSTP keepalive interval in seconds (default: 20)
+	MobileDPD       int    `mapstructure:"mobiledpd"`       // Mobile client DPD interval in seconds (default: 60)
+	MobileKeepalive int    `mapstructure:"mobilekeepalive"` // Mobile client keepalive interval in seconds (default: 30)
+	UpstreamDNS     string `mapstructure:"upstreamdns"`     // Upstream DNS server (default: 8.8.8.8)
 
 	EnableRateLimit      bool  `mapstructure:"enableratelimit"`      // Enable rate limiting (default: true)
 	RateLimitPerIP       int64 `mapstructure:"ratelimitperip"`       // Rate limit per IP (packets per second, default: 1000)
@@ -91,8 +87,6 @@ type VPNConfig struct {
 	LoginAttemptWindow         int  `mapstructure:"loginattemptwindow"`         // Time window for counting attempts in seconds (default: 300 = 5 minutes)
 
 	AllowMultiClientLogin bool `mapstructure:"allowmulticlientlogin"` // Allow same account multiple concurrent logins
-
-	AllowLan bool `mapstructure:"allow_lan"`
 }
 
 type JWTConfig struct {
@@ -121,7 +115,7 @@ func Load() *Config {
 	setDefaults()
 
 	viper.BindEnv("vpn.network", "VPN_NETWORK")
-        viper.BindEnv("vpn.certfile", "VPN_CERT")
+	viper.BindEnv("vpn.certfile", "VPN_CERT")
 	viper.BindEnv("vpn.keyfile", "VPN_KEY")
 	viper.BindEnv("vpn.ebpfinterfacename", "VPN_EBPF_INTERFACE")
 	viper.BindEnv("vpn.enableafxdp", "VPN_ENABLE_AFXDP")
@@ -212,12 +206,14 @@ func setDefaults() {
 
 	viper.SetDefault("vpn.enablecompression", false) // Disabled by default
 	viper.SetDefault("vpn.compressiontype", "none")  // none, lz4, gzip
+	viper.SetDefault("vpn.mobiledpd", 60)            // Mobile client DPD interval (default: 60 seconds)
+	viper.SetDefault("vpn.mobilekeepalive", 4)       // Mobile client keepalive interval (default: 4 seconds, aligned with anylink)
+	viper.SetDefault("vpn.upstreamdns", "8.8.8.8")   // Upstream DNS server (default: 8.8.8.8)
 
-	viper.SetDefault("vpn.upstreamdns", "8.8.8.8:53,8.8.4.4:53") // Upstream DNS servers
-	viper.SetDefault("vpn.changecheckinterval", 5)               // Check for changes every 5 seconds
-	viper.SetDefault("vpn.cstpbatchmaxpackets", 10)              // Max 10 packets per batch
-	viper.SetDefault("vpn.cstpbatchmaxsize", 8192)               // Max 8KB per batch
-	viper.SetDefault("vpn.cstpbatchtimeout", 10)                 // 10ms timeout
+	viper.SetDefault("vpn.changecheckinterval", 5)  // Check for changes every 5 seconds
+	viper.SetDefault("vpn.cstpbatchmaxpackets", 10) // Max 10 packets per batch
+	viper.SetDefault("vpn.cstpbatchmaxsize", 8192)  // Max 8KB per batch
+	viper.SetDefault("vpn.cstpbatchtimeout", 10)    // 10ms timeout
 
 	viper.SetDefault("vpn.enableratelimit", false)      // Disable rate limiting by default
 	viper.SetDefault("vpn.ratelimitperip", 1000)        // 1000 packets per second per IP (when enabled)
@@ -231,8 +227,6 @@ func setDefaults() {
 	viper.SetDefault("vpn.maxloginattempts", 5)              // 5 failed attempts before blocking
 	viper.SetDefault("vpn.loginlockoutduration", 900)        // Block for 15 minutes
 	viper.SetDefault("vpn.loginattemptwindow", 300)          // Count attempts within 5 minutes
-
-	viper.SetDefault("vpn.allow_lan", true) // Enable by default to exclude local network traffic in full tunnel mode
 
 	viper.SetDefault("jwt.secret", "your-secret-key-change-this")
 	viper.SetDefault("jwt.expiration", 24)
@@ -294,3 +288,4 @@ func printConfigSummary(cfg *Config) {
 	}
 	log.Println("==================================================")
 }
+

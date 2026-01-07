@@ -15,107 +15,6 @@ import (
 	"gorm.io/gorm"
 )
 
-// inferApplicationProtocol infers application layer protocol from network protocol and port
-func inferApplicationProtocol(netProtocol string, dstPort uint16) string {
-	// If not TCP or UDP, return network protocol as-is
-	if netProtocol != "tcp" && netProtocol != "udp" {
-		return netProtocol
-	}
-
-	// Common port mappings for application protocols
-	switch dstPort {
-	case 20, 21:
-		return "ftp"
-	case 22:
-		return "ssh"
-	case 23:
-		return "telnet"
-	case 25:
-		return "smtp"
-	case 53:
-		if netProtocol == "udp" {
-			return "dns"
-		}
-		return netProtocol // TCP DNS is less common
-	case 67, 68:
-		return "dhcp"
-	case 69:
-		return "tftp"
-	case 80:
-		return "http"
-	case 443:
-		return "https"
-	case 8080:
-		return "http-alt"
-	case 8443:
-		return "https-alt"
-	case 3306:
-		return "mysql"
-	case 5432:
-		return "postgresql"
-	case 6379:
-		return "redis"
-	case 27017:
-		return "mongodb"
-	case 3389:
-		return "rdp"
-	case 5900:
-		return "vnc"
-	case 1433:
-		return "mssql"
-	case 1521:
-		return "oracle"
-	case 389:
-		return "ldap"
-	case 636:
-		return "ldaps"
-	case 143:
-		return "imap"
-	case 993:
-		return "imaps"
-	case 110:
-		return "pop3"
-	case 995:
-		return "pop3s"
-	case 9092:
-		return "kafka"
-	case 9200:
-		return "elasticsearch"
-	case 9300:
-		return "elasticsearch-cluster"
-	case 2181:
-		return "zookeeper"
-	case 9042:
-		return "cassandra"
-	case 7000, 7001:
-		return "cassandra-cluster"
-	case 27018:
-		return "mongodb-shard"
-	case 5984:
-		return "couchdb"
-	case 11211:
-		return "memcached"
-	case 5672:
-		return "amqp"
-	case 15672:
-		return "rabbitmq-management"
-	case 5671:
-		return "amqps"
-	case 1883:
-		return "mqtt"
-	case 8883:
-		return "mqtts"
-	case 2379, 2380:
-		return "etcd"
-	case 10250:
-		return "kubelet"
-	case 6443:
-		return "kubernetes-api"
-	default:
-		// Return network protocol if no application protocol can be inferred
-		return netProtocol
-	}
-}
 
 // PolicyEvent represents a policy match event from eBPF (both ALLOW and DENY)
 type PolicyEvent struct {
@@ -243,8 +142,8 @@ func logPolicyEvent(event *PolicyEvent) error {
 		netProtocolStr = "icmp"
 	}
 
-	// Infer application layer protocol from destination port
-	protocolStr := inferApplicationProtocol(netProtocolStr, event.DstPort)
+	// Use network protocol directly (tcp/udp/icmp) with port number
+	protocolStr := netProtocolStr
 
 	// 根据设置决定是否记录该协议的日志
 	if !shouldLogProtocolForEBPF(protocolStr, event.DstPort) {

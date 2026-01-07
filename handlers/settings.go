@@ -295,6 +295,168 @@ func (h *SettingsHandler) loadAuditLogFromDB(out *AuditLogSettingsRequest) error
 	return json.Unmarshal([]byte(setting.Value), out)
 }
 
+type BannerSettingsRequest struct {
+	Banner string `json:"banner"`
+}
+
+func (h *SettingsHandler) GetBannerSettings(c *gin.Context) {
+	settings := BannerSettingsRequest{
+		Banner: "您已接入公司网络，请按照公司规定使用.\n请勿进行非工作下载及视频行为！",
+	}
+	if err := h.loadBannerFromDB(&settings); err != nil && err != gorm.ErrRecordNotFound {
+		log.Printf("Failed to load banner settings from DB: %v", err)
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"banner": settings.Banner,
+	})
+}
+
+func (h *SettingsHandler) UpdateBannerSettings(c *gin.Context) {
+	var req BannerSettingsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if err := h.saveBannerToDB(&req); err != nil {
+		log.Printf("Failed to persist banner settings: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save settings"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"banner":  req.Banner,
+		"message": "Banner settings updated",
+	})
+}
+
+func (h *SettingsHandler) saveBannerToDB(req *BannerSettingsRequest) error {
+	data, err := json.Marshal(req)
+	if err != nil {
+		return err
+	}
+	return database.DB.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "key"}},
+		DoUpdates: clause.AssignmentColumns([]string{"value", "updated_at"}),
+	}).Create(&models.SystemSetting{Key: bannerSettingKey, Value: string(data)}).Error
+}
+
+func (h *SettingsHandler) loadBannerFromDB(out *BannerSettingsRequest) error {
+	var setting models.SystemSetting
+	err := database.DB.Where("`key` = ?", bannerSettingKey).First(&setting).Error
+	if err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return err
+		}
+		return err
+	}
+	return json.Unmarshal([]byte(setting.Value), out)
+}
+
+func GetBannerText() string {
+	var setting models.SystemSetting
+	err := database.DB.Where("`key` = ?", bannerSettingKey).First(&setting).Error
+	if err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return "您已接入公司网络，请按照公司规定使用.\n请勿进行非工作下载及视频行为！"
+		}
+		log.Printf("Failed to load banner from DB: %v", err)
+		return "您已接入公司网络，请按照公司规定使用.\n请勿进行非工作下载及视频行为！"
+	}
+	var bannerSettings BannerSettingsRequest
+	if err := json.Unmarshal([]byte(setting.Value), &bannerSettings); err != nil {
+		log.Printf("Failed to unmarshal banner settings: %v", err)
+		return "您已接入公司网络，请按照公司规定使用.\n请勿进行非工作下载及视频行为！"
+	}
+	if bannerSettings.Banner == "" {
+		return "您已接入公司网络，请按照公司规定使用.\n请勿进行非工作下载及视频行为！"
+	}
+	return bannerSettings.Banner
+}
+
+type VPNProfileSettingsRequest struct {
+	VPNProfileName string `json:"vpn_profile_name"`
+}
+
+func (h *SettingsHandler) GetVPNProfileSettings(c *gin.Context) {
+	settings := VPNProfileSettingsRequest{
+		VPNProfileName: "ZVPN",
+	}
+	if err := h.loadVPNProfileFromDB(&settings); err != nil && err != gorm.ErrRecordNotFound {
+		log.Printf("Failed to load VPN profile settings from DB: %v", err)
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"vpn_profile_name": settings.VPNProfileName,
+	})
+}
+
+func (h *SettingsHandler) UpdateVPNProfileSettings(c *gin.Context) {
+	var req VPNProfileSettingsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	if req.VPNProfileName == "" {
+		req.VPNProfileName = "ZVPN"
+	}
+
+	if err := h.saveVPNProfileToDB(&req); err != nil {
+		log.Printf("Failed to persist VPN profile settings: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to save settings"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"vpn_profile_name": req.VPNProfileName,
+		"message":          "VPN profile settings updated",
+	})
+}
+
+func (h *SettingsHandler) saveVPNProfileToDB(req *VPNProfileSettingsRequest) error {
+	data, err := json.Marshal(req)
+	if err != nil {
+		return err
+	}
+	return database.DB.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "key"}},
+		DoUpdates: clause.AssignmentColumns([]string{"value", "updated_at"}),
+	}).Create(&models.SystemSetting{Key: vpnProfileSettingKey, Value: string(data)}).Error
+}
+
+func (h *SettingsHandler) loadVPNProfileFromDB(out *VPNProfileSettingsRequest) error {
+	var setting models.SystemSetting
+	err := database.DB.Where("`key` = ?", vpnProfileSettingKey).First(&setting).Error
+	if err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return err
+		}
+		return err
+	}
+	return json.Unmarshal([]byte(setting.Value), out)
+}
+
+func GetVPNProfileName() string {
+	var setting models.SystemSetting
+	err := database.DB.Where("`key` = ?", vpnProfileSettingKey).First(&setting).Error
+	if err != nil {
+		if err == gorm.ErrRecordNotFound {
+			return "ZVPN"
+		}
+		log.Printf("Failed to load VPN profile name from DB: %v", err)
+		return "ZVPN"
+	}
+	var vpnProfileSettings VPNProfileSettingsRequest
+	if err := json.Unmarshal([]byte(setting.Value), &vpnProfileSettings); err != nil {
+		log.Printf("Failed to unmarshal VPN profile settings: %v", err)
+		return "ZVPN"
+	}
+	if vpnProfileSettings.VPNProfileName == "" {
+		return "ZVPN"
+	}
+	return vpnProfileSettings.VPNProfileName
+}
+
 type SecuritySettingsRequest struct {
 	EnableRateLimit            bool  `json:"enable_rate_limit"`
 	RateLimitPerIP             int64 `json:"rate_limit_per_ip" binding:"min=1,max=100000"`
@@ -532,6 +694,8 @@ const (
 	securitySettingKey = "security_settings"
 	distributedSyncKey = "distributed_sync_settings"
 	auditLogSettingKey = "audit_log_settings"
+	bannerSettingKey   = "banner_settings"
+	vpnProfileSettingKey = "vpn_profile_settings"
 )
 
 func (h *SettingsHandler) savePerformanceToDB(req *PerformanceSettingsRequest) error {

@@ -152,16 +152,23 @@ CREATE TABLE IF NOT EXISTS hooks (
     INDEX idx_deleted_at (deleted_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
--- 会话表
+-- 会话表（用于存储用户登录 session token）
 CREATE TABLE IF NOT EXISTS sessions (
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    created_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
+    updated_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+    deleted_at DATETIME(3) NULL,
     user_id BIGINT UNSIGNED NOT NULL,
-    vpn_ip VARCHAR(45),
-    connected_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
-    last_seen DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+    token VARCHAR(255) NOT NULL COMMENT '随机生成的 session token（64 字符 hex 字符串）',
+    ip_address VARCHAR(45) COMMENT '客户端 IP 地址',
+    user_agent VARCHAR(512) COMMENT '客户端 User-Agent',
+    expires_at DATETIME(3) NOT NULL COMMENT 'Session 过期时间',
+    active BOOLEAN DEFAULT TRUE COMMENT 'Session 是否活跃（可用于手动撤销）',
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    UNIQUE INDEX idx_token (token),
     INDEX idx_user_id (user_id),
-    INDEX idx_vpn_ip (vpn_ip)
+    INDEX idx_expires_at (expires_at),
+    INDEX idx_deleted_at (deleted_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
 -- LDAP 配置表

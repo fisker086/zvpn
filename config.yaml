@@ -21,12 +21,9 @@ vpn:
   # 网络配置
   interfacename: "zvpn0"
   network: "10.8.0.0/24"  # 使用与环境变量一致的网段
-  mtu: 1460
+  mtu: 1420
   ebpfinterfacename: "eth0"  # 指定eBPF程序要挂载的物理网卡（如eth0, ens33, enp0s3等）
   
-  # SSL 证书配置
-  # Docker: 使用环境变量 VPN_CERT 和 VPN_KEY 覆盖
-  # 本地: 使用相对路径或设置环境变量
   certfile: "./certs/server.crt"
   keyfile: "./certs/server.key"
   
@@ -38,25 +35,13 @@ vpn:
   
   # CSTP/DTLS 连接保活配置
   cstpdpd: 15                  
-  cstpkeepalive: 10                    
+  cstpkeepalive: 10
   
-  # VPN 配置文件配置
-  vpnprofilename: "ZVPN"        # VPN 连接名称（显示在客户端连接列表中，默认：ZVPN）
+  # 移动端客户端连接保活配置（移动端通常需要更短的 keepalive 间隔）
+  mobiledpd: 60                # 移动端 DPD 间隔（秒，默认：60）
+  mobilekeepalive: 4           # 移动端 Keepalive 间隔（秒，默认：4，与 anylink 一致）                    
   
-  # Cisco 客户端兼容性配置（ocserv 协议参数）
-  ciscoclientcompat: true        # 启用 Cisco 客户端兼容模式（支持旧版 AnyConnect 客户端，默认：true）
-  dtlslegacy: true               # 启用旧版 DTLS 协议支持（默认：true，OpenConnect 和 AnyConnect 客户端都支持）
-  
-  # 上游DNS服务器配置（用于全局模式下的fallback DNS）
-  upstreamdns: "114.114.114.114:53"  # 上游DNS服务器（逗号分隔，用于全局模式下的fallback DNS）
-  
-  # 本地网络访问控制（类似 AnyLink 的 allow_lan）
-  # 当 allow_lan=true 时，全局模式下会排除本地网络流量，优先级高于全局路由设置
-  # 需要客户端同时开启"Allow Local Lan"选项才能生效
-  # 行为：本地网络流量直接访问本地网络，其他所有流量通过VPN隧道传输
-  allow_lan: true
-
 # ==================== JWT 配置 ====================
 jwt:
-  secret: "your-secret-key-change-this-in-production"  # 生产环境必须修改！
+  secret: "de3b81da80999e0ab400286b838799eb0e56e9ea804783d873b0a3960c2cf7c7"  # 生产环境必须修改！
   expiration: 24  # Token 过期时间（小时）

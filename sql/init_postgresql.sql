@@ -156,18 +156,25 @@ CREATE TABLE IF NOT EXISTS hooks (
 CREATE INDEX IF NOT EXISTS idx_hooks_hook_type ON hooks(hook_type);
 CREATE INDEX IF NOT EXISTS idx_hooks_deleted_at ON hooks(deleted_at);
 
--- 会话表
+-- 会话表（用于存储用户登录 session token）
 CREATE TABLE IF NOT EXISTS sessions (
     id BIGSERIAL PRIMARY KEY,
+    created_at TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP,
+    deleted_at TIMESTAMP(3) NULL,
     user_id BIGINT NOT NULL,
-    vpn_ip VARCHAR(45),
-    connected_at TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP,
-    last_seen TIMESTAMP(3) DEFAULT CURRENT_TIMESTAMP,
+    token VARCHAR(255) NOT NULL,
+    ip_address VARCHAR(45),
+    user_agent VARCHAR(512),
+    expires_at TIMESTAMP(3) NOT NULL,
+    active BOOLEAN DEFAULT TRUE,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_token ON sessions(token);
 CREATE INDEX IF NOT EXISTS idx_sessions_user_id ON sessions(user_id);
-CREATE INDEX IF NOT EXISTS idx_sessions_vpn_ip ON sessions(vpn_ip);
+CREATE INDEX IF NOT EXISTS idx_sessions_expires_at ON sessions(expires_at);
+CREATE INDEX IF NOT EXISTS idx_sessions_deleted_at ON sessions(deleted_at);
 
 -- LDAP 配置表
 CREATE TABLE IF NOT EXISTS ldap_configs (

@@ -31,6 +31,53 @@ import (
 	"gorm.io/gorm"
 )
 
+// tlsErrorLogger 自定义 TLS 错误日志处理器
+// 用于过滤正常的连接关闭错误，并增强错误日志的详细信息
+type tlsErrorLogger struct {
+	normalErrors map[string]bool // 正常错误列表（不需要记录）
+}
+
+// Write 实现 io.Writer 接口
+func (l *tlsErrorLogger) Write(p []byte) (n int, err error) {
+	msg := string(p)
+	msgLower := strings.ToLower(msg)
+
+	// 检查是否是正常错误（客户端正常关闭连接）
+	isNormalError := false
+	for normalErr := range l.normalErrors {
+		if strings.Contains(msgLower, strings.ToLower(normalErr)) {
+			isNormalError = true
+			break
+		}
+	}
+
+	if isNormalError {
+		// 正常错误：只记录 DEBUG 级别（如果需要的话）
+		// 这里不记录，避免日志噪音
+		// log.Printf("TLS: Normal connection close detected: %s", strings.TrimSpace(msg))
+		return len(p), nil
+	}
+
+	// 真正的错误：记录详细信息
+	log.Printf("TLS: ⚠️  ERROR - %s", strings.TrimSpace(msg))
+
+	// 分析错误类型
+	if strings.Contains(msgLower, "handshake") {
+		log.Printf("TLS: Error occurred during TLS handshake - this may indicate:")
+		log.Printf("TLS:   1. Client certificate validation failure")
+		log.Printf("TLS:   2. Cipher suite mismatch")
+		log.Printf("TLS:   3. Protocol version incompatibility")
+		log.Printf("TLS:   4. Certificate chain validation issue")
+		log.Printf("TLS:   5. Network connectivity problem")
+	} else if strings.Contains(msgLower, "certificate") {
+		log.Printf("TLS: Certificate-related error detected")
+	} else if strings.Contains(msgLower, "timeout") {
+		log.Printf("TLS: Timeout error detected - connection may be slow or network unstable")
+	}
+
+	return len(p), nil
+}
+
 // CertInfo 证书信息
 type CertInfo struct {
 	SNI           string    `json:"sni"`            // SNI 域名
@@ -1023,93 +1070,38 @@ func (s *Server) startHTTPSServer() {
 	// 保持与 anylink 完全一致的配置，确保最大兼容性
 	tlsConfig := &tls.Config{
 		NextProtos: []string{"http/1.1"},
-		MinVersion: tls.VersionTLS12,
+		MinVersion: tls.VersionTLS11, // 支持 TLS 1.1 及以上版本（包括 TLS 1.2 和 1.3）
 		// 注意：不设置 MaxVersion，让 Go 自动协商最高支持的 TLS 版本
 		// 不设置 PreferServerCipherSuites，使用默认行为（客户端优先）
+		// 警告：TLS 1.1 已被 IETF 弃用（RFC 8996），存在安全风险，建议客户端升级到 TLS 1.2+
 		CipherSuites: selectedCipherSuites,
 		GetCertificate: func(chi *tls.ClientHelloInfo) (*tls.Certificate, error) {
-			// 记录客户端SNI信息（用于诊断证书匹配问题）
-			// 注意：只在有SNI时记录，避免产生过多日志
-			if chi.ServerName != "" {
-				log.Printf("TLS: GetCertificate - SNI: %s, RemoteAddr: %s", chi.ServerName, chi.Conn.RemoteAddr().String())
-			} else {
-				log.Printf("TLS: GetCertificate - No SNI provided, RemoteAddr: %s", chi.Conn.RemoteAddr().String())
-			}
-
-			// 参考 anylink：完全一致的实现
+			// 参考 anylink：非常简洁的实现，只有一行 Trace 日志
 			// anylink: base.Trace("GetCertificate ServerName", chi.ServerName)
 			// anylink: return dbdata.GetCertificateBySNI(chi.ServerName)
+
+			// 只在调试模式下记录 SNI（减少日志噪音）
+			// log.Printf("TLS: GetCertificate - SNI: %s", chi.ServerName)
+
 			cert, err := s.certManager.GetCertificateBySNI(chi.ServerName)
 			if err != nil {
-				// 记录错误详情
+				// 只在出错时记录
 				log.Printf("TLS: GetCertificate ERROR - SNI: %s, Error: %v", chi.ServerName, err)
-			} else if cert != nil {
-				// 验证证书链的有效性（用于诊断）
-				if len(cert.Certificate) > 1 {
-					// 检查证书链顺序
-					serverCert, err1 := x509.ParseCertificate(cert.Certificate[0])
-					intermediateCert, err2 := x509.ParseCertificate(cert.Certificate[1])
-					if err1 == nil && err2 == nil {
-						if serverCert.Issuer.String() != intermediateCert.Subject.String() {
-							log.Printf("TLS: ⚠️  WARNING - Certificate chain order issue detected during handshake!")
-							log.Printf("TLS: ⚠️  Server cert issuer: %s", serverCert.Issuer.String())
-							log.Printf("TLS: ⚠️  Intermediate cert subject: %s", intermediateCert.Subject.String())
-							log.Printf("TLS: ⚠️  This may cause client to reject the certificate chain")
-						}
-					}
-				}
-				// 计算证书链大小
-				certSize := 0
-				for _, certBytes := range cert.Certificate {
-					certSize += len(certBytes)
-				}
-
-				// 记录证书信息
-				if cert.Leaf != nil {
-					certCN := cert.Leaf.Subject.CommonName
-					certDNSNames := cert.Leaf.DNSNames
-					log.Printf("TLS: Certificate selected - CN: %s, DNS Names: %v, Chain size: %d bytes (%d certs), SNI: %s",
-						certCN, certDNSNames, certSize, len(cert.Certificate), chi.ServerName)
-
-					// 检查证书是否匹配请求的SNI
-					if chi.ServerName != "" {
-						sniLower := strings.ToLower(chi.ServerName)
-						matched := false
-						if certCN != "" && strings.ToLower(certCN) == sniLower {
-							matched = true
-						}
-						for _, dnsName := range certDNSNames {
-							if strings.ToLower(dnsName) == sniLower {
-								matched = true
-								break
-							}
-						}
-						if !matched {
-							log.Printf("TLS: ⚠️  WARNING - Certificate does not match SNI! SNI: %s, Cert CN: %s, Cert DNS: %v",
-								chi.ServerName, certCN, certDNSNames)
-						}
-					}
-				} else {
-					log.Printf("TLS: Certificate selected - Chain size: %d bytes (%d certs), SNI: %s (cert.Leaf is nil)",
-						certSize, len(cert.Certificate), chi.ServerName)
-				}
-
-				// 检查证书链大小（TLS握手消息大小限制）
-				// 标准以太网MTU是1500字节，减去IP和TCP头部（40字节），实际可用约1460字节
-				// TLS握手消息包括：TLS记录头（5字节）+ 握手消息头（4字节）+ 证书消息
-				// 如果证书链超过14KB，可能导致握手消息过大，在某些网络环境下失败
-				if certSize > 14000 {
-					log.Printf("TLS: ⚠️  WARNING - Large certificate chain (%d bytes) may cause TLS handshake failures on networks with small MTU or strict firewalls",
-						certSize)
-					log.Printf("TLS: ⚠️  Consider reducing certificate chain size or using a certificate with shorter chain")
-				}
 			}
 			return cert, err
 		},
 	}
 
-	// 使用详细的错误日志记录器（添加更多调试信息）
-	errorLogger := log.New(os.Stderr, "HTTPS Server: ", log.LstdFlags|log.Lmicroseconds)
+	// 创建自定义错误日志处理器（过滤正常关闭，记录真正的错误）
+	errorLogWriter := &tlsErrorLogger{
+		normalErrors: map[string]bool{
+			"EOF":                              true, // 客户端正常关闭连接
+			"connection reset by peer":         true, // 客户端重置连接（可能是正常关闭）
+			"broken pipe":                      true, // 管道断开（可能是正常关闭）
+			"use of closed network connection": true, // 连接已关闭（正常情况）
+		},
+	}
+	errorLogger := log.New(errorLogWriter, "HTTPS Server: ", log.LstdFlags|log.Lmicroseconds)
 
 	// 参考 anylink 的服务器配置
 	// 注意：对于 VPN 长连接，ReadTimeout 和 WriteTimeout 应该设置得足够长
@@ -1392,4 +1384,3 @@ func (c *loggingConn) Read(b []byte) (int, error) {
 	}
 	return n, err
 }
-
