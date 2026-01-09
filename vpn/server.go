@@ -201,46 +201,25 @@ func NewVPNServer(cfg *config.Config) (*VPNServer, error) {
 			log.Printf("✅ eBPF XDP: Public IP configured: %s (for policy checking)", publicIP.String())
 		}
 
-		// NAT 策略: eBPF TC (优先，内核 5.19+) -> nftables (fallback)
-		log.Printf("配置 NAT: 优先尝试 eBPF TC egress NAT (需要内核 5.19+)")
+		// NAT 策略: 使用 eBPF TC egress NAT
+		log.Printf("配置 NAT: 使用 eBPF TC egress NAT (接口: %s, NAT IP: %s)", cfg.VPN.EBPFInterfaceName, publicIP.String())
 		tcProg, err = loadEBPFTCNAT(cfg.VPN.EBPFInterfaceName, publicIP, cfg.VPN.Network)
 		if err != nil {
-			log.Printf("⚠️  eBPF TC NAT 加载失败: %v", err)
-			log.Printf("   原因可能是: 内核版本 < 5.19 (TCX egress 需要 5.19+) 或权限不足")
-			log.Printf("   回退到 nftables MASQUERADE...")
-
-			// Fallback to nftables
-			if err := setupIPTablesNAT(cfg.VPN.Network, cfg.VPN.EBPFInterfaceName); err != nil {
-				log.Printf("❌ NAT 配置失败: nftables MASQUERADE 设置失败: %v", err)
-				log.Printf("   NAT 将无法工作 - VPN 客户端无法访问外部网络")
-			} else {
-				log.Printf("✅ NAT 配置成功: 使用 nftables MASQUERADE (fallback)")
-			}
+			log.Printf("接口: %s, eBPF TC NAT 加载失败: %v", cfg.VPN.EBPFInterfaceName, err)
 		} else {
-			log.Printf("✅ eBPF TC NAT 加载成功: 使用 eBPF TC egress NAT (高性能，内核级 NAT)")
-			// 即使 eBPF TC NAT 加载成功，也设置 nftables 规则作为备用
-			// 因为 eBPF TC NAT 可能在某些情况下不工作（权限、内核版本等）
-			log.Printf("配置 NAT: 同时设置 nftables MASQUERADE 作为备用...")
-			if err := setupIPTablesNAT(cfg.VPN.Network, cfg.VPN.EBPFInterfaceName); err != nil {
-				log.Printf("⚠️  备用 NAT 配置失败: nftables MASQUERADE 设置失败: %v", err)
-				log.Printf("   将仅依赖 eBPF TC NAT，如果 eBPF NAT 不工作，NAT 可能失败")
-			} else {
-				log.Printf("✅ 备用 NAT 配置成功: nftables MASQUERADE 已设置")
-			}
+			log.Printf("eBPF TC NAT 加载成功, 接口: %s, NAT IP: %s, VPN 网络: %s", cfg.VPN.EBPFInterfaceName, publicIP.String(), cfg.VPN.Network)
 		}
 
 		egressIPForServer = publicIP
 	} else {
-		log.Printf("Warning: Failed to detect egress interface IP.")
-		log.Printf("配置 NAT: 使用 MASQUERADE (自动检测出口 IP)...")
-		// Set up NAT anyway - MASQUERADE will auto-detect the egress IP
-		// This is important for Docker containers where IP detection might fail
-		if err := setupIPTablesNAT(cfg.VPN.Network, cfg.VPN.EBPFInterfaceName); err != nil {
-			log.Printf("❌ NAT 配置失败: nftables MASQUERADE 设置失败: %v", err)
-			log.Printf("   NAT 将无法工作 - VPN 客户端无法访问外部网络")
-			log.Printf("   请手动添加 NAT 规则: nft add rule ip nat POSTROUTING ip saddr %s oifname %s masquerade", cfg.VPN.Network, cfg.VPN.EBPFInterfaceName)
+		log.Printf("Warning: Failed to detect egress interface IP from default route.")
+		log.Printf("配置 NAT: 尝试使用 eBPF TC egress NAT，将从接口 %s 获取 IP...", cfg.VPN.EBPFInterfaceName)
+		// Try to load eBPF TC NAT - it will attempt to get IP from the interface
+		tcProg, err = loadEBPFTCNAT(cfg.VPN.EBPFInterfaceName, nil, cfg.VPN.Network)
+		if err != nil {
+			log.Printf("❌ eBPF TC NAT 加载失败: %v, 请确保接口 %s 有有效的 IPv4 地址", err, cfg.VPN.EBPFInterfaceName)
 		} else {
-			log.Printf("✅ NAT 配置成功: 使用 nftables MASQUERADE (自动检测出口 IP)")
+			log.Printf("✅ eBPF TC NAT 加载成功: 使用 eBPF TC egress NAT")
 		}
 	}
 
@@ -284,7 +263,7 @@ func NewVPNServer(cfg *config.Config) (*VPNServer, error) {
 		routeMgr:        routeMgr,
 		policyMgr:       policyMgr,
 		ebpfProgram:     ebpfProg,
-		tcProgram:       tcProg, // eBPF TC program for NAT (may be nil if fallback to nftables)
+		tcProgram:       tcProg, // eBPF TC program for NAT
 		forwarder:       forwarder,
 		ipPool:          ipPool,
 		tunDevice:       tunDevice,
@@ -523,7 +502,6 @@ func (s *VPNServer) BuildCSTPPacket(payload []byte) ([]byte, error) {
 	return packet, nil
 }
 
-
 // GetPolicyManager returns the policy manager
 func (s *VPNServer) GetPolicyManager() *policy.Manager {
 	return s.policyMgr
@@ -708,7 +686,7 @@ func initializePublicIP(ebpfProg *ebpf.XDPProgram) error {
 	// Set egress IP in eBPF map for NAT masquerading (for ingress traffic)
 	if err := ebpfProg.SetPublicIP(publicIP); err != nil {
 		log.Printf("Warning: Failed to set egress IP in eBPF map: %v", err)
-		log.Printf("eBPF NAT may not work correctly. Falling back to kernel NAT (requires nftables).")
+		log.Printf("eBPF NAT may not work correctly. Please ensure eBPF TC NAT is properly configured.")
 		return err
 	}
 
@@ -1035,3 +1013,4 @@ func (s *VPNServer) logAllRegisteredIPs() {
 		s.clientsLock.RUnlock()
 	}
 }
+

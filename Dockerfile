@@ -119,7 +119,7 @@ RUN dnf install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
         ca-certificates \
         libbpf \
         iproute kmod bash openssl nc wget \
-        nftables tcpdump iptables \
+        tcpdump \
         iputils  \
         kernel-tools || true && \
     dnf clean all && \
@@ -158,3 +158,4 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
 
 ENTRYPOINT ["/app/docker-entrypoint.sh"]
 CMD ["/app/zvpn"]
+

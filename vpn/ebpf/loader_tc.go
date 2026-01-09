@@ -68,7 +68,7 @@ func LoadTCProgram(ifName string) (*TCProgram, error) {
 		clsactLink, err := attachTCClsact(ifName, iface.Index, objs.TcNatEgress)
 		if err != nil {
 			objs.Close()
-			return nil, fmt.Errorf("failed to attach TC program: %w (tried TCX and traditional TC clsact, system will use nftables MASQUERADE as fallback)", err)
+			return nil, fmt.Errorf("failed to attach TC program: %w (tried TCX and traditional TC clsact)", err)
 		}
 		log.Printf("✅ TC egress NAT program attached using traditional TC clsact qdisc (compatible with kernel 4.1+)")
 		return &TCProgram{
@@ -348,3 +348,4 @@ func (l *clsactLink) Close() error {
 
 	return nil
 }
+

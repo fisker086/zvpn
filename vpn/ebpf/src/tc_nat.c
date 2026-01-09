@@ -168,11 +168,11 @@ static __always_inline int is_vpn_network(__u32 ip) {
     return (ip & *vpn_mask) == *vpn_net;
 }
 
-// TC egress hook: Perform NAT masquerading for packets from VPN clients to external networks
+// TC egress hook: Perform SNAT masquerading for packets from VPN clients to external networks
 // 
 // 架构说明：
 // TC 职责（eth0 egress）：
-// 1. NAT MASQUERADE：将 VPN 客户端 IP 转换为服务器出口 IP
+// 1. SNAT MASQUERADE：将 VPN 客户端 IP 转换为服务器出口 IP
 // 2. 校验和重算：重新计算 IP 和传输层校验和
 // 3. 仅处理：VPN 客户端 → 外部网络的流量
 //
@@ -185,11 +185,13 @@ static __always_inline int is_vpn_network(__u32 ip) {
 // TC 不处理：
 // - 策略检查（由 XDP eth0 ingress 处理）
 // - VPN 内部流量（不需要 NAT）
-// - 反向流量（由内核 conntrack 处理）
+// - 反向流量（由内核 conntrack 自动处理 DNAT）
 //
 // 注意：
-// - 使用 TCX_EGRESS attach type (kernel 5.19+)
+// - 使用 TCX_EGRESS attach type (kernel 5.19+)，回退到传统 TC clsact (kernel 4.1+)
 // - eth0 是物理网卡，数据包有以太网头
+// - 端口映射：当前实现只修改源 IP，不修改源端口（依赖客户端端口不同）
+// - 连接跟踪：依赖内核 conntrack 处理反向流量（确保 /proc/sys/net/netfilter/nf_conntrack_max > 0）
 SEC("tc")
 int tc_nat_egress(struct __sk_buff *skb) {
     void *data = (void *)(long)skb->data;
