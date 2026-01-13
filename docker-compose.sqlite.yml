@@ -10,9 +10,7 @@
 services:
   # ZVPN 应用（使用 SQLite）
   zvpn:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    image: ghcr.nju.edu.cn/fisker086/zvpn:latest
     container_name: zvpn-backend
     restart: unless-stopped
     
