@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"log"
+	"os"
 
 	"github.com/spf13/viper"
 )
@@ -150,6 +151,16 @@ func Load() *Config {
 		}
 	} else {
 		log.Printf("✓ 配置文件加载成功: %s", viper.ConfigFileUsed())
+	}
+
+	// 这样可以确保环境变量（如 DB_TYPE）能够覆盖配置文件中的值
+	if dbType := os.Getenv("DB_TYPE"); dbType != "" {
+		viper.Set("database.type", dbType)
+		log.Printf("✓ 环境变量 DB_TYPE=%s 覆盖配置文件设置", dbType)
+	}
+	if dbDsn := os.Getenv("DB_DSN"); dbDsn != "" {
+		viper.Set("database.dsn", dbDsn)
+		log.Printf("✓ 环境变量 DB_DSN 覆盖配置文件设置")
 	}
 
 	var config Config
