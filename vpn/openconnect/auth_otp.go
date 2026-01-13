@@ -21,13 +21,30 @@ func (h *Handler) sendOTPRequest(c *gin.Context, username string, errorMessage s
 		message = errorMessage
 	}
 
-	authContent := "    <auth id=\"otp\">\n"
-	authContent += "        <title>OTP Authentication</title>\n"
+	// 检测客户端类型
+	clientType := detectClientType(c)
+	isOpenConnectClient := clientType == ClientTypeOpenConnect
+
+	authContent := "    <auth id=\"otp-verification\">\n"
+	authContent += "        <title>OTP 动态码验证</title>\n"
 	authContent += "        <message>" + message + "</message>\n"
+	if errorMessage != "" {
+		authContent += "        <error id=\"otp-verification\" param1=\"" + errorMessage + "\" param2=\"\">验证失败:  %s</error>\n"
+	}
 	authContent += "        <form method=\"post\" action=\"/\">\n"
 	authContent += "            <input type=\"hidden\" name=\"username\" value=\"" + username + "\" />\n"
 	authContent += "            <input type=\"hidden\" name=\"password-token\" value=\"" + passwordToken + "\" />\n"
-	authContent += "            <input type=\"text\" name=\"otp-code\" label=\"OTP Code (6 digits):\" />\n"
+
+	// 为了兼容性，根据客户端类型使用不同的字段名
+	// AnyConnect 使用 secondary_password（标准字段），OpenConnect 使用 otp-code
+	// 服务器端解析时会优先读取 secondary_password，如果没有则读取 otp-code（已实现兼容）
+	if isOpenConnectClient {
+		// OpenConnect 客户端：使用 otp-code 字段
+		authContent += "            <input type=\"password\" name=\"otp-code\" label=\"OTP Code (6 digits):\" />\n"
+	} else {
+		// AnyConnect 客户端：使用 secondary_password 字段（标准字段）
+		authContent += "            <input type=\"password\" name=\"secondary_password\" label=\"OTPCode:\" />\n"
+	}
 	authContent += "        </form>\n"
 	authContent += "    </auth>\n"
 
@@ -121,3 +138,4 @@ func (h *Handler) sendOTPSetupRequest(c *gin.Context, username string) {
 
 	h.sendAuthRequestResponse(c, xml)
 }
+

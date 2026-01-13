@@ -129,7 +129,11 @@ func (h *Handler) GetConfig(c *gin.Context) {
 			if err := c.Request.ParseForm(); err == nil {
 				username := c.Request.PostForm.Get("username")
 				password := c.Request.PostForm.Get("password")
-				otpCode := c.Request.PostForm.Get("otp-code")
+				// 优先使用 secondary_password（AnyConnect 标准字段），如果没有则使用 otp-code
+				otpCode := c.Request.PostForm.Get("secondary_password")
+				if otpCode == "" {
+					otpCode = c.Request.PostForm.Get("otp-code")
+				}
 				passwordToken := c.Request.PostForm.Get("password-token")
 				if username != "" && (password != "" || (otpCode != "" && passwordToken != "")) {
 					h.Authenticate(c)
@@ -174,10 +178,11 @@ type AuthRequest struct {
 		GroupSelect string `xml:"group-select"`
 	} `xml:"opaque"`
 	Auth struct {
-		Username      string `xml:"username"`
-		Password      string `xml:"password"`
-		PasswordToken string `xml:"password-token"`
-		OTPCode       string `xml:"otp-code"`
+		Username          string `xml:"username"`
+		Password          string `xml:"password"`
+		PasswordToken     string `xml:"password-token"`
+		OTPCode           string `xml:"otp-code"`
+		SecondaryPassword string `xml:"secondary_password"` // AnyConnect 客户端使用此字段
 	} `xml:"auth"`
 }
 
@@ -325,7 +330,12 @@ func (h *Handler) Authenticate(c *gin.Context) {
 				if len(bodyBytes) > 0 && bytes.HasPrefix(bytes.TrimSpace(bodyBytes), []byte("<?xml")) {
 					var authReq AuthRequest
 					if err := xml.Unmarshal(bodyBytes, &authReq); err == nil {
-						otpCodeFromRequest = authReq.Auth.OTPCode
+						// 优先使用 secondary_password（AnyConnect 标准字段），如果没有则使用 otp-code
+						if authReq.Auth.SecondaryPassword != "" {
+							otpCodeFromRequest = authReq.Auth.SecondaryPassword
+						} else {
+							otpCodeFromRequest = authReq.Auth.OTPCode
+						}
 						passwordTokenFromRequest = authReq.Auth.PasswordToken
 					}
 				}
@@ -333,7 +343,11 @@ func (h *Handler) Authenticate(c *gin.Context) {
 
 					c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 					if err := c.Request.ParseForm(); err == nil {
-						otpCodeFromRequest = c.Request.PostForm.Get("otp-code")
+						// 优先使用 secondary_password（AnyConnect 标准字段），如果没有则使用 otp-code
+						otpCodeFromRequest = c.Request.PostForm.Get("secondary_password")
+						if otpCodeFromRequest == "" {
+							otpCodeFromRequest = c.Request.PostForm.Get("otp-code")
+						}
 						passwordTokenFromRequest = c.Request.PostForm.Get("password-token")
 					}
 				}
@@ -635,28 +649,37 @@ func (h *Handler) Authenticate(c *gin.Context) {
 			if len(bodyBytes) > 0 && bytes.HasPrefix(bytes.TrimSpace(bodyBytes), []byte("<?xml")) {
 				var authReq AuthRequest
 				if err := xml.Unmarshal(bodyBytes, &authReq); err == nil {
-					otpCode = authReq.Auth.OTPCode
+					// 优先使用 secondary_password（AnyConnect 标准字段），如果没有则使用 otp-code
+					if authReq.Auth.SecondaryPassword != "" {
+						otpCode = authReq.Auth.SecondaryPassword
+					} else {
+						otpCode = authReq.Auth.OTPCode
+					}
 					passwordToken = authReq.Auth.PasswordToken
 
 					if authReq.Auth.Username != "" {
 						username = authReq.Auth.Username
 					}
-					log.Printf("OpenConnect: XML parsed for OTP step - username: %s, has OTP: %v, has token: %v",
-						username, otpCode != "", passwordToken != "")
+					log.Printf("OpenConnect: XML parsed for OTP step - username: %s, has OTP: %v (secondary_password: %v, otp-code: %v), has token: %v",
+						username, otpCode != "", authReq.Auth.SecondaryPassword != "", authReq.Auth.OTPCode != "", passwordToken != "")
 				}
 			}
 			if otpCode == "" || passwordToken == "" {
 
 				c.Request.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 				if err := c.Request.ParseForm(); err == nil {
-					otpCode = c.Request.PostForm.Get("otp-code")
+					// 优先使用 secondary_password（AnyConnect 标准字段），如果没有则使用 otp-code
+					otpCode = c.Request.PostForm.Get("secondary_password")
+					if otpCode == "" {
+						otpCode = c.Request.PostForm.Get("otp-code")
+					}
 					passwordToken = c.Request.PostForm.Get("password-token")
 
 					if formUsername := c.Request.PostForm.Get("username"); formUsername != "" {
 						username = formUsername
 					}
-					log.Printf("OpenConnect: Form parsed for OTP step - username: %s, has OTP: %v, has token: %v",
-						username, otpCode != "", passwordToken != "")
+					log.Printf("OpenConnect: Form parsed for OTP step - username: %s, has OTP: %v (secondary_password: %v, otp-code: %v), has token: %v",
+						username, otpCode != "", c.Request.PostForm.Get("secondary_password") != "", c.Request.PostForm.Get("otp-code") != "", passwordToken != "")
 				}
 			}
 
@@ -1021,3 +1044,4 @@ func (h *Handler) handleLogout(c *gin.Context) {
 
 	c.Data(http.StatusOK, "text/xml; charset=utf-8", []byte(xml))
 }
+
