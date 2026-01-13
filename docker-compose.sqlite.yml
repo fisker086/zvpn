@@ -1,0 +1,95 @@
+# Docker Compose 配置 - SQLite 版本
+# 使用 SQLite 数据库，无需 MySQL 服务，部署更简单
+# 
+# 启动方式：
+#   docker-compose -f docker-compose.sqlite.yml up -d
+#
+# 或者使用环境变量：
+#   DB_TYPE=sqlite DB_DSN=data/zvpn.db docker-compose up -d zvpn
+
+services:
+  # ZVPN 应用（使用 SQLite）
+  zvpn:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: zvpn-backend
+    restart: unless-stopped
+    
+    # 网络配置
+    networks:
+      - zvpn-network
+    ports:
+      - "18080:18080"        # HTTP REST API
+      - "443:443/tcp"        # OpenConnect SSL/TLS (主连接)
+      - "443:443/udp"        # OpenConnect DTLS (UDP 加速，低延迟)
+    
+    # 特权模式（eBPF 和 TUN/TAP 需要）
+    privileged: true
+    
+    # 额外的 capabilities（如果需要）
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_ADMIN
+      - BPF
+      - SYS_RESOURCE
+    
+    # 挂载点
+    volumes:
+      # eBPF 文件系统（如果启用 eBPF）
+      - /sys/fs/bpf:/sys/fs/bpf:rw
+      # 证书目录
+      - ./certs:/app/certs:rw
+      # 数据目录（SQLite 数据库文件存储在这里）
+      - ./data:/app/data:rw
+      # TUN 设备（必需）
+      - /dev/net/tun:/dev/net/tun
+    
+    environment:
+      # 服务器配置
+      SERVER_HOST: ${SERVER_HOST:-0.0.0.0}
+      SERVER_PORT: ${SERVER_PORT:-18080}
+      GIN_MODE: ${GIN_MODE:-release}
+      
+      # 数据库配置 - SQLite
+      DB_TYPE: ${DB_TYPE:-sqlite}
+      DB_DSN: ${DB_DSN:-data/zvpn.db}  # SQLite 数据库文件路径（相对于 /app 目录）
+      
+      # VPN 配置
+      VPN_INTERFACE: ${VPN_INTERFACE:-zvpn0}
+      VPN_NETWORK: ${VPN_NETWORK:-10.8.0.0/24}
+      VPN_MTU: ${VPN_MTU:-1400}
+      
+      # OpenConnect 配置
+      VPN_ENABLE_OPENCONNECT: ${VPN_ENABLE_OPENCONNECT:-true}
+      VPN_OPENCONNECT_PORT: ${VPN_OPENCONNECT_PORT:-443}
+      VPN_ENABLE_DTLS: ${VPN_ENABLE_DTLS:-true}
+      VPN_DTLS_PORT: ${VPN_DTLS_PORT:-443}
+      
+      # 证书配置
+      VPN_CERT: ${VPN_CERT:-/app/certs/server.crt}
+      VPN_KEY: ${VPN_KEY:-/app/certs/server.key}
+      
+      # eBPF 配置（必需）
+      VPN_EBPF_INTERFACE: ${VPN_EBPF_INTERFACE:-eth0}
+      
+      # JWT 配置
+      JWT_SECRET: ${JWT_SECRET:-your-secret-key-change-this-in-production}
+      
+      # 时区
+      TZ: ${TZ:-Asia/Shanghai}
+    
+    # 健康检查
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:18080/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s  # SQLite 启动更快，减少等待时间
+
+networks:
+  zvpn-network:
+    driver: bridge
+
+

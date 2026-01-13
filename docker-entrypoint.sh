@@ -5,16 +5,32 @@ echo "=========================================="
 echo "🚀 ZVPN Docker 启动脚本"
 echo "=========================================="
 
-# 等待 MySQL 就绪（如果使用外部 MySQL）
-if [ -n "$DB_HOST" ] && [ "$DB_TYPE" = "mysql" ]; then
-    echo "⏳ 等待 MySQL 就绪..."
-    host="${DB_HOST:-127.0.0.1}"
-    port="${DB_PORT:-3306}"
-    until nc -z "$host" "$port" 2>/dev/null; do
-        echo "MySQL 未就绪 ($host:$port)，等待 2 秒..."
-        sleep 2
-    done
-    echo "✅ MySQL 已就绪"
+# 等待数据库就绪（仅 MySQL/PostgreSQL，SQLite 不需要）
+DB_TYPE="${DB_TYPE:-mysql}"
+if [ "$DB_TYPE" = "mysql" ] || [ "$DB_TYPE" = "postgres" ] || [ "$DB_TYPE" = "postgresql" ]; then
+    if [ -n "$DB_HOST" ]; then
+        echo "⏳ 等待 $DB_TYPE 数据库就绪..."
+        host="${DB_HOST:-127.0.0.1}"
+        if [ "$DB_TYPE" = "mysql" ]; then
+            port="${DB_PORT:-3306}"
+        else
+            port="${DB_PORT:-5432}"
+        fi
+        until nc -z "$host" "$port" 2>/dev/null; do
+            echo "$DB_TYPE 未就绪 ($host:$port)，等待 2 秒..."
+            sleep 2
+        done
+        echo "✅ $DB_TYPE 数据库已就绪"
+    fi
+elif [ "$DB_TYPE" = "sqlite" ] || [ "$DB_TYPE" = "sqlite3" ]; then
+    echo "📦 使用 SQLite 数据库（无需等待外部服务）"
+    # 确保 SQLite 数据库目录存在
+    DB_DSN="${DB_DSN:-data/zvpn.db}"
+    DB_DIR=$(dirname "$DB_DSN")
+    if [ "$DB_DIR" != "." ] && [ "$DB_DIR" != "/" ]; then
+        mkdir -p "/app/$DB_DIR" 2>/dev/null || true
+        echo "✅ SQLite 数据库目录已准备: /app/$DB_DIR"
+    fi
 fi
 
 # 切换到工作目录
@@ -84,6 +100,9 @@ echo "    VPN 接口: ${VPN_INTERFACE:-zvpn0}"
 echo "    MTU: ${VPN_MTU:-1400}"
 echo ""
 echo "  🗄️  数据库: ${DB_TYPE:-mysql}"
+if [ "${DB_TYPE:-mysql}" = "sqlite" ] || [ "${DB_TYPE:-mysql}" = "sqlite3" ]; then
+    echo "    SQLite 文件: ${DB_DSN:-data/zvpn.db}"
+fi
 echo ""
 echo "  ⚡ 性能加速:"
     echo "    eBPF XDP: 启用 (接口: ${VPN_EBPF_INTERFACE:-eth0})"
@@ -94,3 +113,6 @@ echo ""
 
 # 执行主命令
 exec "$@"
+
+
+

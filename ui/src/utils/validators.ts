@@ -56,20 +56,32 @@ export function validatePasswordStrength(password: string): {
   }
 
   let strength = 0
-  if (/[a-z]/.test(password)) strength++
-  if (/[A-Z]/.test(password)) strength++
-  if (/[0-9]/.test(password)) strength++
-  if (/[^a-zA-Z0-9]/.test(password)) strength++
+  const hasLower = /[a-z]/.test(password)
+  const hasUpper = /[A-Z]/.test(password)
+  const hasNumber = /[0-9]/.test(password)
+  const hasSpecial = /[^a-zA-Z0-9]/.test(password)
+  
+  if (hasLower) strength++
+  if (hasUpper) strength++
+  if (hasNumber) strength++
+  if (hasSpecial) strength++
 
-  if (strength < 2) {
+  // 需要至少包含3种类型的字符（大小写、数字、特殊字符）
+  if (strength < 3) {
+    const missing: string[] = []
+    if (!hasLower) missing.push('小写字母')
+    if (!hasUpper) missing.push('大写字母')
+    if (!hasNumber) missing.push('数字')
+    if (!hasSpecial) missing.push('特殊字符（如 !@#$%^&*）')
+    
     return {
       valid: false,
       strength: 'weak',
-      message: '密码强度较弱，建议包含大小写字母、数字和特殊字符',
+      message: `密码复杂度不足，需要包含大小写字母、数字和特殊字符。当前缺少：${missing.join('、')}`,
     }
   }
 
-  if (strength === 2) {
+  if (strength === 3) {
     return {
       valid: true,
       strength: 'medium',
@@ -83,4 +95,5 @@ export function validatePasswordStrength(password: string): {
     message: '密码强度强',
   }
 }
+
 

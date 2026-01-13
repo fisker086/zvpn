@@ -155,6 +155,25 @@
               留空则不修改密码，填写新密码将更新用户密码
             </a-typography-text>
           </template>
+          <template #extra v-else>
+            <a-alert
+              type="info"
+              :closable="false"
+              style="margin-top: 8px"
+            >
+              <template #icon>
+                <icon-info-circle />
+              </template>
+              <div style="font-size: 12px">
+                <div style="margin-bottom: 4px"><strong>密码要求：</strong></div>
+                <div>• 长度至少 8 位</div>
+                <div>• 包含大小写字母、数字和特殊字符（如 !@#$%^&*）</div>
+                <div style="margin-top: 4px; color: var(--color-text-3)">
+                  示例：MyP@ssw0rd
+                </div>
+              </div>
+            </a-alert>
+          </template>
         </a-form-item>
 
         <a-form-item label="邮箱">
@@ -176,12 +195,18 @@
           </template>
         </a-form-item>
 
-        <a-form-item label="用户组" required>
+        <a-form-item 
+          label="用户组" 
+          required
+          :validate-status="(!isEdit && (!formData.group_ids || formData.group_ids.length === 0)) ? 'error' : ''"
+          :help="(!isEdit && (!formData.group_ids || formData.group_ids.length === 0)) ? '请至少选择一个用户组' : ''"
+        >
           <a-select
             v-model="formData.group_ids"
             placeholder="请选择用户组（必选）"
             multiple
             :loading="groupsLoading"
+            :status="(!isEdit && (!formData.group_ids || formData.group_ids.length === 0)) ? 'error' : ''"
           >
             <a-option
               v-for="group in groups"
@@ -196,15 +221,15 @@
           </a-select>
           <template #extra>
             <a-alert
-              type="info"
+              type="warning"
               :closable="false"
               style="margin-top: 8px"
             >
               <template #icon>
-                <icon-info-circle />
+                <icon-exclamation-circle-fill />
               </template>
               <div style="font-size: 12px">
-                <div>用户必须属于至少一个用户组。</div>
+                <div><strong>⚠️ 必选项：</strong>用户必须属于至少一个用户组</div>
                 <div style="margin-top: 4px">策略通过用户组自动分配，用户无法直接绑定策略。</div>
               </div>
             </a-alert>
@@ -511,8 +536,9 @@ const handleDelete = (record: User) => {
 }
 
 const handleSubmit = async () => {
+  // 验证必填项
   if (!formData.username || (!isEdit.value && !formData.password)) {
-    Message.warning('请填写必填项')
+    Message.warning('请填写必填项（用户名和密码）')
     return
   }
 
@@ -531,9 +557,9 @@ const handleSubmit = async () => {
     }
   }
 
-  // 验证用户组
-  if (!formData.group_ids || formData.group_ids.length === 0) {
-    Message.warning('用户必须属于至少一个用户组')
+  // 验证用户组（创建用户时必选）
+  if (!isEdit.value && (!formData.group_ids || formData.group_ids.length === 0)) {
+    Message.warning('请至少选择一个用户组，用户必须属于至少一个用户组')
     return
   }
 
@@ -573,6 +599,9 @@ const handleSubmit = async () => {
       
       await usersApi.update(currentUser.value.id, updateData)
       Message.success(updateData.password ? '用户信息和密码已更新' : '更新成功')
+      // 只有成功时才关闭模态框
+      modalVisible.value = false
+      fetchUsers()
     } else {
       // 创建用户（必须指定用户组）
       await usersApi.create({
@@ -586,10 +615,12 @@ const handleSubmit = async () => {
       })
       
       Message.success('创建成功')
+      // 只有成功时才关闭模态框
+      modalVisible.value = false
+      fetchUsers()
     }
-    modalVisible.value = false
-    fetchUsers()
   } catch (error: any) {
+    // 失败时不关闭模态框，让用户可以看到错误信息并修改
     Message.error(error.response?.data?.error || '操作失败')
   } finally {
     submitLoading.value = false
@@ -881,3 +912,4 @@ onMounted(() => {
   line-height: 1.5;
 }
 </style>
+

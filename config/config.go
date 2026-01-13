@@ -173,6 +173,10 @@ func setDefaults() {
 
 	viper.SetDefault("database.type", "mysql")
 	viper.SetDefault("database.dsn", "zvpn:zvpn@tcp(127.0.0.1:3306)/zvpn?charset=utf8mb4&parseTime=True&loc=Local")
+
+	// 支持环境变量覆盖数据库类型和 DSN
+	viper.BindEnv("database.type", "DB_TYPE", "DATABASE_TYPE")
+	viper.BindEnv("database.dsn", "DB_DSN", "DATABASE_DSN")
 	viper.SetDefault("database.maxopenconns", 25)     // 最大打开连接数
 	viper.SetDefault("database.maxidleconns", 10)     // 最大空闲连接数
 	viper.SetDefault("database.connmaxlifetime", 300) // 连接最大生存时间（秒）
@@ -244,12 +248,27 @@ func setDefaults() {
 }
 
 func validateConfig(cfg *Config) error {
-	if cfg.Database.Type != "mysql" && cfg.Database.Type != "postgres" && cfg.Database.Type != "postgresql" {
-		return fmt.Errorf("不支持的数据库类型: %s (仅支持 mysql 或 postgres)", cfg.Database.Type)
+	validTypes := []string{"mysql", "postgres", "postgresql", "sqlite", "sqlite3"}
+	isValid := false
+	for _, t := range validTypes {
+		if cfg.Database.Type == t {
+			isValid = true
+			break
+		}
+	}
+	if !isValid {
+		return fmt.Errorf("不支持的数据库类型: %s (支持: mysql, postgres, sqlite)", cfg.Database.Type)
 	}
 
+	// SQLite 的 DSN 是文件路径，可以为空（使用默认路径）
 	if cfg.Database.DSN == "" {
-		return fmt.Errorf("数据库 DSN 不能为空")
+		if cfg.Database.Type == "sqlite" || cfg.Database.Type == "sqlite3" {
+			// SQLite 默认使用 data/zvpn.db
+			cfg.Database.DSN = "data/zvpn.db"
+			log.Printf("SQLite DSN 未设置，使用默认路径: %s", cfg.Database.DSN)
+		} else {
+			return fmt.Errorf("数据库 DSN 不能为空")
+		}
 	}
 
 	if cfg.JWT.Secret == "your-secret-key-change-this" {

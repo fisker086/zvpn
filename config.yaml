@@ -8,13 +8,18 @@ server:
 
 # ==================== 数据库配置 ====================
 database:
+  # 支持的数据库类型: mysql, postgres, sqlite
+  # MySQL: type: "mysql", dsn: "user:pass@tcp(host:3306)/dbname?charset=utf8mb4&parseTime=True&loc=Local"
+  # PostgreSQL: type: "postgres", dsn: "host=localhost user=zvpn password=zvpn dbname=zvpn port=5432 sslmode=disable"
+  # SQLite: type: "sqlite", dsn: "data/zvpn.db" (文件路径，相对于应用目录)
   type: "mysql"
   dsn: "root:123456@tcp(mysql:3306)/zvpn?charset=utf8mb4&parseTime=True&loc=Local"
   # 连接池配置（可选，使用默认值即可）
-  maxopenconns: 25      # 最大打开连接数（默认：25）
-  maxidleconns: 10      # 最大空闲连接数（默认：10）
-  connmaxlifetime: 300  # 连接最大生存时间（秒，默认：300，即5分钟）
-  connmaxidletime: 60   # 连接最大空闲时间（秒，默认：60，即1分钟）
+  # 注意：SQLite 使用单连接，这些配置对 SQLite 无效
+  maxopenconns: 25      # 最大打开连接数（默认：25，SQLite 使用 1）
+  maxidleconns: 10      # 最大空闲连接数（默认：10，SQLite 使用 1）
+  connmaxlifetime: 300  # 连接最大生存时间（秒，默认：300，即5分钟，SQLite 不使用）
+  connmaxidletime: 60   # 连接最大空闲时间（秒，默认：60，即1分钟，SQLite 不使用）
   
 # ==================== VPN 网络配置 ====================
 vpn:
@@ -45,3 +50,4 @@ vpn:
 jwt:
   secret: "de3b81da80999e0ab400286b838799eb0e56e9ea804783d873b0a3960c2cf7c7"  # 生产环境必须修改！
   expiration: 24  # Token 过期时间（小时）
+

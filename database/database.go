@@ -5,12 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/fisker/zvpn/config"
 	"github.com/fisker/zvpn/models"
 	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
+	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
@@ -67,8 +70,35 @@ func Init(cfg *config.Config) error {
 		dialector = mysql.Open(cfg.Database.DSN)
 	case "postgres", "postgresql":
 		dialector = postgres.Open(cfg.Database.DSN)
+	case "sqlite", "sqlite3":
+		// SQLite DSN 是文件路径
+		dbPath := cfg.Database.DSN
+		if dbPath == "" {
+			dbPath = "data/zvpn.db" // 默认路径
+		}
+
+		// 确保数据库文件目录存在
+		// 如果路径是相对路径，保持相对路径（GORM SQLite 驱动会处理）
+		// 如果是绝对路径，确保目录存在
+		if filepath.IsAbs(dbPath) {
+			dir := filepath.Dir(dbPath)
+			if err := os.MkdirAll(dir, 0755); err != nil {
+				return fmt.Errorf("failed to create SQLite database directory: %w", err)
+			}
+		} else {
+			// 相对路径，确保目录存在（相对于当前工作目录）
+			dir := filepath.Dir(dbPath)
+			if dir != "." && dir != "" {
+				if err := os.MkdirAll(dir, 0755); err != nil {
+					return fmt.Errorf("failed to create SQLite database directory: %w", err)
+				}
+			}
+		}
+
+		log.Printf("SQLite database path: %s", dbPath)
+		dialector = sqlite.Open(dbPath)
 	default:
-		return fmt.Errorf("unsupported database type: %s (supported: mysql, postgres)", cfg.Database.Type)
+		return fmt.Errorf("unsupported database type: %s (supported: mysql, postgres, sqlite)", cfg.Database.Type)
 	}
 
 	log.Printf("Connecting to %s database...", cfg.Database.Type)
@@ -86,36 +116,55 @@ func Init(cfg *config.Config) error {
 		return fmt.Errorf("failed to get underlying sql.DB: %w", err)
 	}
 
-	maxOpenConns := cfg.Database.MaxOpenConns
-	if maxOpenConns <= 0 {
-		maxOpenConns = 25 // 默认值
-	}
-	sqlDB.SetMaxOpenConns(maxOpenConns)
-	log.Printf("Database connection pool: MaxOpenConns = %d", maxOpenConns)
+	// SQLite 的连接池配置与其他数据库不同
+	if cfg.Database.Type == "sqlite" || cfg.Database.Type == "sqlite3" {
+		// SQLite 是文件数据库，连接池配置较小
+		maxOpenConns := cfg.Database.MaxOpenConns
+		if maxOpenConns <= 0 {
+			maxOpenConns = 1 // SQLite 默认单连接
+		}
+		if maxOpenConns > 1 {
+			log.Printf("Warning: SQLite works best with MaxOpenConns=1, but using %d as configured", maxOpenConns)
+		}
+		sqlDB.SetMaxOpenConns(maxOpenConns)
+		sqlDB.SetMaxIdleConns(1) // SQLite 通常只需要 1 个空闲连接
+		log.Printf("Database connection pool: MaxOpenConns = %d, MaxIdleConns = 1 (SQLite)", maxOpenConns)
 
-	maxIdleConns := cfg.Database.MaxIdleConns
-	if maxIdleConns <= 0 {
-		maxIdleConns = 10 // 默认值
-	}
-	if maxIdleConns > maxOpenConns {
-		maxIdleConns = maxOpenConns
-	}
-	sqlDB.SetMaxIdleConns(maxIdleConns)
-	log.Printf("Database connection pool: MaxIdleConns = %d", maxIdleConns)
+		// SQLite 不需要连接超时配置
+		log.Printf("SQLite database: connection pool configured (file-based, no connection timeout)")
+	} else {
+		// MySQL/PostgreSQL 连接池配置
+		maxOpenConns := cfg.Database.MaxOpenConns
+		if maxOpenConns <= 0 {
+			maxOpenConns = 25 // 默认值
+		}
+		sqlDB.SetMaxOpenConns(maxOpenConns)
+		log.Printf("Database connection pool: MaxOpenConns = %d", maxOpenConns)
 
-	connMaxLifetime := cfg.Database.ConnMaxLifetime
-	if connMaxLifetime <= 0 {
-		connMaxLifetime = 300 // 默认 5 分钟
-	}
-	sqlDB.SetConnMaxLifetime(time.Duration(connMaxLifetime) * time.Second)
-	log.Printf("Database connection pool: ConnMaxLifetime = %ds", connMaxLifetime)
+		maxIdleConns := cfg.Database.MaxIdleConns
+		if maxIdleConns <= 0 {
+			maxIdleConns = 10 // 默认值
+		}
+		if maxIdleConns > maxOpenConns {
+			maxIdleConns = maxOpenConns
+		}
+		sqlDB.SetMaxIdleConns(maxIdleConns)
+		log.Printf("Database connection pool: MaxIdleConns = %d", maxIdleConns)
 
-	connMaxIdleTime := cfg.Database.ConnMaxIdleTime
-	if connMaxIdleTime <= 0 {
-		connMaxIdleTime = 60 // 默认 1 分钟
+		connMaxLifetime := cfg.Database.ConnMaxLifetime
+		if connMaxLifetime <= 0 {
+			connMaxLifetime = 300 // 默认 5 分钟
+		}
+		sqlDB.SetConnMaxLifetime(time.Duration(connMaxLifetime) * time.Second)
+		log.Printf("Database connection pool: ConnMaxLifetime = %ds", connMaxLifetime)
+
+		connMaxIdleTime := cfg.Database.ConnMaxIdleTime
+		if connMaxIdleTime <= 0 {
+			connMaxIdleTime = 60 // 默认 1 分钟
+		}
+		sqlDB.SetConnMaxIdleTime(time.Duration(connMaxIdleTime) * time.Second)
+		log.Printf("Database connection pool: ConnMaxIdleTime = %ds", connMaxIdleTime)
 	}
-	sqlDB.SetConnMaxIdleTime(time.Duration(connMaxIdleTime) * time.Second)
-	log.Printf("Database connection pool: ConnMaxIdleTime = %ds", connMaxIdleTime)
 
 	if err := sqlDB.Ping(); err != nil {
 		return fmt.Errorf("failed to ping database: %w", err)
@@ -281,6 +330,7 @@ func initDefaultSystemSettings() {
 
 func createDefaultSystemSetting(key string, defaultValue map[string]interface{}) {
 	var count int64
+	// key 是 MySQL 关键字，需要使用反引号。GORM 会根据数据库类型自动转换引号语法
 	DB.Model(&models.SystemSetting{}).Where("`key` = ?", key).Count(&count)
 	if count == 0 {
 		data, err := json.Marshal(defaultValue)
@@ -299,3 +349,4 @@ func createDefaultSystemSetting(key string, defaultValue map[string]interface{})
 		}
 	}
 }
+
