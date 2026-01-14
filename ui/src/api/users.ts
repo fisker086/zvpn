@@ -22,14 +22,14 @@ export interface User {
 export interface CreateUserRequest {
   username: string
   password: string
-  email?: string
+  email: string
   full_name?: string  // 中文名/全名（可选）
   is_admin?: boolean
   group_ids: number[] // 必须指定用户组
 }
 
 export interface UpdateUserRequest {
-  email?: string
+  email: string
   full_name?: string  // 中文名/全名（可选）
   is_admin?: boolean
   is_active?: boolean

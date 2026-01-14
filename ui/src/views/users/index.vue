@@ -176,7 +176,12 @@
           </template>
         </a-form-item>
 
-        <a-form-item label="邮箱">
+        <a-form-item 
+          label="邮箱" 
+          required
+          :validate-status="!formData.email ? 'error' : ''"
+          :help="!formData.email ? '邮箱为必填项' : ''"
+        >
           <a-input
             v-model="formData.email"
             placeholder="请输入邮箱"
@@ -537,13 +542,13 @@ const handleDelete = (record: User) => {
 
 const handleSubmit = async () => {
   // 验证必填项
-  if (!formData.username || (!isEdit.value && !formData.password)) {
-    Message.warning('请填写必填项（用户名和密码）')
+  if (!formData.username || (!isEdit.value && !formData.password) || !formData.email) {
+    Message.warning('请填写必填项（用户名、密码和邮箱）')
     return
   }
 
   // 验证邮箱格式
-  if (formData.email && !validateEmail(formData.email)) {
+  if (!validateEmail(formData.email)) {
     Message.warning('请输入有效的邮箱地址')
     return
   }
