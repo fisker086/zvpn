@@ -35,6 +35,10 @@
             <span class="text-secondary">{{ record.description || '-' }}</span>
           </template>
 
+          <template #allow_lan="{ record }">
+            <a-tag v-if="record.allow_lan" color="green" size="small">已开启</a-tag>
+            <a-tag v-else color="gray" size="small">未开启</a-tag>
+          </template>
 
           <template #users="{ record }">
             <a-space wrap>
@@ -123,6 +127,17 @@
             placeholder="请输入描述"
             :auto-size="{ minRows: 3, maxRows: 5 }"
           />
+        </a-form-item>
+
+        <a-form-item label="允许本地网络访问">
+          <a-switch v-model="formData.allow_lan" />
+          <template #extra>
+            <div style="margin-top: 8px; font-size: 12px; color: var(--color-text-3)">
+              <div>开启后，用户本地所在网段将不通过 VPN 加密传输。</div>
+              <div style="margin-top: 4px">本地网络指的是运行 VPN 客户端的设备所在的网络（本地路由网段）。</div>
+              <div style="margin-top: 4px">客户端需要开启"Allow Local Lan"选项，功能才能生效。</div>
+            </div>
+          </template>
         </a-form-item>
       </a-form>
     </a-modal>
@@ -259,37 +274,44 @@ const pagination = reactive({
 const formData = reactive<CreateGroupRequest & UpdateGroupRequest>({
   name: '',
   description: '',
-  allow_lan: false,
+  allow_lan: true,
 })
 
 const columns = [
   {
     title: '用户组名称',
     slotName: 'name',
-    width: 200,
+    width: 180,
     align: 'center',
   },
   {
     title: '描述',
     slotName: 'description',
+    width: 250,
+    align: 'center',
+  },
+  {
+    title: '允许本地网络',
+    slotName: 'allow_lan',
+    width: 130,
     align: 'center',
   },
   {
     title: '用户',
     slotName: 'users',
-    width: 250,
+    width: 220,
     align: 'center',
   },
   {
     title: '策略',
     slotName: 'policies',
-    width: 250,
+    width: 220,
     align: 'center',
   },
   {
     title: '操作',
     slotName: 'actions',
-    width: 250,
+    width: 200,
     align: 'center',
   },
 ]
@@ -343,7 +365,7 @@ const handleEdit = (record: UserGroup) => {
   currentGroup.value = record
   formData.name = record.name
   formData.description = record.description || ''
-  formData.allow_lan = record.allow_lan || false
+  formData.allow_lan = record.allow_lan !== undefined ? record.allow_lan : true
   modalVisible.value = true
 }
 
@@ -457,7 +479,7 @@ const handleCancel = () => {
 const resetForm = () => {
   formData.name = ''
   formData.description = ''
-  formData.allow_lan = false
+  formData.allow_lan = true
 }
 
 const handlePageChange = (page: number) => {
@@ -630,5 +652,6 @@ onMounted(() => {
   color: rgb(var(--green-7));
 }
 </style>
+
 
 

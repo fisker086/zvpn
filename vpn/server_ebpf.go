@@ -78,6 +78,7 @@ func loadEBPFTCNATImpl(ifName string, publicIP net.IP, vpnNetwork string) (inter
 	}
 
 	log.Printf("✅ eBPF TC NAT: Program loaded and configured on interface %s with NAT IP %s", ifName, publicIP.String())
+
 	return tcProg, nil
 }
 

@@ -20,6 +20,7 @@ export interface Policy {
   exclude_routes?: ExcludeRoute[]
   max_bandwidth?: number
   dns_servers?: string[] // DNS服务器IP地址数组
+  split_dns?: string[] // Split-DNS域名数组，例如: ["example.com", "*.example.com"]
   groups?: Array<{
     id: number
     name: string
@@ -33,6 +34,7 @@ export interface CreatePolicyRequest {
   description?: string
   max_bandwidth?: number
   dns_servers?: string[] // DNS服务器IP地址数组
+  split_dns?: string[] // Split-DNS域名数组
   group_ids: number[] // 必须绑定至少一个用户组
 }
 
@@ -41,6 +43,7 @@ export interface UpdatePolicyRequest {
   description?: string
   max_bandwidth?: number
   dns_servers?: string[] // DNS服务器IP地址数组
+  split_dns?: string[] // Split-DNS域名数组
 }
 
 export interface AddRouteRequest {
@@ -112,4 +115,5 @@ export const policiesApi = {
   updateExcludeRoute: (policyId: number, excludeRouteId: number, data: UpdateExcludeRouteRequest): Promise<ExcludeRoute> => 
     request.put<ExcludeRoute>(`/policies/${policyId}/exclude-routes/${excludeRouteId}`, data),
 }
+
 

@@ -230,11 +230,16 @@ func (s *VPNServer) listenTUNDevice(tunDevice *TUNDevice) {
 
 		// Case 5: Packet from VPN client to external network
 		// 注意：正常情况下不应该从TUN读取到，因为内核会直接通过eth0发送
-		// 但如果路由配置有问题可能会读取到，需要写回让内核重新路由
+		// 但如果路由配置有问题可能会读取到，需要做NAT后写回让内核重新路由
 		if ipNet.Contains(srcIP) && !ipNet.Contains(dstIP) {
-			LogPacketAlways("Warning: VPN client %s accessing external %s via TUN (should route via eth0)",
+			LogPacketAlways("Warning: VPN client %s accessing external %s via TUN (should route via eth0), performing user-space NAT",
 				srcIP.String(), dstIP.String())
-			// 写回TUN让内核重新路由（这种情况应该很少发生）
+			// Perform user-space NAT as fallback (eBPF TC NAT should handle this, but if packets come back to TUN, do NAT here)
+			if s.PerformUserSpaceNAT(buf[:n]) {
+				log.Printf("TUN: Performed user-space NAT for packet from %s to %s (fallback)",
+					srcIP.String(), dstIP.String())
+			}
+			// 写回TUN让内核重新路由（NAT后的数据包）
 			if _, err := tunDevice.Write(buf[:n]); err != nil {
 				LogPacketAlways("Failed to write packet back to TUN for external routing: %v", err)
 			}
@@ -246,3 +251,4 @@ func (s *VPNServer) listenTUNDevice(tunDevice *TUNDevice) {
 			srcIP.String(), dstIP.String(), protocol)
 	}
 }
+

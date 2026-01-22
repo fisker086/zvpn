@@ -716,15 +716,28 @@ func (tc *TunnelClient) processDataPacket(payload []byte) error {
 	dstIP := net.IP(payload[16:20])
 
 	if !srcIP.Equal(tc.IP) {
-		log.Printf("OpenConnect: Source IP mismatch: expected %s, got %s", tc.IP.String(), srcIP.String())
-		return fmt.Errorf("source IP mismatch: expected %s, got %s", tc.IP.String(), srcIP.String())
+		originalSrcIP := srcIP.String()
+		log.Printf("OpenConnect: Source IP mismatch: expected %s, got %s (correcting)",
+			tc.IP.String(), originalSrcIP)
+
+		if len(payload) >= 16 && tc.IP != nil {
+			if ipv4 := tc.IP.To4(); ipv4 != nil {
+				copy(payload[12:16], ipv4)
+				srcIP = tc.IP
+				log.Printf("OpenConnect: Source IP corrected from %s to %s", originalSrcIP, tc.IP.String())
+			} else {
+				log.Printf("OpenConnect: Warning - VPN IP %s is not IPv4, cannot correct source IP", tc.IP.String())
+			}
+		}
 	}
 
 	tc.lastDataTime = time.Now().Unix()
 
+	var ipNet *net.IPNet
 	cfg := tc.VPNServer.GetConfig()
 	if cfg != nil {
-		ipNet, err := parseVPNNetwork(cfg.VPN.Network)
+		var err error
+		ipNet, err = parseVPNNetwork(cfg.VPN.Network)
 		if err == nil {
 
 			serverVPNIP := getServerVPNIP(ipNet)
@@ -754,8 +767,8 @@ func (tc *TunnelClient) processDataPacket(payload []byte) error {
 		return err
 	}
 
-	if tc.TUNDevice != nil {
 
+	if tc.TUNDevice != nil {
 		_, err := tc.TUNDevice.Write(payload)
 		if err != nil {
 			log.Printf("OpenConnect: Failed to write to TUN device: %v", err)
@@ -1005,3 +1018,4 @@ func (tc *TunnelClient) sendKeepalive() error {
 
 	return tc.sendPacket(PacketTypeKeepalive, nil)
 }
+

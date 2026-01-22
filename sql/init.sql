@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS user_groups (
     id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     name VARCHAR(255) NOT NULL UNIQUE,
     description TEXT,
-    allow_lan BOOLEAN DEFAULT FALSE COMMENT '允许本地网络访问（类似 anylink 的 allow_lan 配置）',
+    allow_lan BOOLEAN DEFAULT TRUE COMMENT '允许本地网络访问（类似 anylink 的 allow_lan 配置）',
     created_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
     updated_at DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
     deleted_at DATETIME(3) NULL,

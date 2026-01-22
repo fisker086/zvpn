@@ -188,3 +188,4 @@ func (h *Handler) VPNConfig(c *gin.Context) {
 		"username": user.Username,
 	})
 }
+

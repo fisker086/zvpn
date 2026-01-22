@@ -53,15 +53,15 @@
           <template #routes="{ record }">
             <div class="routes-container">
               <a-tag
-                v-for="route in record.routes.slice(0, 3)"
+                v-for="route in record.routes.slice(0, 5)"
                 :key="route.id"
                 color="arcoblue"
                 size="small"
               >
                 {{ route.network }}
               </a-tag>
-              <a-tag v-if="record.routes.length > 3" size="small">
-                +{{ record.routes.length - 3 }}
+              <a-tag v-if="record.routes.length > 5" size="small">
+                +{{ record.routes.length - 5 }}
               </a-tag>
               <span v-if="record.routes.length === 0" class="text-secondary">
                 无路由
@@ -212,6 +212,46 @@
           <template #extra>
             <a-typography-text type="secondary" style="font-size: 12px">
               为空时使用系统默认DNS（8.8.8.8, 8.8.4.4）
+            </a-typography-text>
+          </template>
+        </a-form-item>
+
+        <a-form-item label="Split-DNS域名">
+          <a-space direction="vertical" :size="8" fill>
+            <div
+              v-for="(_, index) in formData.split_dns || []"
+              :key="index"
+              style="display: flex; gap: 8px; align-items: center"
+            >
+              <a-input
+                v-model="(formData.split_dns || [])[index]"
+                placeholder="例如: example.com 或 *.example.com"
+                style="flex: 1"
+              />
+              <a-button
+                v-if="canEdit"
+                type="text"
+                status="danger"
+                @click="removeSplitDNS(index)"
+              >
+                删除
+              </a-button>
+            </div>
+            <a-button
+              v-if="canEdit"
+              type="dashed"
+              long
+              @click="addSplitDNS"
+            >
+              <template #icon>
+                <icon-plus />
+              </template>
+              添加Split-DNS域名
+            </a-button>
+          </a-space>
+          <template #extra>
+            <a-typography-text type="secondary" style="font-size: 12px">
+              指定哪些域名应通过VPN的DNS服务器解析（支持通配符，如 *.example.com）
             </a-typography-text>
           </template>
         </a-form-item>
@@ -565,7 +605,7 @@ const columns = [
   {
     title: '路由规则',
     slotName: 'routes',
-    width: 220,
+    width: 350,
     align: 'center',
   },
   {
@@ -673,6 +713,7 @@ const handleEdit = (record: Policy) => {
   formData.description = record.description || ''
   formData.max_bandwidth = record.max_bandwidth
   formData.dns_servers = record.dns_servers ? [...record.dns_servers] : []
+  formData.split_dns = record.split_dns ? [...record.split_dns] : []
   formData.group_ids = [] // 编辑时不显示用户组选择，通过"用户组"按钮单独管理
   modalVisible.value = true
 }
@@ -727,6 +768,8 @@ const handleSubmit = async () => {
   try {
     // 处理DNS服务器：过滤空值，如果为空数组则发送空数组（后端会处理为使用默认DNS）
     const dnsServers = formData.dns_servers?.filter(dns => dns && dns.trim() !== '') || []
+    // 处理Split-DNS域名：过滤空值
+    const splitDNS = formData.split_dns?.filter(domain => domain && domain.trim() !== '') || []
     
     if (isEdit.value && currentPolicy.value) {
       await policiesApi.update(currentPolicy.value.id, {
@@ -734,6 +777,7 @@ const handleSubmit = async () => {
         description: formData.description,
         max_bandwidth: formData.max_bandwidth,
         dns_servers: dnsServers.length > 0 ? dnsServers : [],
+        split_dns: splitDNS.length > 0 ? splitDNS : [],
       })
       Message.success('更新成功')
     } else {
@@ -742,6 +786,7 @@ const handleSubmit = async () => {
         description: formData.description,
         max_bandwidth: formData.max_bandwidth,
         dns_servers: dnsServers.length > 0 ? dnsServers : [],
+        split_dns: splitDNS.length > 0 ? splitDNS : [],
         group_ids: formData.group_ids!,
       })
       Message.success('创建成功')
@@ -765,6 +810,7 @@ const resetForm = () => {
   formData.description = ''
   formData.max_bandwidth = undefined
   formData.dns_servers = []
+  formData.split_dns = []
   formData.group_ids = []
 }
 
@@ -778,6 +824,19 @@ const addDNSServer = () => {
 const removeDNSServer = (index: number) => {
   if (formData.dns_servers) {
     formData.dns_servers.splice(index, 1)
+  }
+}
+
+const addSplitDNS = () => {
+  if (!formData.split_dns) {
+    formData.split_dns = []
+  }
+  formData.split_dns.push('')
+}
+
+const removeSplitDNS = (index: number) => {
+  if (formData.split_dns) {
+    formData.split_dns.splice(index, 1)
   }
 }
 
@@ -1063,7 +1122,7 @@ onMounted(() => {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  max-width: 100px;
+  max-width: 150px;
 }
 
 /* 确保表格单元格内容不溢出 */
@@ -1075,3 +1134,4 @@ onMounted(() => {
   overflow: hidden;
 }
 </style>
+

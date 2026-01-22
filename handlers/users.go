@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"image/png"
 	"log"
@@ -15,6 +16,21 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/pquerna/otp/totp"
 )
+
+// getDNSServersFromPolicy 从策略中获取 DNS 服务器列表
+func getDNSServersFromPolicy(policy *models.Policy) []string {
+	if policy == nil || policy.DNSServers == "" {
+		return []string{}
+	}
+
+	var dnsServers []string
+	err := json.Unmarshal([]byte(policy.DNSServers), &dnsServers)
+	if err == nil {
+		return dnsServers
+	}
+
+	return strings.Split(policy.DNSServers, ",")
+}
 
 type UserHandler struct {
 	config *config.Config
@@ -172,7 +188,7 @@ func (h *UserHandler) UpdateUser(c *gin.Context) {
 			return
 		}
 		var groups []models.UserGroup
-		if err := database.DB.Find(&groups, req.GroupIDs).Error; err != nil || len(groups) != len(req.GroupIDs) {
+		if err := database.DB.Preload("Policies").Find(&groups, req.GroupIDs).Error; err != nil || len(groups) != len(req.GroupIDs) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "部分用户组不存在"})
 			return
 		}
@@ -476,3 +492,4 @@ func (h *UserHandler) DisableOTP(c *gin.Context) {
 		"enabled": false,
 	})
 }
+

@@ -76,9 +76,30 @@ else
     echo "   请使用 --sysctl net.ipv4.ip_forward=1 启动容器"
 fi
 
-# NAT 配置：使用 eBPF TC egress NAT（由程序代码自动配置）
-echo "🔧 NAT 配置: 使用 eBPF TC egress NAT（由程序自动配置）"
-echo "  ℹ️  不再使用 iptables/nftables，所有 NAT 由 eBPF TC 处理"
+# NAT 配置：添加 iptables NAT 规则作为备用（TC NAT 有问题时使用）
+echo "🔧 NAT 配置: 添加 iptables NAT 规则作为备用"
+VPN_NETWORK="${VPN_NETWORK:-10.8.0.0/24}"
+VPN_EBPF_INTERFACE="${VPN_EBPF_INTERFACE:-eth0}"
+
+# 检查 iptables 是否可用
+if command -v iptables >/dev/null 2>&1; then
+    # 检查规则是否已存在（避免重复添加）
+    if ! iptables -t nat -C POSTROUTING -s "$VPN_NETWORK" -o "$VPN_EBPF_INTERFACE" -j MASQUERADE 2>/dev/null; then
+        echo "  ➕ 添加 iptables NAT 规则: -t nat -A POSTROUTING -s $VPN_NETWORK -o $VPN_EBPF_INTERFACE -j MASQUERADE"
+        if iptables -t nat -A POSTROUTING -s "$VPN_NETWORK" -o "$VPN_EBPF_INTERFACE" -j MASQUERADE; then
+            echo "  ✅ iptables NAT 规则添加成功"
+        else
+            echo "  ⚠️  警告: iptables NAT 规则添加失败（可能权限不足）"
+        fi
+    else
+        echo "  ℹ️  iptables NAT 规则已存在，跳过"
+    fi
+else
+    echo "  ⚠️  警告: iptables 命令不可用，跳过 NAT 规则配置"
+fi
+
+# eBPF TC NAT 配置（由程序代码自动配置）
+echo "  ℹ️  eBPF TC NAT 由程序自动配置（如果失败，将使用 iptables NAT）"
 
 # 显示配置信息
 echo "=========================================="

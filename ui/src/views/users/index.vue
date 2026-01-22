@@ -255,6 +255,12 @@
             <a-option value="full">全局模式</a-option>
           </a-select>
           <template #extra>
+            <div v-if="formData.tunnel_mode === 'full'" class="tunnel-mode-warning" style="margin-top: 8px;">
+              <a-alert type="warning" show-icon>
+                <template #icon><icon-exclamation-circle-fill /></template>
+                <div>全局模式需要策略中配置DNS服务器，请确保用户组关联的策略包含DNS配置</div>
+              </a-alert>
+            </div>
             <div class="tunnel-mode-help">
               <div class="mode-card mode-card-recommended">
                 <div class="mode-header">

@@ -481,11 +481,30 @@ func (h *Handler) Authenticate(c *gin.Context) {
 								}
 							}
 							if updated {
-								if err := database.DB.Save(&user).Error; err != nil {
-									log.Printf("OpenConnect: Failed to update LDAP user %s: %v", username, err)
-								} else {
-									log.Printf("OpenConnect: ✓ LDAP user synced: %s (email: %s, fullname: %s, admin: %v)",
-										username, ldapUser.Email, ldapUser.FullName, ldapUser.IsAdmin)
+								// 只更新 LDAP 同步的字段，避免覆盖其他字段（如 TunnelMode）
+								updateFields := []string{}
+								if ldapUser.Email != "" && user.Email != ldapUser.Email {
+									updateFields = append(updateFields, "email")
+								}
+								if user.FullName != ldapUser.FullName && ldapUser.FullName != "" {
+									updateFields = append(updateFields, "full_name")
+								}
+								if user.IsAdmin != ldapUser.IsAdmin {
+									updateFields = append(updateFields, "is_admin")
+								}
+								if user.LDAPDN != ldapUser.DN && ldapUser.DN != "" {
+									updateFields = append(updateFields, "ldap_dn")
+								}
+								if len(ldapUser.Attributes) > 0 {
+									updateFields = append(updateFields, "ldap_attributes")
+								}
+								if len(updateFields) > 0 {
+									if err := database.DB.Model(&user).Select(updateFields).Updates(user).Error; err != nil {
+										log.Printf("OpenConnect: Failed to update LDAP user %s: %v", username, err)
+									} else {
+										log.Printf("OpenConnect: ✓ LDAP user synced: %s (email: %s, fullname: %s, admin: %v)",
+											username, ldapUser.Email, ldapUser.FullName, ldapUser.IsAdmin)
+									}
 								}
 
 								database.DB.Preload("Groups").Preload("Groups.Policies").Preload("Groups.Policies.Routes").Preload("Groups.Policies.ExcludeRoutes").
@@ -721,7 +740,11 @@ func (h *Handler) Authenticate(c *gin.Context) {
 					}
 
 					user.OTPEnabled = true
-					if err := database.DB.Save(&user).Error; err != nil {
+					// 只更新 OTP 相关字段，避免覆盖其他字段（如 TunnelMode）
+					if err := database.DB.Model(&user).Select("otp_enabled", "otp_secret").Updates(map[string]interface{}{
+						"otp_enabled": true,
+						"otp_secret":  user.OTPSecret,
+					}).Error; err != nil {
 						log.Printf("OpenConnect: Failed to enable OTP for user %s: %v", username, err)
 						h.sendAuthError(c, "Failed to enable OTP")
 						return

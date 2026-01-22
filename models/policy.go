@@ -22,6 +22,8 @@ type Policy struct {
 
 	DNSServers string `gorm:"type:text" json:"dns_servers"` // JSON array of DNS server IPs, e.g. ["8.8.8.8","8.8.4.4"]
 
+	SplitDNS   string `gorm:"type:text" json:"split_dns"`   // JSON array of domains for split DNS, e.g. ["example.com","*.example.com"]
+
 	TimeRestrictions []TimeRestriction `gorm:"foreignKey:PolicyID" json:"time_restrictions"`
 
 	Groups []UserGroup `gorm:"many2many:user_group_policies;" json:"groups,omitempty"`

@@ -18,15 +18,16 @@ import (
 )
 
 type VPNServer struct {
-	config      *config.Config
-	routeMgr    *RouteManager
-	policyMgr   *policy.Manager
-	ebpfProgram *ebpf.XDPProgram // XDP program for ingress traffic (eth0) - policy checking only
-	tcProgram   interface{}      // *ebpf.TCProgram (avoid circular import) - TC egress program for NAT
-	forwarder   *PacketForwarder
-	ipPool      *IPPool
-	tunDevice   *TUNDevice // 共享的TUN设备实例
-	xdpSocket   *XDPSocket // AF_XDP socket for zero-copy (experimental)
+	config       *config.Config
+	routeMgr     *RouteManager
+	policyMgr    *policy.Manager
+	ebpfProgram  *ebpf.XDPProgram // XDP program for ingress traffic (eth0) - policy checking only
+	tcProgram    interface{}      // *ebpf.TCProgram (avoid circular import) - TC egress program for NAT on eth0
+	tcProgramTUN interface{}      // *ebpf.TCProgram (avoid circular import) - TC egress program for NAT on TUN device
+	forwarder    *PacketForwarder
+	ipPool       *IPPool
+	tunDevice    *TUNDevice // 共享的TUN设备实例
+	xdpSocket    *XDPSocket // AF_XDP socket for zero-copy (experimental)
 
 	// Lock optimization: use sharded maps if enabled, otherwise use regular maps with locks
 	useShardedLocks bool
@@ -189,7 +190,8 @@ func NewVPNServer(cfg *config.Config) (*VPNServer, error) {
 	}
 
 	var egressIPForServer net.IP
-	var tcProg interface{} // *ebpf.TCProgram
+	var tcProg interface{}    // *ebpf.TCProgram
+	var tcProgTUN interface{} // *ebpf.TCProgram for TUN device
 
 	// Always set up NAT, even if egress IP detection failed
 	// MASQUERADE will automatically use the interface IP
@@ -202,12 +204,33 @@ func NewVPNServer(cfg *config.Config) (*VPNServer, error) {
 		}
 
 		// NAT 策略: 使用 eBPF TC egress NAT
+		// 1. 在 eth0 上 attach TC NAT（主要接口）
 		log.Printf("配置 NAT: 使用 eBPF TC egress NAT (接口: %s, NAT IP: %s)", cfg.VPN.EBPFInterfaceName, publicIP.String())
 		tcProg, err = loadEBPFTCNAT(cfg.VPN.EBPFInterfaceName, publicIP, cfg.VPN.Network)
 		if err != nil {
 			log.Printf("接口: %s, eBPF TC NAT 加载失败: %v", cfg.VPN.EBPFInterfaceName, err)
 		} else {
 			log.Printf("eBPF TC NAT 加载成功, 接口: %s, NAT IP: %s, VPN 网络: %s", cfg.VPN.EBPFInterfaceName, publicIP.String(), cfg.VPN.Network)
+		}
+
+		// 2. 在 TUN 设备上也 attach TC NAT（zvpn0）
+		// 数据包从 TUN 设备写入后，内核路由时会经过 TUN 设备的 egress hook
+		// 注意：TUN 设备是三层设备，可能不支持 TC egress hook，但尝试加载
+		if tunDevice != nil {
+			tunDeviceName := tunDevice.Name()
+			log.Printf("配置 NAT: 尝试在 TUN 设备上使用 eBPF TC egress NAT (接口: %s, NAT IP: %s)", tunDeviceName, publicIP.String())
+			// Use the same loadEBPFTCNAT function, but on TUN device
+			// This will attempt to attach TC NAT to TUN device egress
+			var errTUN error
+			tcProgTUN, errTUN = loadEBPFTCNAT(tunDeviceName, publicIP, cfg.VPN.Network)
+			if errTUN != nil {
+				log.Printf("TUN 设备 %s, eBPF TC NAT 加载失败: %v (TUN设备可能不支持TC egress hook，继续使用 eth0 NAT)", tunDeviceName, errTUN)
+				tcProgTUN = nil // Ensure it's nil on error
+			} else {
+				log.Printf("✅ eBPF TC NAT 在 TUN 设备 %s 加载成功, NAT IP: %s, VPN 网络: %s", tunDeviceName, publicIP.String(), cfg.VPN.Network)
+			}
+		} else {
+			tcProgTUN = nil
 		}
 
 		egressIPForServer = publicIP
@@ -221,6 +244,7 @@ func NewVPNServer(cfg *config.Config) (*VPNServer, error) {
 		} else {
 			log.Printf("✅ eBPF TC NAT 加载成功: 使用 eBPF TC egress NAT")
 		}
+		tcProgTUN = nil // No TUN TC NAT if no public IP
 	}
 
 	// Distributed hook synchronization is managed via DB/system settings (SettingsHandler).
@@ -263,7 +287,8 @@ func NewVPNServer(cfg *config.Config) (*VPNServer, error) {
 		routeMgr:        routeMgr,
 		policyMgr:       policyMgr,
 		ebpfProgram:     ebpfProg,
-		tcProgram:       tcProg, // eBPF TC program for NAT
+		tcProgram:       tcProg,    // eBPF TC program for NAT on eth0
+		tcProgramTUN:    tcProgTUN, // eBPF TC program for NAT on TUN device
 		forwarder:       forwarder,
 		ipPool:          ipPool,
 		tunDevice:       tunDevice,
@@ -756,6 +781,7 @@ func (s *VPNServer) RegisterClient(userID uint, client *VPNClient) {
 	// Register in TC program (for egress NAT) if available
 	if err := s.tcProgramAddVPNClient(client.IP, clientRealIP); err != nil {
 		log.Printf("Warning: Failed to register VPN client in eBPF TC map: %v", err)
+		log.Printf("⚠️  TC NAT may not work for client %s - check eBPF TC map configuration", client.IP.String())
 	} else if s.tcProgram != nil {
 		log.Printf("✅ Registered VPN client in eBPF TC map: VPN IP=%s, Real IP=%s", client.IP.String(), clientRealIP.String())
 	}

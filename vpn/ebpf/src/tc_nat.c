@@ -194,6 +194,9 @@ static __always_inline int is_vpn_network(__u32 ip) {
 // - 连接跟踪：依赖内核 conntrack 处理反向流量（确保 /proc/sys/net/netfilter/nf_conntrack_max > 0）
 SEC("tc")
 int tc_nat_egress(struct __sk_buff *skb) {
+    // Get interface index to verify we're on the right interface
+    __u32 ifindex = skb->ifindex;
+    
     void *data = (void *)(long)skb->data;
     void *data_end = (void *)(long)skb->data_end;
     
@@ -245,6 +248,19 @@ int tc_nat_egress(struct __sk_buff *skb) {
     __u32 src_ip = ip->saddr;
     __u32 dst_ip = ip->daddr;
     
+    // Debug: Log first few packets with source IP (for debugging)
+    // Use bpf_printk to log directly from kernel
+    static __u32 packet_count = 0;
+    if (packet_count < 5) {
+        bpf_printk("TC NAT: Packet #%d: src_ip=0x%08X (%u.%u.%u.%u), dst_ip=0x%08X (%u.%u.%u.%u)",
+                   packet_count,
+                   src_ip,
+                   (src_ip >> 24) & 0xFF, (src_ip >> 16) & 0xFF, (src_ip >> 8) & 0xFF, src_ip & 0xFF,
+                   dst_ip,
+                   (dst_ip >> 24) & 0xFF, (dst_ip >> 16) & 0xFF, (dst_ip >> 8) & 0xFF, dst_ip & 0xFF);
+        packet_count++;
+    }
+    
     // Update statistics: packets processed
     __u32 stat_key = 4; // Total packets processed
     __u64 *stat_value = bpf_map_lookup_elem(&nat_stats, &stat_key);
@@ -252,7 +268,62 @@ int tc_nat_egress(struct __sk_buff *skb) {
         (*stat_value)++;
     }
     
-    if (!is_vpn_network(src_ip) || is_vpn_network(dst_ip)) {
+    // Check VPN network configuration first
+    __u32 vpn_check_key = 0;
+    __u32 *vpn_net = bpf_map_lookup_elem(&vpn_network_config, &vpn_check_key);
+    __u32 vpn_mask_key = 1;
+    __u32 *vpn_mask = bpf_map_lookup_elem(&vpn_network_config, &vpn_mask_key);
+    
+    // Debug: Check if VPN network is configured
+    if (!vpn_net || !vpn_mask) {
+        // VPN network not configured - update stat key 5 for debugging
+        stat_key = 5;
+        stat_value = bpf_map_lookup_elem(&nat_stats, &stat_key);
+        if (stat_value) {
+            (*stat_value)++;
+        }
+        return TC_ACT_OK; // VPN network not configured, pass
+    }
+    
+    // Debug: Store first few source IPs for debugging
+    // Use stat key 6 as counter, 7-11 to store IPs (we can store multiple IPs)
+    stat_key = 6;
+    stat_value = bpf_map_lookup_elem(&nat_stats, &stat_key);
+    if (stat_value && *stat_value < 5) {
+        // Store source IP (first 5 packets)
+        __u32 ip_key = 7 + (*stat_value); // Use keys 7-11
+        if (ip_key < 12) { // Make sure we don't overflow
+            __u64 ip_value = (__u64)src_ip;
+            bpf_map_update_elem(&nat_stats, &ip_key, &ip_value, BPF_ANY);
+            (*stat_value)++;
+        }
+    }
+    
+    // Check if source IP is in VPN network
+    // Note: src_ip and vpn_net are both in network byte order (big-endian)
+    // IP addresses in IP header are already in network byte order
+    // VPN network config stored in map is also in network byte order
+    __u32 src_network = src_ip & *vpn_mask;
+    __u32 dst_network = dst_ip & *vpn_mask;
+    int src_is_vpn = (src_network == *vpn_net);
+    int dst_is_vpn = (dst_network == *vpn_net);
+    
+    // Debug: Store VPN network check details for first packet
+    if (stat_key == 6 && stat_value && *stat_value == 1) {
+        // Store VPN network and mask for comparison (keys 12-13)
+        __u32 debug_key = 12;
+        __u64 debug_value = (__u64)(*vpn_net);
+        bpf_map_update_elem(&nat_stats, &debug_key, &debug_value, BPF_ANY);
+        debug_key = 13;
+        debug_value = (__u64)(*vpn_mask);
+        bpf_map_update_elem(&nat_stats, &debug_key, &debug_value, BPF_ANY);
+        // Store source network (src_ip & mask) for comparison (key 14)
+        debug_key = 14;
+        debug_value = (__u64)src_network;
+        bpf_map_update_elem(&nat_stats, &debug_key, &debug_value, BPF_ANY);
+    }
+    
+    if (!src_is_vpn || dst_is_vpn) {
         return TC_ACT_OK; // Not VPN client to external, pass
     }
     
@@ -317,4 +388,5 @@ int tc_nat_egress(struct __sk_buff *skb) {
 }
 
 char _license[] SEC("license") = "GPL";
+
 

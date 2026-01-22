@@ -3,6 +3,7 @@ package models
 import (
 	"encoding/json"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/fisker/zvpn/auth"
@@ -31,8 +32,8 @@ type User struct {
 	FullName       string `gorm:"size:255" json:"full_name"` // 全名/中文名 (displayName/cn)
 	LDAPAttributes string `gorm:"type:text" json:"-"`        // LDAP原始属性JSON（不返回给API，用于扩展）
 
-	VPNIP      string     `gorm:"size:50" json:"-"`              // Assigned VPN IP (不返回给前端API，在线用户接口单独返回)
-	ClientIP   string     `gorm:"size:50" json:"-"`              // Client's real IP (不返回给前端API)
+	VPNIP      string     `gorm:"size:50" json:"-"` // Assigned VPN IP (不返回给前端API，在线用户接口单独返回)
+	ClientIP   string     `gorm:"size:50" json:"-"` // Client's real IP (不返回给前端API)
 	Connected  bool       `gorm:"default:false" json:"connected"`
 	LastSeen   *time.Time `json:"last_seen"`
 	TunnelMode string     `gorm:"default:'split';size:20" json:"tunnel_mode"` // 隧道模式: split(分隧道) 或 full(全局)
@@ -62,7 +63,11 @@ func (u *User) GetPolicy() *Policy {
 
 	routeMap := make(map[string]bool)        // 用于去重路由
 	excludeRouteMap := make(map[string]bool) // 用于去重排除路由
+	dnsMap := make(map[string]bool)          // 用于去重 DNS 服务器
+	splitDNSMap := make(map[string]bool)     // 用于去重 Split-DNS 域名
 	var policyIDs []uint
+	var mergedDNSServers []string
+	var mergedSplitDNS []string
 
 	for groupIndex, group := range u.Groups {
 		log.Printf("User.GetPolicy: 处理组 %d (ID: %d)", groupIndex+1, group.ID)
@@ -73,7 +78,64 @@ func (u *User) GetPolicy() *Policy {
 			log.Printf("User.GetPolicy: 策略 %d 的路由数量: %d，排除路由数量: %d", policyIndex+1, len(policy.Routes), len(policy.ExcludeRoutes))
 
 			policyIDs = append(policyIDs, policy.ID)
-			
+
+			// 合并 DNS 服务器
+			if policy.DNSServers != "" {
+				var dnsServers []string
+				if err := json.Unmarshal([]byte(policy.DNSServers), &dnsServers); err == nil {
+					// JSON 格式解析成功
+					for _, dns := range dnsServers {
+						dns = strings.TrimSpace(dns)
+						if dns != "" && !dnsMap[dns] {
+							log.Printf("User.GetPolicy: 添加 DNS 服务器: %s", dns)
+							mergedDNSServers = append(mergedDNSServers, dns)
+							dnsMap[dns] = true
+						}
+					}
+				} else {
+					// 尝试逗号分隔格式
+					for _, dns := range strings.Split(policy.DNSServers, ",") {
+						dns = strings.TrimSpace(dns)
+						if dns != "" && !dnsMap[dns] {
+							log.Printf("User.GetPolicy: 添加 DNS 服务器: %s", dns)
+							mergedDNSServers = append(mergedDNSServers, dns)
+							dnsMap[dns] = true
+						}
+					}
+				}
+			}
+
+			// 合并 Split-DNS 域名
+			log.Printf("User.GetPolicy: 策略 %d 的 SplitDNS 字段值: '%s'", policyIndex+1, policy.SplitDNS)
+			if policy.SplitDNS != "" {
+				var splitDNSDomains []string
+				if err := json.Unmarshal([]byte(policy.SplitDNS), &splitDNSDomains); err == nil {
+					// JSON 格式解析成功
+					log.Printf("User.GetPolicy: 策略 %d 解析出 %d 个 Split-DNS 域名 (JSON格式)", policyIndex+1, len(splitDNSDomains))
+					for _, domain := range splitDNSDomains {
+						domain = strings.TrimSpace(domain)
+						if domain != "" && !splitDNSMap[domain] {
+							log.Printf("User.GetPolicy: 添加 Split-DNS 域名: %s", domain)
+							mergedSplitDNS = append(mergedSplitDNS, domain)
+							splitDNSMap[domain] = true
+						}
+					}
+				} else {
+					// 尝试逗号分隔格式
+					log.Printf("User.GetPolicy: 策略 %d SplitDNS JSON 解析失败，尝试逗号分隔格式: %v", policyIndex+1, err)
+					for _, domain := range strings.Split(policy.SplitDNS, ",") {
+						domain = strings.TrimSpace(domain)
+						if domain != "" && !splitDNSMap[domain] {
+							log.Printf("User.GetPolicy: 添加 Split-DNS 域名: %s", domain)
+							mergedSplitDNS = append(mergedSplitDNS, domain)
+							splitDNSMap[domain] = true
+						}
+					}
+				}
+			} else {
+				log.Printf("User.GetPolicy: 策略 %d 的 SplitDNS 字段为空", policyIndex+1)
+			}
+
 			for routeIndex, route := range policy.Routes {
 				log.Printf("User.GetPolicy: 策略 %d 的路由 %d: %s", policyIndex+1, routeIndex+1, route.Network)
 				if !routeMap[route.Network] {
@@ -84,7 +146,7 @@ func (u *User) GetPolicy() *Policy {
 					log.Printf("User.GetPolicy: 跳过重复路由: %s", route.Network)
 				}
 			}
-			
+
 			for excludeRouteIndex, excludeRoute := range policy.ExcludeRoutes {
 				log.Printf("User.GetPolicy: 策略 %d 的排除路由 %d: %s", policyIndex+1, excludeRouteIndex+1, excludeRoute.Network)
 				if !excludeRouteMap[excludeRoute.Network] {
@@ -95,6 +157,24 @@ func (u *User) GetPolicy() *Policy {
 					log.Printf("User.GetPolicy: 跳过重复排除路由: %s", excludeRoute.Network)
 				}
 			}
+		}
+	}
+
+	// 设置合并后的 DNS 服务器
+	if len(mergedDNSServers) > 0 {
+		dnsJSON, err := json.Marshal(mergedDNSServers)
+		if err == nil {
+			mergedPolicy.DNSServers = string(dnsJSON)
+			log.Printf("User.GetPolicy: 合并后 DNS 服务器数量: %d", len(mergedDNSServers))
+		}
+	}
+
+	// 设置合并后的 Split-DNS 域名
+	if len(mergedSplitDNS) > 0 {
+		splitDNSJSON, err := json.Marshal(mergedSplitDNS)
+		if err == nil {
+			mergedPolicy.SplitDNS = string(splitDNSJSON)
+			log.Printf("User.GetPolicy: 合并后 Split-DNS 域名数量: %d", len(mergedSplitDNS))
 		}
 	}
 
@@ -222,3 +302,4 @@ func (u *User) CheckOTPOnly(password string) bool {
 	otpAuth := auth.NewOTPAuthenticator("ZVPN")
 	return otpAuth.ValidateOTP(u.OTPSecret, otpCode)
 }
+

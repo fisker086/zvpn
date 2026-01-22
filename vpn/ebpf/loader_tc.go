@@ -241,8 +241,66 @@ func (t *TCProgram) GetNATStats() (map[uint32]uint64, error) {
 // LogNATStats logs the NAT statistics for debugging
 func (t *TCProgram) LogNATStats() {
 	if stats, err := t.GetNATStats(); err == nil {
-		log.Printf("TC NAT Stats: Total=%d, VPNNetworkCheck=%d, VPNClientFound=%d, EgressIPFound=%d, NATPerformed=%d",
-			stats[4], stats[1], stats[2], stats[3], stats[0])
+		log.Printf("TC NAT Stats: Total=%d, VPNNetworkCheck=%d, VPNClientFound=%d, EgressIPFound=%d, NATPerformed=%d, VPNNetworkNotConfigured=%d",
+			stats[4], stats[1], stats[2], stats[3], stats[0], stats[5])
+
+		// Also log VPN network configuration for debugging
+		if t.vpnNetworkConfig != nil {
+			var networkAddr uint32
+			var networkMask uint32
+			if err := t.vpnNetworkConfig.Lookup(uint32(0), &networkAddr); err == nil {
+				if err := t.vpnNetworkConfig.Lookup(uint32(1), &networkMask); err == nil {
+					networkIP := net.IP([]byte{
+						byte(networkAddr >> 24),
+						byte(networkAddr >> 16),
+						byte(networkAddr >> 8),
+						byte(networkAddr),
+					})
+					maskIP := net.IP([]byte{
+						byte(networkMask >> 24),
+						byte(networkMask >> 16),
+						byte(networkMask >> 8),
+						byte(networkMask),
+					})
+					log.Printf("TC NAT VPN Network Config: Network=%s, Mask=%s", networkIP.String(), maskIP.String())
+
+					// Log first few source IPs seen (for debugging)
+					if stats[6] > 0 {
+						log.Printf("TC NAT Debug: Saw %d packets, VPN network: %s (0x%08X), Mask: 0x%08X",
+							stats[6], networkIP.String(), networkAddr, networkMask)
+
+						// Log first few source IPs
+						for i := uint32(7); i < 12 && i-7 < uint32(stats[6]); i++ {
+							if stats[i] > 0 {
+								srcIPUint32 := uint32(stats[i])
+								srcIP := net.IP([]byte{
+									byte(srcIPUint32 >> 24),
+									byte(srcIPUint32 >> 16),
+									byte(srcIPUint32 >> 8),
+									byte(srcIPUint32),
+								})
+								srcNetwork := srcIPUint32 & networkMask
+								log.Printf("TC NAT Debug: Source IP #%d: %s (0x%08X), Network part: 0x%08X, Match: %v",
+									i-6, srcIP.String(), srcIPUint32, srcNetwork, srcNetwork == networkAddr)
+							}
+						}
+
+						// Log VPN network config from eBPF map (if available)
+						if stats[12] > 0 && stats[13] > 0 {
+							vpnNetFromMap := uint32(stats[12])
+							vpnMaskFromMap := uint32(stats[13])
+							log.Printf("TC NAT Debug: VPN config from map: Network=0x%08X, Mask=0x%08X",
+								vpnNetFromMap, vpnMaskFromMap)
+							if stats[14] > 0 {
+								srcNetworkFromMap := uint32(stats[14])
+								log.Printf("TC NAT Debug: Source network (src & mask): 0x%08X, Match: %v",
+									srcNetworkFromMap, srcNetworkFromMap == vpnNetFromMap)
+							}
+						}
+					}
+				}
+			}
+		}
 	}
 }
 

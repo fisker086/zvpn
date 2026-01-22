@@ -119,6 +119,7 @@ RUN dnf install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
         ca-certificates \
         libbpf \
         iproute kmod bash openssl nc wget \
+	iptables iptables-nft \
         tcpdump \
         iputils  \
         kernel-tools || true && \

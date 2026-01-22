@@ -418,8 +418,9 @@ func (h *Handler) handleConnect(c *gin.Context) {
 		}
 	}
 
+	tunnelMode := getUserTunnelMode(&user)
 	if len(dnsServers) == 0 {
-		dnsServers = append(dnsServers, "8.8.8.8")
+		log.Printf("OpenConnect: No DNS configured for user %s (tunnel mode: %s), DNS will use local/system default", user.Username, tunnelMode)
 	}
 
 	clientCipherSuite := getHeaderCaseInsensitive(c, "X-Dtls12-Ciphersuite", "X-DTLS12-CipherSuite", "X-Dtls-Ciphersuite", "X-DTLS-CipherSuite")
@@ -438,7 +439,12 @@ func (h *Handler) handleConnect(c *gin.Context) {
 	user.Connected = true
 	now := time.Now()
 	user.LastSeen = &now
-	database.DB.Save(&user)
+	if err := database.DB.Model(&user).Select("connected", "last_seen").Updates(map[string]interface{}{
+		"connected": user.Connected,
+		"last_seen": user.LastSeen,
+	}).Error; err != nil {
+		log.Printf("OpenConnect: Failed to update user connection status: %v", err)
+	}
 
 	auditLogger := policy.GetAuditLogger()
 	if auditLogger != nil {
@@ -469,7 +475,6 @@ func (h *Handler) handleConnect(c *gin.Context) {
 	clientOS, clientVer := parseClientInfo(userAgent)
 	tunnelClient := NewTunnelClient(&user, conn, vpnIP, h.vpnServer, tunDevice)
 
-	// 检测是否为移动端客户端（用于 DTLS 配置）
 	mobileLicense := getHeaderCaseInsensitive(c, "X-Cstp-License", "X-CSTP-License")
 	userAgentLower := strings.ToLower(userAgent)
 	isMobile := mobileLicense == "mobile" ||
@@ -547,14 +552,11 @@ func (h *Handler) handleConnect(c *gin.Context) {
 		}
 	}()
 
-	log.Printf("OpenConnect: About to start HandleTunnelData for user %s (VPN IP: %s)", user.Username, user.VPNIP)
 	if err := tunnelClient.HandleTunnelData(); err != nil {
-		log.Printf("OpenConnect: HandleTunnelData returned error for user %s: %v", user.Username, err)
-	} else {
-		log.Printf("OpenConnect: HandleTunnelData returned normally (no error) for user %s", user.Username)
+		log.Printf("OpenConnect: HandleTunnelData error for user %s: %v", user.Username, err)
 	}
 
-	tunnelMode := getUserTunnelMode(&user)
+	tunnelMode = getUserTunnelMode(&user)
 	log.Printf("OpenConnect: Tunnel closed for user %s (VPN IP: %s, Tunnel Mode: %s)",
 		user.Username, user.VPNIP, tunnelMode)
 
@@ -568,18 +570,9 @@ func (h *Handler) handleConnect(c *gin.Context) {
 		case client.WriteChan <- disconnectPacket:
 			disconnectSent = true
 			if tunnelMode == "full" {
-				log.Printf("OpenConnect: DISCONNECT packet queued for client %s (full tunnel mode), waiting for route cleanup", user.Username)
-
-				time.Sleep(200 * time.Millisecond)
-
-				time.Sleep(500 * time.Millisecond)
-
-				time.Sleep(2000 * time.Millisecond)
+				time.Sleep(2700 * time.Millisecond)
 			} else {
-
-				time.Sleep(100 * time.Millisecond)
-
-				time.Sleep(200 * time.Millisecond)
+				time.Sleep(300 * time.Millisecond)
 			}
 		default:
 
@@ -618,26 +611,11 @@ func (h *Handler) handleConnect(c *gin.Context) {
 	}
 
 	if disconnectSent && tunnelMode == "full" {
-		log.Printf("OpenConnect: Additional wait for full tunnel mode client %s to complete route cleanup", user.Username)
-		log.Printf("OpenConnect: Note: Local network routes were already excluded via split-exclude (private IP ranges), so local access should not be affected")
-
 		time.Sleep(1000 * time.Millisecond)
 	}
 
-	if tunnelMode == "full" {
-		if disconnectSent {
-			log.Printf("OpenConnect: DISCONNECT packet sent to client %s (full tunnel mode), waited ~3.7s for route cleanup", user.Username)
-			log.Printf("OpenConnect: Local network routes were excluded via split-exclude, so local and public internet access should not be affected")
-			log.Printf("OpenConnect: Client should have cleaned up default route and restored network access")
-		} else {
-			log.Printf("OpenConnect: WARNING - Failed to send DISCONNECT packet to client %s (full tunnel mode)", user.Username)
-			log.Printf("OpenConnect: Client may not clean up default route automatically")
-			log.Printf("OpenConnect: However, local network routes were excluded via split-exclude, so local access should still work")
-			log.Printf("OpenConnect: If client cannot access public internet after disconnect, check route table and remove VPN routes manually if needed")
-			log.Printf("OpenConnect: Linux: 'ip route del default via <VPN网关IP>' or 'route del default gw <VPN网关IP>'")
-			log.Printf("OpenConnect: macOS: 'route delete default <VPN网关IP>'")
-			log.Printf("OpenConnect: Windows: 'route delete 0.0.0.0 mask 0.0.0.0 <VPN网关IP>'")
-		}
+	if tunnelMode == "full" && !disconnectSent {
+		log.Printf("OpenConnect: WARNING - Failed to send DISCONNECT packet to client %s (full tunnel mode)", user.Username)
 	}
 
 	if exists && client != nil {
@@ -649,11 +627,8 @@ func (h *Handler) handleConnect(c *gin.Context) {
 
 			if disconnectSent {
 				if tunnelMode == "full" {
-
-					log.Printf("OpenConnect: Final wait before closing WriteLoop for full tunnel mode client %s", user.Username)
 					time.Sleep(500 * time.Millisecond)
 				} else {
-
 					time.Sleep(100 * time.Millisecond)
 				}
 			}
@@ -713,7 +688,10 @@ func (h *Handler) handleConnect(c *gin.Context) {
 	}
 	user.Connected = false
 	user.VPNIP = ""
-	if err := database.DB.Save(&user).Error; err != nil {
+	if err := database.DB.Model(&user).Select("connected", "vpn_ip").Updates(map[string]interface{}{
+		"connected": false,
+		"vpn_ip":    "",
+	}).Error; err != nil {
 		log.Printf("OpenConnect: Failed to update user status on disconnect: %v", err)
 	}
 
@@ -723,8 +701,6 @@ func (h *Handler) handleConnect(c *gin.Context) {
 			fmt.Sprintf("VPN connection closed. VPN IP: %s", user.VPNIP), user.VPNIP, 0)
 	}
 
-	user.Connected = false
-	database.DB.Save(&user)
 }
 
 func (h *Handler) sendCSTPConfig(conn net.Conn, user *models.User, dnsServers []string, clientCipherSuite string, clientMasterSecret string, clientType ClientType, c *gin.Context) error {
@@ -738,7 +714,6 @@ func (h *Handler) sendCSTPConfig(conn net.Conn, user *models.User, dnsServers []
 
 	tunnelMode := getUserTunnelMode(user)
 
-	tunnelAllDNS := shouldTunnelAllDNS(tunnelMode)
 
 	response := "HTTP/1.1 200 OK\r\n"
 	response += "Content-Type: application/octet-stream\r\n"
@@ -753,6 +728,7 @@ func (h *Handler) sendCSTPConfig(conn net.Conn, user *models.User, dnsServers []
 	cstpAcceptEncoding := getHeaderCaseInsensitive(c, "X-Cstp-Accept-Encoding", "X-CSTP-Accept-Encoding")
 	dtlsAcceptEncoding := getHeaderCaseInsensitive(c, "X-Dtls-Accept-Encoding", "X-DTLS-Accept-Encoding")
 
+	response += "Server: ZVPN 1.0\r\n"
 	response += "X-CSTP-Version: 1\r\n"
 	response += "X-CSTP-Server-Name: ZVPN 1.0\r\n"
 	response += "X-CSTP-Protocol: Copyright (c) 2004 Cisco Systems, Inc.\r\n"
@@ -762,182 +738,32 @@ func (h *Handler) sendCSTPConfig(conn net.Conn, user *models.User, dnsServers []
 
 	response += "X-CSTP-Base-MTU: " + strconv.Itoa(h.config.VPN.MTU) + "\r\n"
 
+
 	if h.config.VPN.EnableCompression && cstpAcceptEncoding != "" {
 		compressionType := getCompressionType(h.config)
 		if compressionType != "none" {
-
 			if strings.Contains(strings.ToLower(cstpAcceptEncoding), strings.ToLower(compressionType)) {
 				response += "X-CSTP-Content-Encoding: " + compressionType + "\r\n"
+			}
+		}
+	}
+	if h.config.VPN.EnableCompression && dtlsAcceptEncoding != "" {
+		compressionType := getCompressionType(h.config)
+		if compressionType != "none" {
+			if strings.Contains(strings.ToLower(dtlsAcceptEncoding), strings.ToLower(compressionType)) {
+				response += "X-DTLS-Content-Encoding: " + compressionType + "\r\n"
 			}
 		}
 	}
 
 	mobileLicense := getHeaderCaseInsensitive(c, "X-Cstp-License", "X-CSTP-License")
 	userAgent := strings.ToLower(c.GetHeader("User-Agent"))
-	// 检测移动端客户端：通过 X-Cstp-License 头部或 User-Agent
 	isMobile := mobileLicense == "mobile" ||
 		strings.Contains(userAgent, "android") ||
 		strings.Contains(userAgent, "iphone") ||
 		strings.Contains(userAgent, "ipad") ||
 		strings.Contains(userAgent, "ios")
 
-	if h.config.VPN.EnableDTLS {
-
-		sessionIDBytes := make([]byte, 32)
-		if _, err := rand.Read(sessionIDBytes); err != nil {
-			log.Printf("OpenConnect: Warning - Failed to generate DTLS session ID: %v", err)
-
-			sessionIDBytes = make([]byte, 32)
-		}
-		dtlsSessionID := hex.EncodeToString(sessionIDBytes)
-
-		dtlsPort := h.config.VPN.OpenConnectPort
-		if h.config.VPN.DTLSPort != "" && h.config.VPN.DTLSPort != h.config.VPN.OpenConnectPort {
-
-			dtlsPort = h.config.VPN.DTLSPort
-		}
-
-		// DTLS 也使用移动端配置（如果检测到移动端）
-		var dtlsDPD, dtlsKeepalive int
-		if isMobile {
-			dtlsDPD = h.config.VPN.MobileDPD
-			dtlsKeepalive = h.config.VPN.MobileKeepalive
-			if dtlsDPD == 0 {
-				dtlsDPD = 60
-			}
-			if dtlsKeepalive == 0 {
-				dtlsKeepalive = 4
-			}
-		} else {
-			dtlsDPD = h.config.VPN.CSTPDPD
-			dtlsKeepalive = h.config.VPN.CSTPKeepalive
-			if dtlsDPD == 0 {
-				dtlsDPD = 30
-			}
-			if dtlsKeepalive == 0 {
-				dtlsKeepalive = 20
-			}
-		}
-		dtlsDPDStr := strconv.Itoa(dtlsDPD)
-		dtlsKeepaliveStr := strconv.Itoa(dtlsKeepalive)
-
-		cipherSuiteHeader := checkDtls12Ciphersuite(clientCipherSuite)
-
-		response += "X-DTLS-Session-ID: " + dtlsSessionID + "\r\n"
-		response += "X-DTLS-Port: " + dtlsPort + "\r\n"
-		response += "X-DTLS-MTU: " + strconv.Itoa(h.config.VPN.MTU) + "\r\n"
-		response += "X-DTLS-DPD: " + dtlsDPDStr + "\r\n"
-		response += "X-DTLS-Keepalive: " + dtlsKeepaliveStr + "\r\n"
-
-		response += "X-DTLS-Rekey-Time: 86400\r\n"
-		response += "X-DTLS-Rekey-Method: new-tunnel\r\n"
-		response += "X-DTLS-CipherSuite: " + cipherSuiteHeader + "\r\n"
-		response += "X-DTLS12-CipherSuite: " + cipherSuiteHeader + "\r\n"
-
-		if h.config.VPN.EnableCompression && dtlsAcceptEncoding != "" {
-			compressionType := getCompressionType(h.config)
-			if compressionType != "none" {
-
-				if strings.Contains(strings.ToLower(dtlsAcceptEncoding), strings.ToLower(compressionType)) {
-					response += "X-DTLS-Content-Encoding: " + compressionType + "\r\n"
-				}
-			}
-		}
-
-		if clientMasterSecret != "" && h.dtlsSessionStore != nil {
-			if err := h.dtlsSessionStore.StoreMasterSecret(dtlsSessionID, clientMasterSecret); err != nil {
-				log.Printf("OpenConnect: Failed to store master secret: %v", err)
-			}
-		}
-
-	}
-
-	var splitIncludeRoutes []string
-	if user.PolicyID != 0 && len(user.Policy.Routes) > 0 {
-		for _, route := range user.Policy.Routes {
-
-			if route.Network != "" && route.Network != h.config.VPN.Network {
-
-				if _, _, err := net.ParseCIDR(route.Network); err != nil {
-					log.Printf("OpenConnect: WARNING - Invalid route format '%s' for user %s: %v (skipping)", route.Network, user.Username, err)
-					continue
-				}
-				splitIncludeRoutes = append(splitIncludeRoutes, route.Network)
-			}
-		}
-	}
-
-	if tunnelMode == "full" {
-
-		userPolicy := user.GetPolicy()
-		if userPolicy != nil && len(userPolicy.ExcludeRoutes) > 0 {
-			excludeRouteCount := 0
-			for _, excludeRoute := range userPolicy.ExcludeRoutes {
-
-				if excludeRoute.Network == "0.0.0.0/255.255.255.255" || excludeRoute.Network == "0.0.0.0/32" {
-					continue
-				}
-
-				if _, _, err := net.ParseCIDR(excludeRoute.Network); err != nil {
-					log.Printf("OpenConnect: Invalid exclude route '%s' for user %s: %v", excludeRoute.Network, user.Username, err)
-					continue
-				}
-				response += "X-CSTP-Split-Exclude: " + excludeRoute.Network + "\r\n"
-				excludeRouteCount++
-			}
-		}
-	} else {
-
-		if len(splitIncludeRoutes) > 0 {
-
-			for _, route := range splitIncludeRoutes {
-				response += "X-CSTP-Split-Include: " + route + "\r\n"
-			}
-		}
-	}
-
-	hasDNS := false
-	validDNSCount := 0
-	for _, dns := range dnsServers {
-		if dns != "" {
-			dns = strings.TrimSpace(dns)
-
-			if ip := net.ParseIP(dns); ip != nil {
-				response += "X-CSTP-DNS: " + dns + "\r\n"
-				hasDNS = true
-				validDNSCount++
-			} else {
-				log.Printf("OpenConnect: WARNING - Invalid DNS format '%s', skipping", dns)
-			}
-		}
-	}
-
-	if !hasDNS {
-		log.Printf("OpenConnect: WARNING - No valid DNS servers after validation for user %s", user.Username)
-	}
-
-	response += "X-CSTP-Lease-Duration: 1209600\r\n"
-	response += "X-CSTP-Session-Timeout: none\r\n"
-	response += "X-CSTP-Session-Timeout-Alert-Interval: 60\r\n"
-	response += "X-CSTP-Session-Timeout-Remaining: none\r\n"
-	response += "X-CSTP-Idle-Timeout: 18000\r\n"
-	response += "X-CSTP-Disconnected-Timeout: 18000\r\n"
-	response += "X-CSTP-Keep: true\r\n"
-
-	if tunnelAllDNS {
-		response += "X-CSTP-Tunnel-All-DNS: true\r\n"
-	} else {
-
-		response += "X-CSTP-Tunnel-All-DNS: false\r\n"
-		if !hasDNS {
-			log.Printf("OpenConnect: WARNING - No DNS configured and Tunnel-All-DNS=false for user %s", user.Username)
-		}
-	}
-
-	response += "X-CSTP-Rekey-Time: 86400\r\n"
-	response += "X-CSTP-Rekey-Method: new-tunnel\r\n"
-
-	// CSTP 使用移动端配置（如果检测到移动端）
 	var cstpDPD, cstpKeepalive int
 	if isMobile {
 		cstpDPD = h.config.VPN.MobileDPD
@@ -948,8 +774,6 @@ func (h *Handler) sendCSTPConfig(conn net.Conn, user *models.User, dnsServers []
 		if cstpKeepalive == 0 {
 			cstpKeepalive = 4
 		}
-		log.Printf("OpenConnect: Using mobile client configuration (DPD: %d, Keepalive: %d) for user %s",
-			cstpDPD, cstpKeepalive, user.Username)
 	} else {
 		cstpDPD = h.config.VPN.CSTPDPD
 		cstpKeepalive = h.config.VPN.CSTPKeepalive
@@ -960,30 +784,276 @@ func (h *Handler) sendCSTPConfig(conn net.Conn, user *models.User, dnsServers []
 			cstpKeepalive = 20
 		}
 	}
+
+	var dtlsSessionID string
+	var dtlsPort string
+	var dtlsDPDStr, dtlsKeepaliveStr string
+	var cipherSuiteHeader string
+	if h.config.VPN.EnableDTLS {
+		sessionIDBytes := make([]byte, 32)
+		if _, err := rand.Read(sessionIDBytes); err != nil {
+			log.Printf("OpenConnect: Warning - Failed to generate DTLS session ID: %v", err)
+			sessionIDBytes = make([]byte, 32)
+		}
+		dtlsSessionID = hex.EncodeToString(sessionIDBytes)
+
+		dtlsPort = h.config.VPN.OpenConnectPort
+		if h.config.VPN.DTLSPort != "" && h.config.VPN.DTLSPort != h.config.VPN.OpenConnectPort {
+			dtlsPort = h.config.VPN.DTLSPort
+		}
+
+		dtlsDPDStr = strconv.Itoa(cstpDPD)
+		dtlsKeepaliveStr = strconv.Itoa(cstpKeepalive)
+
+		cipherSuiteHeader = checkDtls12Ciphersuite(clientCipherSuite)
+
+		if clientMasterSecret != "" && h.dtlsSessionStore != nil {
+			if err := h.dtlsSessionStore.StoreMasterSecret(dtlsSessionID, clientMasterSecret); err != nil {
+				log.Printf("OpenConnect: Failed to store master secret: %v", err)
+			}
+		}
+	}
+
+	var splitIncludeRoutes []string
+	var splitExcludeRoutes []string
+	routeMap := make(map[string]bool)        // 用于去重 split-include 路由
+	excludeRouteMap := make(map[string]bool) // 用于去重 split-exclude 路由
+
+	if tunnelMode != "full" && len(dnsServers) > 0 {
+		for _, dns := range dnsServers {
+			if dns == "" {
+				continue
+			}
+			dns = strings.TrimSpace(dns)
+			dnsIP := net.ParseIP(dns)
+			if dnsIP == nil {
+				continue
+			}
+
+			if isPrivateIP(dnsIP) {
+				dnsNetwork := getDNSServerNetwork(dnsIP)
+				if dnsNetwork != "" {
+					if dnsNetwork == h.config.VPN.Network {
+						continue
+					}
+					if !routeMap[dnsNetwork] {
+						routeMap[dnsNetwork] = true
+						splitIncludeRoutes = append(splitIncludeRoutes, dnsNetwork)
+					}
+				}
+			}
+		}
+	}
+
+	if user.PolicyID != 0 && len(user.Policy.Routes) > 0 {
+		for _, route := range user.Policy.Routes {
+			if route.Network == "" {
+				continue
+			}
+
+			normalizedRoute, _, err := parseRouteNetwork(route.Network)
+			if err != nil {
+				log.Printf("OpenConnect: WARNING - Invalid route format '%s' for user %s: %v (skipping)", route.Network, user.Username, err)
+				continue
+			}
+
+			if normalizedRoute == h.config.VPN.Network {
+				continue
+			}
+
+			if normalizedRoute == "0.0.0.0/0" {
+				log.Printf("OpenConnect: WARNING - Default route (0.0.0.0/0) is not allowed in split mode for user %s (skipping)", user.Username)
+				continue
+			}
+
+			if !routeMap[normalizedRoute] {
+				routeMap[normalizedRoute] = true
+				splitIncludeRoutes = append(splitIncludeRoutes, normalizedRoute)
+			}
+		}
+	}
+
+	if tunnelMode == "full" {
+		userPolicy := user.GetPolicy()
+		if userPolicy != nil && len(userPolicy.ExcludeRoutes) > 0 {
+			for _, excludeRoute := range userPolicy.ExcludeRoutes {
+				if excludeRoute.Network == "" {
+					continue
+				}
+
+				normalizedRoute, _, err := parseRouteNetwork(excludeRoute.Network)
+				if err != nil {
+					log.Printf("OpenConnect: Invalid exclude route '%s' for user %s: %v (skipping)", excludeRoute.Network, user.Username, err)
+					continue
+				}
+
+				if excludeRoute.Network == "0.0.0.0/255.255.255.255" {
+					if !excludeRouteMap[excludeRoute.Network] {
+						excludeRouteMap[excludeRoute.Network] = true
+						splitExcludeRoutes = append(splitExcludeRoutes, excludeRoute.Network)
+						log.Printf("OpenConnect: Added exclude route '%s' (allow_lan format) for user %s in full tunnel mode", excludeRoute.Network, user.Username)
+					}
+				} else {
+					if !excludeRouteMap[normalizedRoute] {
+						excludeRouteMap[normalizedRoute] = true
+						splitExcludeRoutes = append(splitExcludeRoutes, normalizedRoute)
+						log.Printf("OpenConnect: Added exclude route '%s' (normalized from '%s') for user %s in full tunnel mode", normalizedRoute, excludeRoute.Network, user.Username)
+					}
+				}
+			}
+		}
+	}
+
+	allowLan := false
+	for _, group := range user.Groups {
+		if group.AllowLan {
+			allowLan = true
+			break
+		}
+	}
+
+	if allowLan {
+		allowLanRoute := "0.0.0.0/255.255.255.255"
+		if !excludeRouteMap[allowLanRoute] {
+			excludeRouteMap[allowLanRoute] = true
+			splitExcludeRoutes = append([]string{allowLanRoute}, splitExcludeRoutes...)
+			log.Printf("OpenConnect: Auto-added allow_lan route (0.0.0.0/255.255.255.255) for user %s (group allow_lan enabled)", user.Username)
+		} else {
+			log.Printf("OpenConnect: allow_lan route (0.0.0.0/255.255.255.255) already configured in policy for user %s", user.Username)
+			var filteredRoutes []string
+			for _, route := range splitExcludeRoutes {
+				if route != allowLanRoute {
+					filteredRoutes = append(filteredRoutes, route)
+				}
+			}
+			splitExcludeRoutes = append([]string{allowLanRoute}, filteredRoutes...)
+		}
+	}
+
+	hasDNS := false
+	for _, dns := range dnsServers {
+		if dns != "" {
+			dns = strings.TrimSpace(dns)
+
+			if ip := net.ParseIP(dns); ip != nil {
+				response += "X-CSTP-DNS: " + dns + "\r\n"
+				hasDNS = true
+			} else {
+				log.Printf("OpenConnect: WARNING - Invalid DNS format '%s', skipping", dns)
+			}
+		}
+	}
+
+	if !hasDNS {
+		defaultDNS := "114.114.114.114"
+		response += "X-CSTP-DNS: " + defaultDNS + "\r\n"
+		log.Printf("OpenConnect: Added default DNS (%s) for user %s in %s tunnel mode (no DNS configured)", defaultDNS, user.Username, tunnelMode)
+		hasDNS = true
+	}
+
+	defaultSplitDNS := "ZVPN.local"
+	splitDNSDomains := []string{}
+
+	userPolicy := user.GetPolicy()
+	if userPolicy != nil {
+		log.Printf("OpenConnect: Checking Split-DNS for user %s, policy SplitDNS field: '%s'", user.Username, userPolicy.SplitDNS)
+		splitDNSDomains = getSplitDNSDomains(userPolicy)
+		log.Printf("OpenConnect: Parsed %d Split-DNS domains for user %s: %v", len(splitDNSDomains), user.Username, splitDNSDomains)
+	} else {
+		log.Printf("OpenConnect: No policy found for user %s, will use default Split-DNS", user.Username)
+	}
+
+	if len(splitDNSDomains) == 0 {
+		splitDNSDomains = []string{defaultSplitDNS}
+		log.Printf("OpenConnect: Using default Split-DNS domain '%s' for user %s", defaultSplitDNS, user.Username)
+	}
+
+	for _, domain := range splitDNSDomains {
+		domain = strings.TrimSpace(domain)
+		if domain != "" {
+			response += "X-CSTP-Split-DNS: " + domain + "\r\n"
+			log.Printf("OpenConnect: Added Split-DNS domain '%s' for user %s", domain, user.Username)
+		}
+	}
+	log.Printf("OpenConnect: Added %d Split-DNS domains for user %s", len(splitDNSDomains), user.Username)
+
+	if tunnelMode != "full" {
+		if len(splitIncludeRoutes) > 0 {
+			optimizedRoutes := optimizeRoutes(splitIncludeRoutes)
+			for _, route := range optimizedRoutes {
+				routeFormatted := convertCIDRToSubnetMask(route)
+				response += "X-CSTP-Split-Include: " + routeFormatted + "\r\n"
+			}
+		}
+
+		if !allowLan && len(splitExcludeRoutes) > 0 {
+			log.Printf("OpenConnect: WARNING - ExcludeRoutes found in split tunnel mode for user %s, ignoring (split-include and split-exclude cannot be sent together for mobile clients)", user.Username)
+		}
+	}
+
+	if tunnelMode == "full" {
+		if len(splitExcludeRoutes) > 0 {
+			optimizedExcludeRoutes := optimizeRoutes(splitExcludeRoutes)
+			for _, route := range optimizedExcludeRoutes {
+				routeFormatted := convertCIDRToSubnetMask(route)
+				response += "X-CSTP-Split-Exclude: " + routeFormatted + "\r\n"
+			}
+		}
+		if len(splitIncludeRoutes) > 0 {
+			log.Printf("OpenConnect: WARNING - Routes found in full tunnel mode for user %s, ignoring (split-include and split-exclude cannot be sent together)", user.Username)
+		}
+	}
+
+	response += "X-CSTP-Lease-Duration: 1209600\r\n"
+	response += "X-CSTP-Session-Timeout: none\r\n"
+	response += "X-CSTP-Session-Timeout-Alert-Interval: 60\r\n"
+	response += "X-CSTP-Session-Timeout-Remaining: none\r\n"
+	response += "X-CSTP-Idle-Timeout: 18000\r\n"
+	response += "X-CSTP-Disconnected-Timeout: 18000\r\n"
+	response += "X-CSTP-Keep: true\r\n"
+
+	response += "X-CSTP-Tunnel-All-DNS: false\r\n"
+
+	response += "X-CSTP-Rekey-Time: 86400\r\n"
+	response += "X-CSTP-Rekey-Method: new-tunnel\r\n"
+	if h.config.VPN.EnableDTLS {
+		response += "X-DTLS-Rekey-Time: 86400\r\n"
+		response += "X-DTLS-Rekey-Method: new-tunnel\r\n"
+	}
+
 	response += fmt.Sprintf("X-CSTP-DPD: %d\r\n", cstpDPD)
 	response += fmt.Sprintf("X-CSTP-Keepalive: %d\r\n", cstpKeepalive)
-
-	// 添加移动端许可证响应头
-	if isMobile {
-		response += "X-CSTP-License: accept\r\n"
-	}
 
 	response += "X-CSTP-MSIE-Proxy-Lockdown: true\r\n"
 	response += "X-CSTP-Smartcard-Removal-Disconnect: true\r\n"
 
 	response += "X-CSTP-MTU: " + strconv.Itoa(h.config.VPN.MTU) + "\r\n"
+	if h.config.VPN.EnableDTLS {
+		response += "X-DTLS-MTU: " + strconv.Itoa(h.config.VPN.MTU) + "\r\n"
+	}
+
+	if h.config.VPN.EnableDTLS {
+		response += "X-DTLS-Session-ID: " + dtlsSessionID + "\r\n"
+		response += "X-DTLS-Port: " + dtlsPort + "\r\n"
+		response += "X-DTLS-DPD: " + dtlsDPDStr + "\r\n"
+		response += "X-DTLS-Keepalive: " + dtlsKeepaliveStr + "\r\n"
+		response += "X-DTLS12-CipherSuite: " + cipherSuiteHeader + "\r\n"
+	}
+
+	response += "X-CSTP-License: accept\r\n"
+
+	response += "X-CSTP-Routing-Filtering-Ignore: false\r\n"
+	response += "X-CSTP-Quarantine: false\r\n"
+	response += "X-CSTP-Disable-Always-On-VPN: false\r\n"
+	response += "X-CSTP-Client-Bypass-Protocol: true\r\n"
+	response += "X-CSTP-TCP-Keepalive: false\r\n"
+
 	response += "X-Cisco-Client-Compat: 1\r\n"
 	response += "\r\n"
 
-	log.Printf("OpenConnect: Sending CSTP config for user %s (IP: %s)", user.Username, user.VPNIP)
-
-	lines := strings.Split(response, "\r\n")
-	var cstpHeaders []string
-	for _, line := range lines {
-		if strings.HasPrefix(line, "X-CSTP-") || strings.HasPrefix(line, "X-DTLS-") || strings.HasPrefix(line, "X-Cisco-") {
-			cstpHeaders = append(cstpHeaders, line)
-		}
-	}
+	log.Printf("OpenConnect: ========== CSTP Config XML for user %s (VPN IP: %s) ==========", user.Username, user.VPNIP)
+	log.Printf("OpenConnect: %s", response)
+	log.Printf("OpenConnect: ========== End of CSTP Config XML ==========")
 
 	if _, err = conn.Write([]byte(response)); err != nil {
 		log.Printf("OpenConnect: ERROR - Failed to write CSTP config to connection: %v", err)
@@ -1266,3 +1336,4 @@ func closeConnectionGracefully(conn net.Conn) {
 		}
 	}
 }
+

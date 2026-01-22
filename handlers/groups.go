@@ -21,13 +21,13 @@ func NewGroupHandler(cfg *config.Config) *GroupHandler {
 type CreateGroupRequest struct {
 	Name        string `json:"name" binding:"required"`
 	Description string `json:"description"`
-	AllowLan    *bool  `json:"allow_lan"` // 允许本地网络访问（类似 anylink 的 allow_lan 配置）
+	AllowLan    *bool  `json:"allow_lan"` // 允许本地网络访问（类似  的 allow_lan 配置）
 }
 
 type UpdateGroupRequest struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
-	AllowLan    *bool  `json:"allow_lan"` // 允许本地网络访问（类似 anylink 的 allow_lan 配置）
+	AllowLan    *bool  `json:"allow_lan"` // 允许本地网络访问（类似  的 allow_lan 配置）
 }
 
 type AssignUsersRequest struct {

@@ -26,23 +26,25 @@ type CreatePolicyRequest struct {
 	Description  string   `json:"description"`
 	Routes       []string `json:"routes"` // CIDR format
 	MaxBandwidth int64    `json:"max_bandwidth"`
-	DNSServers   []string `json:"dns_servers"` // DNS server IPs
+	DNSServers   []string `json:"dns_servers"`                  // DNS server IPs
+	SplitDNS     []string `json:"split_dns"`                    // Split-DNS domains, e.g. ["example.com", "*.example.com"]
 	GroupIDs     []uint   `json:"group_ids" binding:"required"` // 必须绑定至少一个用户组
 }
 
 type PolicyResponse struct {
-	ID             uint                      `json:"id"`
-	CreatedAt      time.Time                 `json:"created_at"`
-	UpdatedAt      time.Time                 `json:"updated_at"`
-	Name           string                    `json:"name"`
-	Description    string                    `json:"description"`
-	Routes         []models.Route            `json:"routes"`
-	ExcludeRoutes  []models.ExcludeRoute     `json:"exclude_routes"`
-	AllowedNetworks []models.AllowedNetwork  `json:"allowed_networks"`
-	MaxBandwidth   int64                     `json:"max_bandwidth"`
-	DNSServers     []string                  `json:"dns_servers"`
+	ID               uint                     `json:"id"`
+	CreatedAt        time.Time                `json:"created_at"`
+	UpdatedAt        time.Time                `json:"updated_at"`
+	Name             string                   `json:"name"`
+	Description      string                   `json:"description"`
+	Routes           []models.Route           `json:"routes"`
+	ExcludeRoutes    []models.ExcludeRoute    `json:"exclude_routes"`
+	AllowedNetworks  []models.AllowedNetwork  `json:"allowed_networks"`
+	MaxBandwidth     int64                    `json:"max_bandwidth"`
+	DNSServers       []string                 `json:"dns_servers"`
+	SplitDNS         []string                 `json:"split_dns"` // Split-DNS domains
 	TimeRestrictions []models.TimeRestriction `json:"time_restrictions"`
-	Groups         []models.UserGroup        `json:"groups,omitempty"`
+	Groups           []models.UserGroup       `json:"groups,omitempty"`
 }
 
 func convertPolicyToResponse(policy models.Policy) PolicyResponse {
@@ -52,20 +54,28 @@ func convertPolicyToResponse(policy models.Policy) PolicyResponse {
 			dnsServers = []string{}
 		}
 	}
-	
+
+	var splitDNS []string
+	if policy.SplitDNS != "" {
+		if err := json.Unmarshal([]byte(policy.SplitDNS), &splitDNS); err != nil {
+			splitDNS = []string{}
+		}
+	}
+
 	return PolicyResponse{
-		ID:              policy.ID,
-		CreatedAt:       policy.CreatedAt,
-		UpdatedAt:       policy.UpdatedAt,
-		Name:            policy.Name,
-		Description:     policy.Description,
-		Routes:          policy.Routes,
-		ExcludeRoutes:   policy.ExcludeRoutes,
-		AllowedNetworks: policy.AllowedNetworks,
-		MaxBandwidth:    policy.MaxBandwidth,
-		DNSServers:      dnsServers,
+		ID:               policy.ID,
+		CreatedAt:        policy.CreatedAt,
+		UpdatedAt:        policy.UpdatedAt,
+		Name:             policy.Name,
+		Description:      policy.Description,
+		Routes:           policy.Routes,
+		ExcludeRoutes:    policy.ExcludeRoutes,
+		AllowedNetworks:  policy.AllowedNetworks,
+		MaxBandwidth:     policy.MaxBandwidth,
+		DNSServers:       dnsServers,
+		SplitDNS:         splitDNS,
 		TimeRestrictions: policy.TimeRestrictions,
-		Groups:          policy.Groups,
+		Groups:           policy.Groups,
 	}
 }
 
@@ -123,9 +133,20 @@ func (h *PolicyHandler) CreatePolicy(c *gin.Context) {
 		dnsServersJSON = string(dnsBytes)
 	}
 
+	var splitDNSJSON string
+	if len(req.SplitDNS) > 0 {
+		splitDNSBytes, err := json.Marshal(req.SplitDNS)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "Split-DNS域名格式错误"})
+			return
+		}
+		splitDNSJSON = string(splitDNSBytes)
+	}
+
 	policy := &models.Policy{
 		Name:         req.Name,
 		Description:  req.Description,
+		SplitDNS:     splitDNSJSON,
 		MaxBandwidth: req.MaxBandwidth,
 		DNSServers:   dnsServersJSON,
 		Groups:       groups, // 创建时即绑定用户组
@@ -162,6 +183,7 @@ func (h *PolicyHandler) UpdatePolicy(c *gin.Context) {
 		Description  string   `json:"description"`
 		MaxBandwidth int64    `json:"max_bandwidth"`
 		DNSServers   []string `json:"dns_servers"`
+		SplitDNS     []string `json:"split_dns"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -175,7 +197,7 @@ func (h *PolicyHandler) UpdatePolicy(c *gin.Context) {
 		policy.Description = req.Description
 	}
 	policy.MaxBandwidth = req.MaxBandwidth
-	
+
 	if req.DNSServers != nil {
 		if len(req.DNSServers) > 0 {
 			dnsBytes, err := json.Marshal(req.DNSServers)
@@ -186,6 +208,19 @@ func (h *PolicyHandler) UpdatePolicy(c *gin.Context) {
 			policy.DNSServers = string(dnsBytes)
 		} else {
 			policy.DNSServers = "" // 清空DNS配置，使用系统默认
+		}
+	}
+
+	if req.SplitDNS != nil {
+		if len(req.SplitDNS) > 0 {
+			splitDNSBytes, err := json.Marshal(req.SplitDNS)
+			if err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "Split-DNS域名格式错误"})
+				return
+			}
+			policy.SplitDNS = string(splitDNSBytes)
+		} else {
+			policy.SplitDNS = "" // 清空Split-DNS配置
 		}
 	}
 
@@ -200,7 +235,7 @@ func (h *PolicyHandler) UpdatePolicy(c *gin.Context) {
 
 func (h *PolicyHandler) DeletePolicy(c *gin.Context) {
 	id := c.Param("id")
-	
+
 	var policy models.Policy
 	if err := database.DB.First(&policy, id).Error; err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Policy not found"})
@@ -472,7 +507,7 @@ func (h *PolicyHandler) AssignGroups(c *gin.Context) {
 		return
 	}
 
-
 	database.DB.Preload("Routes").Preload("Groups").First(&policy, policy.ID)
 	c.JSON(http.StatusOK, convertPolicyToResponse(policy))
 }
+

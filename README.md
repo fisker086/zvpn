@@ -6,13 +6,10 @@
 
 - ✅ **完全兼容 Cisco AnyConnect 客户端** - 支持 Cisco AnyConnect Secure Mobility Client 和 Cisco Secure Client（Windows、macOS、iOS、Android）
 - ✅ **支持 OpenConnect 客户端** - 兼容开源 OpenConnect 客户端（Linux、macOS、Windows）
-- ✅ **🚀 纯 eBPF 高性能加速** - 基于 eBPF XDP + TC 的零拷贝数据包处理，**完全替代 iptables/nftables**，提供企业级性能
-- ✅ **eBPF TC SNAT** - 内核级 NAT 转换，无需 iptables，性能提升 10x+
+- ✅ **eBPF 加速** - 基于 eBPF XDP 的数据包处理
 - ✅ **完整的用户认证体系** - 支持本地认证、LDAP/AD 集成、OTP 双因素认证
 - ✅ **细粒度策略管理** - 支持基于用户、组、IP 的策略控制和流量审计
 - ✅ **Web 管理界面** - 现代化的 Vue.js 管理界面，支持用户、组、策略、证书等全功能管理
-
-
 
 
 ## 快速部署
@@ -60,59 +57,6 @@ sudo dnf install -y clang llvm libbpf iproute           # RHEL/CentOS
 make build && ./build/zvpn
 ```
 
-> **注意**：生产环境必须使用有效的 CA 签发的证书（如 Let's Encrypt），Cisco Secure Client 不支持自签名证书。
-
-## 部署说明
-
-### 系统要求
-
-#### 推荐的操作系统
-
-**经过测试和验证的发行版：**
-
-- ✅ **Ubuntu 20.04 LTS / 22.04 LTS** - 强烈推荐
-  - 内核版本：5.4+ (20.04) / 5.15+ (22.04)
-  - eBPF 支持完善，libbpf 版本新
-  - 依赖包齐全，部署简单
-
-- ✅ **Debian 11 (Bullseye) / 12 (Bookworm)** - 推荐
-  - 内核版本：5.10+ (11) / 6.1+ (12)
-  - 稳定可靠，eBPF 支持良好
-
-- ✅ **RHEL 8 / 9** - 企业级推荐
-  - 内核版本：4.18+ (8) / 5.14+ (9)
-  - 企业级支持，稳定性高
-
-- ⚠️ **CentOS 7** - 不推荐（内核过旧）
-  - 内核版本：3.10，eBPF 支持有限
-  - 建议升级到 CentOS Stream 8/9 或迁移到其他发行版
-
-- ❌ **Rocky Linux** - 不推荐
-  - 可能存在 libbpf 版本兼容性问题
-  - eBPF 相关依赖可能不完整
-  - 建议使用 Ubuntu 或 Debian
-
-#### 硬件要求
-
-- **内核版本**: Linux 5.8+ (eBPF XDP 需要), **5.19+ 推荐** (eBPF TC egress NAT 需要)
-- **内存**: 最低 512MB，推荐 1GB+
-- **CPU**: 最低 1 核，推荐 2 核+
-- **网络**: 需要 root 权限或 CAP_NET_ADMIN 能力（用于 eBPF 程序加载）
-
-#### 必需的系统依赖
-
-```bash
-# Ubuntu/Debian
-sudo apt-get install -y libbpf-dev clang llvm iproute2
-
-# RHEL/CentOS 8+
-sudo dnf install -y libbpf clang llvm iproute
-```
-
-> **注意**：ZVPN 使用纯 eBPF 实现 NAT，**不再依赖 iptables/nftables**。所有网络转发和 NAT 转换都在内核中通过 eBPF 完成，性能更高，资源占用更低。
-
-### 网络配置
-
 #### 端口说明
 
 - **18080** (TCP): 管理 API 和 Web 界面
@@ -155,21 +99,6 @@ brew install openconnect
 - **iOS**: 从 App Store 下载 "Cisco Secure Client"
 - **Android**: 从 Google Play 下载 "Cisco Secure Client"
 
-### 连接方式
-
-#### 使用 OpenConnect 命令行
-
-```bash
-# 基本连接
-sudo openconnect --user=your-username https://your-vpn-server.com
-
-# 指定服务器证书（仅适用于自签名证书，开发/测试环境）
-sudo openconnect --user=your-username --servercert=pin-sha256:xxxxx https://your-vpn-server.com
-
-# 禁用 DTLS（如果遇到问题）
-sudo openconnect --user=your-username --no-dtls https://your-vpn-server.com
-```
-
 #### 使用 Cisco AnyConnect / Secure Client
 
 ZVPN 完全兼容 Cisco AnyConnect 协议，支持所有标准的 AnyConnect 客户端功能：
@@ -206,56 +135,6 @@ export JWT_SECRET=your-secret-key
 
 
 ## 🎉 Release Notes
-
-### v2.0 - 纯 eBPF 架构升级 🚀
-
-**重大突破：完全移除 iptables/nftables 依赖，实现 100% 纯 eBPF 网络栈！**
-
-#### 🔥 核心升级
-
-- **✨ 纯 eBPF TC SNAT** - 完全替代 iptables MASQUERADE，性能提升 **10x+**
-  - 内核级 NAT 转换，零用户态开销
-  - 支持 TCX egress (kernel 6.6+) 和传统 TC clsact (kernel 4.1+)
-  - 自动 IP 检测和配置，无需手动设置 iptables 规则
-
-- **⚡ 性能优化**
-  - 移除 iptables/nftables 依赖，减少系统调用开销
-  - eBPF 程序直接在内核中处理数据包，延迟降低 **50%+**
-  - 支持高并发连接，单机可处理 **10万+** 并发 VPN 连接
-
-- **🛠️ 架构改进**
-  - 完全基于 eBPF XDP + TC 的数据包处理管道
-  - XDP 负责 ingress 策略检查和流量过滤
-  - TC egress 负责 SNAT 转换和校验和重算
-  - 零依赖传统防火墙工具，部署更简单
-
-#### 📦 技术细节
-
-- **eBPF TC NAT 实现**
-  - 自动检测出口 IP，支持从接口获取
-  - 完整的 IP 和传输层校验和重算
-  - 支持 TCP/UDP/ICMP 协议
-  - 完整的统计信息追踪
-
-- **兼容性**
-  - 内核 5.19+ 使用 TCX egress（推荐）
-  - 内核 4.1+ 使用传统 TC clsact（兼容模式）
-  - 自动降级和错误处理
-
-#### 🎯 使用优势
-
-1. **性能提升** - 相比 iptables，NAT 性能提升 10 倍以上
-2. **资源占用** - 减少内存和 CPU 占用，更适合容器化部署
-3. **部署简化** - 无需配置 iptables 规则，开箱即用
-4. **可观测性** - 完整的 eBPF 统计信息，便于监控和调试
-
-#### 📝 迁移说明
-
-- **无需任何配置变更** - 完全向后兼容
-- **自动检测和配置** - 系统会自动检测出口 IP 并配置 NAT
-- **移除依赖** - Dockerfile 和部署脚本已移除 iptables/nftables 依赖
-
----
 
 ### v1.0 - 初始版本
 

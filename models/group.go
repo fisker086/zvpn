@@ -12,7 +12,7 @@ type UserGroup struct {
 	Name        string `gorm:"uniqueIndex;not null;size:255" json:"name"`
 	Description string `json:"description"`
 
-	AllowLan bool `gorm:"default:false" json:"allow_lan"`
+	AllowLan bool `gorm:"default:true" json:"allow_lan"`
 
 	Users    []User   `gorm:"many2many:user_group_users;" json:"users,omitempty"`
 	Policies []Policy `gorm:"many2many:user_group_policies;" json:"policies,omitempty"`
