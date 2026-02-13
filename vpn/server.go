@@ -15,6 +15,7 @@ import (
 	"github.com/fisker/zvpn/vpn/policy"
 	"github.com/fisker/zvpn/vpn/security"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 type VPNServer struct {
@@ -193,45 +194,54 @@ func NewVPNServer(cfg *config.Config) (*VPNServer, error) {
 	var tcProg interface{}    // *ebpf.TCProgram
 	var tcProgTUN interface{} // *ebpf.TCProgram for TUN device
 
-	// Always set up NAT, even if egress IP detection failed
-	// MASQUERADE will automatically use the interface IP
 	if publicIP != nil {
-		// Set in eBPF XDP map (for reference, XDP is used for policy checking only)
+		// Verify that publicIP matches the actual interface IP
+		// This is critical for DNAT to work correctly - return packets target the egress IP
+		// Try to get the actual interface IP directly from eth0
+		if actualIP := getInterfaceIPDirectly(cfg.VPN.EBPFInterfaceName); actualIP != nil && !actualIP.Equal(publicIP) {
+			log.Printf("⚠️  Warning: Detected public IP %s does not match interface %s actual IP %s, updating...", publicIP.String(), cfg.VPN.EBPFInterfaceName, actualIP.String())
+			publicIP = actualIP
+		}
+		
 		if err := ebpfProg.SetPublicIP(publicIP); err != nil {
 			log.Printf("Warning: Failed to set egress IP in eBPF XDP map: %v", err)
 		} else {
-			log.Printf("✅ eBPF XDP: Public IP configured: %s (for policy checking)", publicIP.String())
+			log.Printf("✅ eBPF XDP: Public IP configured: %s (从接口 %s 自动获取)", publicIP.String(), cfg.VPN.EBPFInterfaceName)
 		}
 
-		// NAT 策略: 使用 eBPF TC egress NAT
-		// 1. 在 eth0 上 attach TC NAT（主要接口）
-		log.Printf("配置 NAT: 使用 eBPF TC egress NAT (接口: %s, NAT IP: %s)", cfg.VPN.EBPFInterfaceName, publicIP.String())
+		if err := ebpfProg.SetVPNNetwork(cfg.VPN.Network); err != nil {
+			log.Printf("Warning: Failed to set VPN network in eBPF XDP map: %v", err)
+		} else {
+			log.Printf("✅ eBPF XDP: VPN network configured: %s (从配置文件 config.yaml 读取)", cfg.VPN.Network)
+		}
+
+		// Verify pinned map values after XDP configuration
+		if err := ebpf.VerifySharedMapValues(); err != nil {
+			log.Printf("Warning: Failed to verify shared map values: %v", err)
+		}
+
+		// Ensure publicIP is updated if it was corrected above
 		tcProg, err = loadEBPFTCNAT(cfg.VPN.EBPFInterfaceName, publicIP, cfg.VPN.Network)
 		if err != nil {
 			log.Printf("接口: %s, eBPF TC NAT 加载失败: %v", cfg.VPN.EBPFInterfaceName, err)
 		} else {
 			log.Printf("eBPF TC NAT 加载成功, 接口: %s, NAT IP: %s, VPN 网络: %s", cfg.VPN.EBPFInterfaceName, publicIP.String(), cfg.VPN.Network)
+			// 验证 TC 程序是否正确 attach
+			if tcProgTyped, ok := tcProg.(interface{ VerifyAttachment() error }); ok {
+				if err := tcProgTyped.VerifyAttachment(); err != nil {
+					log.Printf("⚠️  TC NAT 验证失败: %v", err)
+				} else {
+					log.Printf("✅ TC NAT 程序验证成功，已正确 attach 到接口 %s", cfg.VPN.EBPFInterfaceName)
+				}
+			}
 		}
 
-		// 2. 在 TUN 设备上也 attach TC NAT（zvpn0）
-		// 数据包从 TUN 设备写入后，内核路由时会经过 TUN 设备的 egress hook
-		// 注意：TUN 设备是三层设备，可能不支持 TC egress hook，但尝试加载
-		if tunDevice != nil {
-			tunDeviceName := tunDevice.Name()
-			log.Printf("配置 NAT: 尝试在 TUN 设备上使用 eBPF TC egress NAT (接口: %s, NAT IP: %s)", tunDeviceName, publicIP.String())
-			// Use the same loadEBPFTCNAT function, but on TUN device
-			// This will attempt to attach TC NAT to TUN device egress
-			var errTUN error
-			tcProgTUN, errTUN = loadEBPFTCNAT(tunDeviceName, publicIP, cfg.VPN.Network)
-			if errTUN != nil {
-				log.Printf("TUN 设备 %s, eBPF TC NAT 加载失败: %v (TUN设备可能不支持TC egress hook，继续使用 eth0 NAT)", tunDeviceName, errTUN)
-				tcProgTUN = nil // Ensure it's nil on error
-			} else {
-				log.Printf("✅ eBPF TC NAT 在 TUN 设备 %s 加载成功, NAT IP: %s, VPN 网络: %s", tunDeviceName, publicIP.String(), cfg.VPN.Network)
-			}
-		} else {
-			tcProgTUN = nil
-		}
+		// Note: TC NAT should only be attached to eth0 (egress interface), not zvpn0
+		// Reason: Data packets flow: zvpn0 (TUN) -> kernel routing -> eth0 (egress)
+		// SNAT should be performed on eth0 egress hook (before packet leaves eth0)
+		// TUN devices are Layer 3 devices and may not support TC egress hooks properly
+		// Even if TC program loads on zvpn0, it may not execute or may cause conflicts
+		tcProgTUN = nil
 
 		egressIPForServer = publicIP
 	} else {
@@ -258,6 +268,51 @@ func NewVPNServer(cfg *config.Config) (*VPNServer, error) {
 	// Enable IP forwarding
 	if err := EnableIPForwarding(); err != nil {
 		log.Printf("Warning: Failed to enable IP forwarding: %v", err)
+	}
+
+	// Add route for VPN network to ensure packets from VPN clients can reach external networks
+	// This is needed for proper routing when packets are sent from VPN network (e.g., ping -I 10.8.0.1)
+	// The route ensures that packets from VPN network to external destinations go through the default gateway (eth0)
+	if publicIP != nil {
+		// Get default route to find the gateway
+		routes, err := netlink.RouteList(nil, unix.AF_INET)
+		if err == nil {
+			var defaultRoute *netlink.Route
+			for i := range routes {
+				if routes[i].Dst == nil {
+					// Default route (destination is nil)
+					defaultRoute = &routes[i]
+					break
+				}
+			}
+			if defaultRoute != nil {
+				// Add route: VPN network -> default gateway (via eth0)
+				// This ensures packets from VPN network (10.8.0.0/24) to external destinations are routed via eth0
+				vpnRoute := &netlink.Route{
+					Dst:       ipNet,
+					Gw:        defaultRoute.Gw,
+					LinkIndex: defaultRoute.LinkIndex,
+				}
+				if err := netlink.RouteAdd(vpnRoute); err != nil {
+					if errno, ok := err.(unix.Errno); !ok || errno != unix.EEXIST {
+						log.Printf("Warning: Failed to add route for VPN network %s: %v (packets may not route correctly)", cfg.VPN.Network, err)
+					} else {
+						log.Printf("Route for VPN network %s already exists", cfg.VPN.Network)
+					}
+				} else {
+					gwStr := "none"
+					if defaultRoute.Gw != nil {
+						gwStr = defaultRoute.Gw.String()
+					}
+					log.Printf("✅ Added route for VPN network %s -> gateway %s (via interface index %d) for proper external routing",
+						cfg.VPN.Network, gwStr, defaultRoute.LinkIndex)
+				}
+			} else {
+				log.Printf("Warning: Default route not found, VPN network routing may not work correctly")
+			}
+		} else {
+			log.Printf("Warning: Could not list routes for VPN network routing: %v", err)
+		}
 	}
 
 	// Note: We do NOT add a route for the VPN network (e.g., 10.8.0.0/24) to the TUN device
@@ -393,6 +448,105 @@ func NewVPNServer(cfg *config.Config) (*VPNServer, error) {
 	// Start eBPF audit logger if eBPF is enabled
 	// This will be handled by a build-tagged function
 	startEBPFAuditLoggerIfEnabled(ebpfProg)
+
+	// Start periodic TC NAT stats logging for debugging (every 30 seconds)
+	// Log stats for both eth0 and zvpn0 interfaces
+	if tcProg != nil || tcProgTUN != nil {
+		eth0Name := cfg.VPN.EBPFInterfaceName
+		tunName := ""
+		if tunDevice != nil {
+			tunName = tunDevice.Name()
+		}
+		go func() {
+			ticker := time.NewTicker(30 * time.Second)
+			defer ticker.Stop()
+			for range ticker.C {
+				// Log stats for eth0 interface
+				if server.tcProgram != nil {
+					if tcProgTyped, ok := server.tcProgram.(interface {
+						GetDetailedNATStats() string
+					}); ok {
+						log.Printf("TC NAT Stats (%s):\n%s", eth0Name, tcProgTyped.GetDetailedNATStats())
+					}
+				}
+				// Log stats for zvpn0 (TUN) interface (if exists)
+				if server.tcProgramTUN != nil {
+					if tcProgTyped, ok := server.tcProgramTUN.(interface {
+						GetDetailedNATStats() string
+					}); ok {
+						log.Printf("TC NAT Stats (%s):\n%s", tunName, tcProgTyped.GetDetailedNATStats())
+					}
+				}
+
+				// Log XDP DNAT conntrack lookup hit/miss stats (for key mismatch diagnosis)
+				if server.ebpfProgram != nil {
+					if xdpProgFull, ok := any(server.ebpfProgram).(interface {
+						GetDNATLookupStatsFull() (uint64, uint64, uint64, uint64, uint64, uint64, uint64, uint64, uint64, uint64, uint64, uint64, error)
+					}); ok {
+						total, hit, miss, targetEgress, vpnNetDst, vpnClientSrc, serverVpnIPDst, earlyTCPCtrl, earlyTCP443, earlyVPNInt, debugDstIP, debugEgressIP, err := xdpProgFull.GetDNATLookupStatsFull()
+						if err == nil {
+							// Convert IPs from network byte order for display
+							// eBPF stores IPs in network byte order (big-endian) as uint64
+							// CRITICAL: The value read from eBPF map is already in network byte order (big-endian)
+							// But when read as uint64 on little-endian system, it may be interpreted incorrectly
+							// We need to ensure we interpret it as big-endian
+							var dstIPStr, egressIPStr string
+							if debugDstIP > 0 {
+								// The value from eBPF is in network byte order (big-endian)
+								// Convert uint64 to bytes and interpret as big-endian
+								ipBytes := make([]byte, 4)
+								// Extract low 32 bits and convert to bytes in network byte order
+								ipUint32 := uint32(debugDstIP & 0xFFFFFFFF)
+								ipBytes[0] = byte(ipUint32 >> 24)
+								ipBytes[1] = byte(ipUint32 >> 16)
+								ipBytes[2] = byte(ipUint32 >> 8)
+								ipBytes[3] = byte(ipUint32)
+								dstIP := net.IP(ipBytes)
+								dstIPStr = fmt.Sprintf("%s/0x%08X", dstIP.String(), ipUint32)
+							} else {
+								dstIPStr = "N/A"
+							}
+							if debugEgressIP > 0 {
+								// Same conversion for egress IP
+								ipBytes := make([]byte, 4)
+								ipUint32 := uint32(debugEgressIP & 0xFFFFFFFF)
+								ipBytes[0] = byte(ipUint32 >> 24)
+								ipBytes[1] = byte(ipUint32 >> 16)
+								ipBytes[2] = byte(ipUint32 >> 8)
+								ipBytes[3] = byte(ipUint32)
+								egressIP := net.IP(ipBytes)
+								egressIPStr = fmt.Sprintf("%s/0x%08X", egressIP.String(), ipUint32)
+							} else {
+								egressIPStr = "N/A"
+							}
+							log.Printf("XDP DNAT Stats: total=%d, hit=%d, miss=%d, targetEgressIP=%d, vpnNetDst=%d, vpnClientSrc=%d, serverVpnIPDst=%d, earlyTCPCtrl=%d, earlyTCP443=%d, earlyVPNInt=%d, debugDstIP=%s, debugEgressIP=%s",
+								total, hit, miss, targetEgress, vpnNetDst, vpnClientSrc, serverVpnIPDst, earlyTCPCtrl, earlyTCP443, earlyVPNInt, dstIPStr, egressIPStr)
+						} else {
+							log.Printf("XDP DNAT Lookup Stats: read failed: %v", err)
+						}
+					} else if xdpProgDetailed, ok := any(server.ebpfProgram).(interface {
+						GetDNATLookupStatsDetailed() (uint64, uint64, uint64, error)
+					}); ok {
+						hit, miss, targetEgress, err := xdpProgDetailed.GetDNATLookupStatsDetailed()
+						if err == nil {
+							log.Printf("XDP DNAT Lookup Stats: hit=%d, miss=%d, targetEgressIP=%d", hit, miss, targetEgress)
+						} else {
+							log.Printf("XDP DNAT Lookup Stats: read failed: %v", err)
+						}
+					} else if xdpProgTyped, ok := any(server.ebpfProgram).(interface {
+						GetDNATLookupStats() (uint64, uint64, error)
+					}); ok {
+						hit, miss, err := xdpProgTyped.GetDNATLookupStats()
+						if err != nil {
+							log.Printf("XDP DNAT Lookup Stats: read failed: %v", err)
+						} else {
+							log.Printf("XDP DNAT Lookup Stats: hit=%d, miss=%d", hit, miss)
+						}
+					}
+				}
+			}
+		}()
+	}
 
 	// If AF_XDP is enabled and working, use it; otherwise fallback to TUN
 	// Note: listenAFXDP is only available on Linux (via build tag)
@@ -646,6 +800,35 @@ func boolToUint8(b bool) uint8 {
 	return 0
 }
 
+// getInterfaceIPDirectly gets the IP address directly from the specified interface
+// Returns nil if interface not found or error occurs (non-blocking)
+func getInterfaceIPDirectly(ifName string) net.IP {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return nil
+	}
+	
+	for _, iface := range ifaces {
+		if iface.Name != ifName {
+			continue
+		}
+		
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if ok && ipNet.IP.To4() != nil && !ipNet.IP.IsLoopback() && !ipNet.IP.IsLinkLocalUnicast() {
+				return ipNet.IP
+			}
+		}
+	}
+	
+	return nil
+}
+
 // loadEBPFTCNAT loads eBPF TC program for NAT masquerading
 // Returns the TC program instance or error if loading fails
 func loadEBPFTCNAT(ifName string, publicIP net.IP, vpnNetwork string) (interface{}, error) {
@@ -782,7 +965,7 @@ func (s *VPNServer) RegisterClient(userID uint, client *VPNClient) {
 	if err := s.tcProgramAddVPNClient(client.IP, clientRealIP); err != nil {
 		log.Printf("Warning: Failed to register VPN client in eBPF TC map: %v", err)
 		log.Printf("⚠️  TC NAT may not work for client %s - check eBPF TC map configuration", client.IP.String())
-	} else if s.tcProgram != nil {
+	} else if s.tcProgram != nil || s.tcProgramTUN != nil {
 		log.Printf("✅ Registered VPN client in eBPF TC map: VPN IP=%s, Real IP=%s", client.IP.String(), clientRealIP.String())
 	}
 }

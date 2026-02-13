@@ -8,15 +8,74 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
+	"strings"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/rlimit"
 )
 
+// Constants and helper functions for map pinning are defined in verify_maps.go
+// to avoid dependency on generated code types
+
+// ensureBPFPinDir ensures the BPF pin directory exists
+func ensureBPFPinDir() error {
+	if err := os.MkdirAll(bpfPinPath, 0755); err != nil {
+		return fmt.Errorf("failed to create BPF pin directory %s: %w", bpfPinPath, err)
+	}
+	return nil
+}
+
+// pinSharedMaps pins shared maps to the filesystem so they can be reused by TC program
+func pinSharedMaps(objs *xdpObjects) error {
+	if err := ensureBPFPinDir(); err != nil {
+		return err
+	}
+
+	// Pin shared maps (used by both TC and XDP)
+	mapsToPin := map[string]*ebpf.Map{
+		"vpn_clients":        objs.VpnClients,
+		"vpn_network_config": objs.VpnNetworkConfig,
+		"server_egress_ip":   objs.ServerEgressIp,
+		"nat_conn_track":     objs.NatConnTrack,
+	}
+
+	for name, m := range mapsToPin {
+		if m == nil {
+			continue
+		}
+		pinPath := getSharedMapPinPath(name)
+
+		// Always try to remove existing pinned map file first to avoid stale data
+		// This ensures we start with a clean map
+		if _, err := os.Stat(pinPath); err == nil {
+			// File exists, try to load and unpin it first
+			if oldMap, err := ebpf.LoadPinnedMap(pinPath, nil); err == nil {
+				if unpinErr := oldMap.Unpin(); unpinErr != nil {
+					log.Printf("Warning: Failed to unpin existing map %s: %v", name, unpinErr)
+				}
+				oldMap.Close()
+			}
+			// Also try to remove the file directly as a fallback
+			if err := os.Remove(pinPath); err != nil && !os.IsNotExist(err) {
+				log.Printf("Warning: Failed to remove existing pinned map file %s: %v", pinPath, err)
+			}
+		}
+
+		// Now pin the new map
+		if err := m.Pin(pinPath); err != nil {
+			return fmt.Errorf("failed to pin map %s: %w", name, err)
+		}
+		log.Printf("✅ Pinned shared map %s to %s", name, pinPath)
+	}
+
+	return nil
+}
+
 // XDPProgram represents an eBPF XDP program
 type XDPProgram struct {
-	objs              *xdpObjects
+	objs               *xdpObjects
 	link               link.Link
 	ifName             string
 	policiesMap        *ebpf.Map
@@ -83,8 +142,14 @@ func LoadXDPProgram(ifName string) (*XDPProgram, error) {
 		}
 	}
 
+	// Pin shared maps so TC program can reuse them
+	if err := pinSharedMaps(objs); err != nil {
+		log.Printf("Warning: Failed to pin shared maps: %v", err)
+		// Continue anyway - TC program will create its own maps if pinning fails
+	}
+
 	return &XDPProgram{
-		objs:              objs,
+		objs:               objs,
 		link:               xdpLink,
 		ifName:             ifName,
 		policiesMap:        objs.Policies,
@@ -125,6 +190,11 @@ func (x *XDPProgram) RemoveVPNClient(vpnIP net.IP) error {
 
 	vpnIPUint32 := ipToUint32(vpnIP)
 	if err := x.vpnClients.Delete(vpnIPUint32); err != nil {
+		// Ignore error if key does not exist (already deleted or never existed)
+		errStr := strings.ToLower(err.Error())
+		if strings.Contains(errStr, "key does not exist") || strings.Contains(errStr, "not found") {
+			return nil
+		}
 		return fmt.Errorf("failed to remove VPN client mapping: %w", err)
 	}
 
@@ -726,6 +796,102 @@ func (x *XDPProgram) GetDetailedStats() (totalPackets uint64, droppedPackets uin
 	return totalPackets, droppedPackets, nil
 }
 
+// GetDNATLookupStats returns DNAT conntrack lookup hit/miss counters from XDP stats map.
+// stats key 5 = hit, key 6 = miss, key 7 = packets targeting egress IP.
+func (x *XDPProgram) GetDNATLookupStats() (hit uint64, miss uint64, err error) {
+	if x == nil || x.stats == nil {
+		return 0, 0, fmt.Errorf("eBPF program not loaded")
+	}
+
+	keyHit := uint32(5)
+	var hitValues []uint64
+	if lookupErr := x.stats.Lookup(keyHit, &hitValues); lookupErr == nil {
+		for _, v := range hitValues {
+			hit += v
+		}
+	}
+
+	keyMiss := uint32(6)
+	var missValues []uint64
+	if lookupErr := x.stats.Lookup(keyMiss, &missValues); lookupErr == nil {
+		for _, v := range missValues {
+			miss += v
+		}
+	}
+
+	return hit, miss, nil
+}
+
+// GetDNATLookupStatsDetailed returns detailed DNAT conntrack lookup statistics.
+// Returns: hit, miss, targetEgressIP (packets targeting egress IP)
+func (x *XDPProgram) GetDNATLookupStatsDetailed() (hit uint64, miss uint64, targetEgressIP uint64, err error) {
+	if x == nil || x.stats == nil {
+		return 0, 0, 0, fmt.Errorf("eBPF program not loaded")
+	}
+
+	keyHit := uint32(5)
+	var hitValues []uint64
+	if lookupErr := x.stats.Lookup(keyHit, &hitValues); lookupErr == nil {
+		for _, v := range hitValues {
+			hit += v
+		}
+	}
+
+	keyMiss := uint32(6)
+	var missValues []uint64
+	if lookupErr := x.stats.Lookup(keyMiss, &missValues); lookupErr == nil {
+		for _, v := range missValues {
+			miss += v
+		}
+	}
+
+	keyTargetEgress := uint32(7)
+	var targetEgressValues []uint64
+	if lookupErr := x.stats.Lookup(keyTargetEgress, &targetEgressValues); lookupErr == nil {
+		for _, v := range targetEgressValues {
+			targetEgressIP += v
+		}
+	}
+
+	return hit, miss, targetEgressIP, nil
+}
+
+// GetDNATLookupStatsFull returns all DNAT-related statistics for debugging.
+func (x *XDPProgram) GetDNATLookupStatsFull() (totalPackets, hit, miss, targetEgressIP, vpnNetworkDst, vpnClientSrc, serverVpnIPDst, earlyTCPControl, earlyTCP443, earlyVPNInternal uint64, debugDstIP, debugEgressIP uint64, err error) {
+	if x == nil || x.stats == nil {
+		return 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, fmt.Errorf("eBPF program not loaded")
+	}
+
+	keys := []struct {
+		key   uint32
+		value *uint64
+	}{
+		{0, &totalPackets},  // Total packets processed
+		{5, &hit},
+		{6, &miss},
+		{7, &targetEgressIP},
+		{8, &vpnNetworkDst},
+		{9, &vpnClientSrc},
+		{10, &serverVpnIPDst},
+		{11, &earlyTCPControl},
+		{12, &earlyTCP443},
+		{13, &earlyVPNInternal},
+		{14, &debugDstIP},
+		{15, &debugEgressIP},
+	}
+
+	for _, k := range keys {
+		var values []uint64
+		if lookupErr := x.stats.Lookup(k.key, &values); lookupErr == nil {
+			for _, v := range values {
+				*k.value += v
+			}
+		}
+	}
+
+	return totalPackets, hit, miss, targetEgressIP, vpnNetworkDst, vpnClientSrc, serverVpnIPDst, earlyTCPControl, earlyTCP443, earlyVPNInternal, debugDstIP, debugEgressIP, nil
+}
+
 // GetPolicyStats returns policy match statistics
 // Note: policy_stats is a per-CPU hash map, so we need to read all CPU values and sum them
 func (x *XDPProgram) GetPolicyStats(policyID uint32) (uint64, error) {
@@ -768,7 +934,35 @@ func (x *XDPProgram) SetPublicIP(publicIP net.IP) error {
 		return fmt.Errorf("failed to set egress IP in eBPF map: %w", err)
 	}
 
-	log.Printf("✅ eBPF NAT: Server egress IP set to %s", publicIP.String())
+	// Verify the value was stored correctly in the memory map
+	var verifyValue uint32
+	if err := x.serverEgressIPMap.Lookup(key, &verifyValue); err != nil {
+		return fmt.Errorf("failed to verify egress IP in eBPF map: %w", err)
+	}
+	if verifyValue != ipUint32 {
+		return fmt.Errorf("egress IP verification failed: expected 0x%08X, got 0x%08X", ipUint32, verifyValue)
+	}
+
+	// Also verify the pinned map has the correct value (if it exists)
+	// This ensures consistency between memory map and pinned map
+	pinPath := getSharedMapPinPath("server_egress_ip")
+	if pinnedMap, err := ebpf.LoadPinnedMap(pinPath, nil); err == nil {
+		defer pinnedMap.Close()
+		var pinnedValue uint32
+		if err := pinnedMap.Lookup(key, &pinnedValue); err == nil {
+			if pinnedValue != ipUint32 {
+				log.Printf("⚠️  Warning: Pinned map value (%s/0x%08X) differs from memory map (%s/0x%08X), updating pinned map...",
+					net.IPv4(byte(pinnedValue>>24), byte(pinnedValue>>16), byte(pinnedValue>>8), byte(pinnedValue)).String(), pinnedValue,
+					publicIP.String(), ipUint32)
+				// Update the pinned map to match
+				if err := pinnedMap.Put(key, ipUint32); err != nil {
+					log.Printf("Warning: Failed to update pinned map: %v", err)
+				}
+			}
+		}
+	}
+
+	log.Printf("✅ eBPF NAT: Server egress IP set to %s (0x%08X, verified: 0x%08X)", publicIP.String(), ipUint32, verifyValue)
 	return nil
 }
 
@@ -934,7 +1128,7 @@ func (x *XDPProgram) IsIPBlocked(ip net.IP) (bool, uint64, error) {
 
 // RateLimitConfig represents the rate limit and DDoS protection configuration
 type RateLimitConfig struct {
-	EnableRateLimit      uint8  // 0 = disabled, 1 = enabled
+	EnableRateLimit      uint8 // 0 = disabled, 1 = enabled
 	_                    [7]byte
 	RateLimitPerIP       uint64 // Packets per second per IP
 	EnableDDoSProtection uint8  // 0 = disabled, 1 = enabled
@@ -971,3 +1165,4 @@ func (x *XDPProgram) GetRateLimitConfig() (RateLimitConfig, error) {
 
 	return config, nil
 }
+

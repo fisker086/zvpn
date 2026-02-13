@@ -4,10 +4,12 @@
 package ebpf
 
 import (
+	"encoding/binary"
 	"fmt"
 	"log"
 	"net"
 	"os"
+	"strings"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
@@ -36,10 +38,65 @@ func LoadTCProgram(ifName string) (*TCProgram, error) {
 		return nil, fmt.Errorf("failed to remove memlock limit: %w", err)
 	}
 
-	// Load pre-compiled eBPF objects
+	// Try to load shared maps from XDP program (pinned maps) before loading TC objects
+	// This allows us to use MapReplacements to replace maps during loading
+	mapReplacements := make(map[string]*ebpf.Map)
+	sharedMapNames := []string{"vpn_clients", "vpn_network_config", "server_egress_ip", "nat_conn_track"}
+
+	for _, name := range sharedMapNames {
+		pinPath := getSharedMapPinPath(name)
+		pinnedMap, err := ebpf.LoadPinnedMap(pinPath, nil)
+		if err != nil {
+			if os.IsNotExist(err) {
+				log.Printf("Shared map %s not found at %s, TC will create its own", name, pinPath)
+				continue
+			}
+			log.Printf("Warning: Failed to load pinned map %s from %s: %v, TC will create its own", name, pinPath, err)
+			continue
+		}
+		mapReplacements[name] = pinnedMap
+		log.Printf("✅ Loaded shared map %s from %s for replacement", name, pinPath)
+	}
+
+	// Load pre-compiled eBPF objects with map replacements
 	objs := &tc_natObjects{}
-	if err := loadTc_natObjects(objs, nil); err != nil {
+	var collOpts *ebpf.CollectionOptions
+	if len(mapReplacements) > 0 {
+		collOpts = &ebpf.CollectionOptions{
+			MapReplacements: mapReplacements,
+		}
+		log.Printf("Using %d shared maps from XDP program", len(mapReplacements))
+	}
+
+	if err := loadTc_natObjects(objs, collOpts); err != nil {
+		// Close loaded maps on error
+		for _, m := range mapReplacements {
+			m.Close()
+		}
 		return nil, fmt.Errorf("failed to load eBPF TC objects: %w", err)
+	}
+
+	if len(mapReplacements) > 0 {
+		log.Printf("✅ TC program reused %d shared maps from XDP program", len(mapReplacements))
+
+		// Verify that TC program can read the shared map values
+		if serverEgressIPMap, ok := mapReplacements["server_egress_ip"]; ok {
+			key := uint32(0)
+			var value uint32
+			if err := serverEgressIPMap.Lookup(key, &value); err == nil {
+				ip := net.IPv4(
+					byte(value>>24),
+					byte(value>>16),
+					byte(value>>8),
+					byte(value),
+				)
+				log.Printf("✅ TC program verified shared server_egress_ip map: %s (0x%08X)", ip.String(), value)
+			} else {
+				log.Printf("⚠️  TC program failed to read from shared server_egress_ip map: %v", err)
+			}
+		}
+	} else {
+		log.Printf("⚠️  TC program using its own maps (XDP maps not found or not pinned)")
 	}
 
 	// Open network interface
@@ -54,12 +111,12 @@ func LoadTCProgram(ifName string) (*TCProgram, error) {
 	var tcLink link.Link
 
 	// Try TCX first (kernel 6.6+)
-	opts := link.TCXOptions{
+	tcxOpts := link.TCXOptions{
 		Program:   objs.TcNatEgress,
 		Interface: iface.Index,
 		Attach:    ebpf.AttachTCXEgress,
 	}
-	tcLink, err = link.AttachTCX(opts)
+	tcLink, err = link.AttachTCX(tcxOpts)
 	if err != nil {
 		log.Printf("Warning: Failed to attach TC program using TCX: %v", err)
 		log.Printf("TCX requires kernel 6.6+, falling back to traditional TC clsact qdisc...")
@@ -71,7 +128,7 @@ func LoadTCProgram(ifName string) (*TCProgram, error) {
 			return nil, fmt.Errorf("failed to attach TC program: %w (tried TCX and traditional TC clsact)", err)
 		}
 		log.Printf("✅ TC egress NAT program attached using traditional TC clsact qdisc (compatible with kernel 4.1+)")
-		return &TCProgram{
+		tcProg := &TCProgram{
 			objs:              objs,
 			link:              nil, // No link.Link for traditional TC
 			clsactLink:        clsactLink,
@@ -80,13 +137,32 @@ func LoadTCProgram(ifName string) (*TCProgram, error) {
 			vpnClients:        objs.VpnClients,
 			natStats:          objs.NatStats,
 			vpnNetworkConfig:  objs.VpnNetworkConfig,
-		}, nil
+		}
+
+		// Verify TC program can read from shared maps
+		if objs.ServerEgressIp != nil {
+			key := uint32(0)
+			var value uint32
+			if err := objs.ServerEgressIp.Lookup(key, &value); err == nil {
+				ip := net.IPv4(
+					byte(value>>24),
+					byte(value>>16),
+					byte(value>>8),
+					byte(value),
+				)
+				log.Printf("✅ TC program verified it can read server_egress_ip: %s (0x%08X)", ip.String(), value)
+			} else {
+				log.Printf("⚠️  TC program cannot read server_egress_ip (may not be set yet): %v", err)
+			}
+		}
+
+		return tcProg, nil
 	}
 
 	log.Printf("✅ TC egress NAT program attached using TCX (kernel 6.6+)")
 	log.Printf("✅ TC egress NAT program attached to interface %s", ifName)
 
-	return &TCProgram{
+	tcProg := &TCProgram{
 		objs:              objs,
 		link:              tcLink,
 		clsactLink:        nil, // Using TCX link
@@ -95,7 +171,26 @@ func LoadTCProgram(ifName string) (*TCProgram, error) {
 		vpnClients:        objs.VpnClients,
 		natStats:          objs.NatStats,
 		vpnNetworkConfig:  objs.VpnNetworkConfig,
-	}, nil
+	}
+
+	// Verify TC program can read from shared maps
+	if objs.ServerEgressIp != nil {
+		key := uint32(0)
+		var value uint32
+		if err := objs.ServerEgressIp.Lookup(key, &value); err == nil {
+			ip := net.IPv4(
+				byte(value>>24),
+				byte(value>>16),
+				byte(value>>8),
+				byte(value),
+			)
+			log.Printf("✅ TC program verified it can read server_egress_ip: %s (0x%08X)", ip.String(), value)
+		} else {
+			log.Printf("⚠️  TC program cannot read server_egress_ip (may not be set yet): %v", err)
+		}
+	}
+
+	return tcProg, nil
 }
 
 // SetPublicIP sets the public IP address for NAT masquerading in TC eBPF
@@ -109,8 +204,8 @@ func (t *TCProgram) SetPublicIP(publicIP net.IP) error {
 	}
 
 	// Convert IP to network byte order (uint32)
-	ipBytes := publicIP.To4()
-	ipUint32 := uint32(ipBytes[0])<<24 | uint32(ipBytes[1])<<16 | uint32(ipBytes[2])<<8 | uint32(ipBytes[3])
+	// Use ipToUint32() for consistency
+	ipUint32 := ipToUint32(publicIP)
 
 	// Store in map with key 0
 	key := uint32(0)
@@ -118,7 +213,16 @@ func (t *TCProgram) SetPublicIP(publicIP net.IP) error {
 		return fmt.Errorf("failed to set egress IP in TC eBPF map: %w", err)
 	}
 
-	log.Printf("✅ TC eBPF NAT: Server egress IP set to %s", publicIP.String())
+	// Verify the value was stored correctly
+	var verifyValue uint32
+	if err := t.serverEgressIPMap.Lookup(key, &verifyValue); err != nil {
+		return fmt.Errorf("failed to verify egress IP in TC eBPF map: %w", err)
+	}
+	if verifyValue != ipUint32 {
+		return fmt.Errorf("egress IP verification failed: expected 0x%08X, got 0x%08X", ipUint32, verifyValue)
+	}
+
+	log.Printf("✅ TC eBPF NAT: Server egress IP set to %s (0x%08X, verified: 0x%08X)", publicIP.String(), ipUint32, verifyValue)
 	return nil
 }
 
@@ -135,15 +239,18 @@ func (t *TCProgram) SetVPNNetwork(vpnNetwork string) error {
 	}
 
 	// Convert network address to network byte order (uint32)
-	ipBytes := ipNet.IP.To4()
-	if ipBytes == nil {
+	// Use binary.BigEndian.Uint32 for consistency
+	networkUint32 := ipToUint32(ipNet.IP)
+	if networkUint32 == 0 {
 		return fmt.Errorf("VPN network must be IPv4")
 	}
-	networkUint32 := uint32(ipBytes[0])<<24 | uint32(ipBytes[1])<<16 | uint32(ipBytes[2])<<8 | uint32(ipBytes[3])
 
-	// Convert mask to uint32
+	// Convert mask to uint32 (mask is already in network byte order)
 	maskBytes := ipNet.Mask
-	maskUint32 := uint32(maskBytes[0])<<24 | uint32(maskBytes[1])<<16 | uint32(maskBytes[2])<<8 | uint32(maskBytes[3])
+	if len(maskBytes) != 4 {
+		return fmt.Errorf("invalid mask length")
+	}
+	maskUint32 := binary.BigEndian.Uint32(maskBytes)
 
 	// Store network address (key 0)
 	key := uint32(0)
@@ -157,7 +264,20 @@ func (t *TCProgram) SetVPNNetwork(vpnNetwork string) error {
 		return fmt.Errorf("failed to set VPN network mask in TC eBPF map: %w", err)
 	}
 
-	log.Printf("✅ TC eBPF NAT: VPN network configured: %s (network: 0x%08X, mask: 0x%08X)", vpnNetwork, networkUint32, maskUint32)
+	networkIP := net.IP([]byte{
+		byte(networkUint32 >> 24),
+		byte(networkUint32 >> 16),
+		byte(networkUint32 >> 8),
+		byte(networkUint32),
+	})
+	maskIP := net.IP([]byte{
+		byte(maskUint32 >> 24),
+		byte(maskUint32 >> 16),
+		byte(maskUint32 >> 8),
+		byte(maskUint32),
+	})
+	log.Printf("✅ TC eBPF NAT: VPN network configured: %s (network: %s/0x%08X, mask: %s/0x%08X)",
+		vpnNetwork, networkIP.String(), networkUint32, maskIP.String(), maskUint32)
 	return nil
 }
 
@@ -185,6 +305,11 @@ func (t *TCProgram) RemoveVPNClient(vpnIP net.IP) error {
 
 	vpnIPUint32 := ipToUint32(vpnIP)
 	if err := t.vpnClients.Delete(vpnIPUint32); err != nil {
+		// Ignore error if key does not exist (already deleted or never existed)
+		errStr := strings.ToLower(err.Error())
+		if strings.Contains(errStr, "key does not exist") || strings.Contains(errStr, "not found") {
+			return nil
+		}
 		return fmt.Errorf("failed to remove VPN client mapping from TC eBPF map: %w", err)
 	}
 
@@ -227,8 +352,7 @@ func (t *TCProgram) GetNATStats() (map[uint32]uint64, error) {
 	}
 
 	stats := make(map[uint32]uint64)
-	// Read all stat keys (0-9)
-	for i := uint32(0); i < 10; i++ {
+	for i := uint32(0); i < 30; i++ {
 		var value uint64
 		if err := t.natStats.Lookup(i, &value); err == nil {
 			stats[i] = value
@@ -238,70 +362,209 @@ func (t *TCProgram) GetNATStats() (map[uint32]uint64, error) {
 	return stats, nil
 }
 
-// LogNATStats logs the NAT statistics for debugging
-func (t *TCProgram) LogNATStats() {
-	if stats, err := t.GetNATStats(); err == nil {
-		log.Printf("TC NAT Stats: Total=%d, VPNNetworkCheck=%d, VPNClientFound=%d, EgressIPFound=%d, NATPerformed=%d, VPNNetworkNotConfigured=%d",
-			stats[4], stats[1], stats[2], stats[3], stats[0], stats[5])
+// GetDetailedNATStats returns formatted NAT statistics for debugging
+func (t *TCProgram) GetDetailedNATStats() string {
+	stats, err := t.GetNATStats()
+	if err != nil {
+		return fmt.Sprintf("Failed to get stats: %v", err)
+	}
 
-		// Also log VPN network configuration for debugging
-		if t.vpnNetworkConfig != nil {
-			var networkAddr uint32
-			var networkMask uint32
-			if err := t.vpnNetworkConfig.Lookup(uint32(0), &networkAddr); err == nil {
-				if err := t.vpnNetworkConfig.Lookup(uint32(1), &networkMask); err == nil {
-					networkIP := net.IP([]byte{
-						byte(networkAddr >> 24),
-						byte(networkAddr >> 16),
-						byte(networkAddr >> 8),
-						byte(networkAddr),
-					})
-					maskIP := net.IP([]byte{
-						byte(networkMask >> 24),
-						byte(networkMask >> 16),
-						byte(networkMask >> 8),
-						byte(networkMask),
-					})
-					log.Printf("TC NAT VPN Network Config: Network=%s, Mask=%s", networkIP.String(), maskIP.String())
+	var buf strings.Builder
+	buf.WriteString(fmt.Sprintf("TC NAT Stats (interface: %s): Total=%d, VPNCheck=%d, ClientFound=%d, EgressIP=%d, NAT=%d, NotConfigured=%d",
+		t.ifName, stats[4], stats[1], stats[2], stats[3], stats[0], stats[5]))
+	
+	// Add debug statistics
+	if stats[7] > 0 {
+		buf.WriteString(fmt.Sprintf(", ShouldNotNAT=%d", stats[7]))
+	}
+	if stats[10] > 0 {
+		buf.WriteString(fmt.Sprintf(", SrcIsVPN=%d", stats[10]))
+	}
+	if stats[11] > 0 {
+		buf.WriteString(fmt.Sprintf(", DstIsVPN=%d", stats[11]))
+	}
+	if stats[12] > 0 {
+		buf.WriteString(fmt.Sprintf(", SrcIsEgress=%d", stats[12]))
+	}
+	
+	// Show debug information (first few packets)
+	if stats[20] > 0 {
+		srcIP := net.IP(make([]byte, 4))
+		// Try big-endian first (network byte order)
+		binary.BigEndian.PutUint32(srcIP, uint32(stats[20]))
+		// If it looks wrong (first byte is 0-9, which is unusual), try little-endian
+		if srcIP[0] <= 9 && srcIP[0] != 10 {
+			binary.LittleEndian.PutUint32(srcIP, uint32(stats[20]))
+		}
+		buf.WriteString(fmt.Sprintf(", DebugSrcIP=%s/0x%08X", srcIP.String(), stats[20]))
+	}
+	if stats[21] > 0 {
+		vpnNet := net.IP(make([]byte, 4))
+		binary.BigEndian.PutUint32(vpnNet, uint32(stats[21]))
+		buf.WriteString(fmt.Sprintf(", DebugVPNNet=%s/0x%08X", vpnNet.String(), stats[21]))
+	}
+	if stats[22] > 0 {
+		vpnMask := net.IP(make([]byte, 4))
+		binary.BigEndian.PutUint32(vpnMask, uint32(stats[22]))
+		buf.WriteString(fmt.Sprintf(", DebugVPNMask=%s/0x%08X", vpnMask.String(), stats[22]))
+	}
+	// Show egress IP debug (key 23)
+	if stats[23] > 0 {
+		egressIP := net.IP(make([]byte, 4))
+		binary.BigEndian.PutUint32(egressIP, uint32(stats[23]))
+		buf.WriteString(fmt.Sprintf(", DebugEgressIP=%s/0x%08X", egressIP.String(), stats[23]))
+	}
+	// Show destination IP debug (key 26)
+	if stats[26] > 0 {
+		dstIP := net.IP(make([]byte, 4))
+		binary.BigEndian.PutUint32(dstIP, uint32(stats[26]))
+		buf.WriteString(fmt.Sprintf(", DebugDstIP=%s/0x%08X", dstIP.String(), stats[26]))
+	}
+	// Show comparison result debug (key 24)
+	if stats[24] > 0 {
+		buf.WriteString(fmt.Sprintf(", DebugCmpResult=%d", stats[24]))
+	}
 
-					// Log first few source IPs seen (for debugging)
-					if stats[6] > 0 {
-						log.Printf("TC NAT Debug: Saw %d packets, VPN network: %s (0x%08X), Mask: 0x%08X",
-							stats[6], networkIP.String(), networkAddr, networkMask)
+	// Show debug info if VPN check failed
+	if stats[1] == 0 && stats[4] > 0 {
+		if stats[18] != 0 || stats[19] != 0 {
+			buf.WriteString(fmt.Sprintf(", src_is_vpn=%d, dst_is_vpn=%d", stats[18], stats[19]))
+		}
+		if stats[12] > 0 {
+			vpnNet := net.IP(make([]byte, 4))
+			// IP addresses in eBPF are stored in network byte order (big-endian)
+			binary.BigEndian.PutUint32(vpnNet, uint32(stats[12]))
+			buf.WriteString(fmt.Sprintf(" (VPNNet=%s/0x%08X", vpnNet.String(), stats[12]))
+			if stats[13] > 0 {
+				vpnMask := net.IP(make([]byte, 4))
+				binary.BigEndian.PutUint32(vpnMask, uint32(stats[13]))
+				buf.WriteString(fmt.Sprintf(", VPNMask=%s/0x%08X", vpnMask.String(), stats[13]))
+			}
+			if stats[20] > 0 {
+				srcIP := net.IP(make([]byte, 4))
+				// Try both byte orders to handle potential endianness issues
+				// First try big-endian (network byte order)
+				binary.BigEndian.PutUint32(srcIP, uint32(stats[20]))
+				// If the result looks wrong (first byte is 0-9, which is unusual for IP addresses),
+				// try little-endian (host byte order on x86)
+				if srcIP[0] <= 9 {
+					binary.LittleEndian.PutUint32(srcIP, uint32(stats[20]))
+				}
+				buf.WriteString(fmt.Sprintf(", SrcIP=%s/0x%08X", srcIP.String(), stats[20]))
+			}
+			if stats[14] > 0 {
+				srcNet := net.IP(make([]byte, 4))
+				binary.BigEndian.PutUint32(srcNet, uint32(stats[14]))
+				// If the result looks wrong, try little-endian
+				if srcNet[0] <= 9 {
+					binary.LittleEndian.PutUint32(srcNet, uint32(stats[14]))
+				}
+				buf.WriteString(fmt.Sprintf(", SrcNet=%s/0x%08X", srcNet.String(), stats[14]))
+			}
+			if stats[7] > 0 {
+				srcIPFirst := net.IP(make([]byte, 4))
+				binary.BigEndian.PutUint32(srcIPFirst, uint32(stats[7]))
+				// If the result looks wrong, try little-endian
+				if srcIPFirst[0] <= 9 {
+					binary.LittleEndian.PutUint32(srcIPFirst, uint32(stats[7]))
+				}
+				buf.WriteString(fmt.Sprintf(", FirstSrcIP=%s/0x%08X", srcIPFirst.String(), stats[7]))
+			}
+			// Show egress IP if available (key 21)
+			if stats[21] > 0 {
+				egressIP := net.IP(make([]byte, 4))
+				binary.BigEndian.PutUint32(egressIP, uint32(stats[21]))
+				// If the result looks wrong, try little-endian
+				if egressIP[0] <= 9 {
+					binary.LittleEndian.PutUint32(egressIP, uint32(stats[21]))
+				}
+				buf.WriteString(fmt.Sprintf(", EgressIP=%s/0x%08X", egressIP.String(), stats[21]))
+			}
+			// Show src_is_egress status (key 22)
+			if stats[22] > 0 {
+				buf.WriteString(fmt.Sprintf(", src_is_egress=%d", stats[22]))
+			}
+			// Show egress_ip pointer status (key 23)
+			if stats[23] != 0 {
+				buf.WriteString(fmt.Sprintf(", egress_ip_ptr=%d", stats[23]))
+			}
+			// Show egress_ip value directly (key 24)
+			if stats[24] > 0 {
+				egressIPVal := net.IP(make([]byte, 4))
+				binary.BigEndian.PutUint32(egressIPVal, uint32(stats[24]))
+				buf.WriteString(fmt.Sprintf(", egress_ip_val=%s/0x%08X", egressIPVal.String(), stats[24]))
+			}
+			buf.WriteString(")")
+		}
+	}
+	buf.WriteString("\n")
 
-						// Log first few source IPs
-						for i := uint32(7); i < 12 && i-7 < uint32(stats[6]); i++ {
-							if stats[i] > 0 {
-								srcIPUint32 := uint32(stats[i])
-								srcIP := net.IP([]byte{
-									byte(srcIPUint32 >> 24),
-									byte(srcIPUint32 >> 16),
-									byte(srcIPUint32 >> 8),
-									byte(srcIPUint32),
-								})
-								srcNetwork := srcIPUint32 & networkMask
-								log.Printf("TC NAT Debug: Source IP #%d: %s (0x%08X), Network part: 0x%08X, Match: %v",
-									i-6, srcIP.String(), srcIPUint32, srcNetwork, srcNetwork == networkAddr)
-							}
-						}
+	return buf.String()
+}
 
-						// Log VPN network config from eBPF map (if available)
-						if stats[12] > 0 && stats[13] > 0 {
-							vpnNetFromMap := uint32(stats[12])
-							vpnMaskFromMap := uint32(stats[13])
-							log.Printf("TC NAT Debug: VPN config from map: Network=0x%08X, Mask=0x%08X",
-								vpnNetFromMap, vpnMaskFromMap)
-							if stats[14] > 0 {
-								srcNetworkFromMap := uint32(stats[14])
-								log.Printf("TC NAT Debug: Source network (src & mask): 0x%08X, Match: %v",
-									srcNetworkFromMap, srcNetworkFromMap == vpnNetFromMap)
-							}
-						}
-					}
+// VerifyAttachment verifies that the TC program is correctly attached to the interface
+func (t *TCProgram) VerifyAttachment() error {
+	if t == nil {
+		return fmt.Errorf("TC program not loaded")
+	}
+
+	// Check if we have a link (TCX) or clsactLink (traditional TC)
+	if t.link != nil {
+		log.Printf("TC NAT: Program attached using TCX link")
+		return nil
+	}
+
+	if t.clsactLink != nil {
+		log.Printf("TC NAT: Program attached using traditional TC clsact qdisc")
+		// Verify clsact qdisc exists
+		link, err := netlink.LinkByName(t.ifName)
+		if err != nil {
+			return fmt.Errorf("failed to find interface %s: %w", t.ifName, err)
+		}
+
+		qdiscs, err := netlink.QdiscList(link)
+		if err != nil {
+			return fmt.Errorf("failed to list qdiscs: %w", err)
+		}
+
+		clsactFound := false
+		for _, qdisc := range qdiscs {
+			if qdisc.Type() == "clsact" {
+				clsactFound = true
+				log.Printf("TC NAT: Verified clsact qdisc exists on interface %s", t.ifName)
+				break
+			}
+		}
+
+		if !clsactFound {
+			return fmt.Errorf("clsact qdisc not found on interface %s", t.ifName)
+		}
+
+		// Verify filter exists
+		filters, err := netlink.FilterList(link, netlink.HANDLE_MIN_EGRESS)
+		if err != nil {
+			return fmt.Errorf("failed to list filters: %w", err)
+		}
+
+		filterFound := false
+		for _, filter := range filters {
+			if bpfFilter, ok := filter.(*netlink.BpfFilter); ok {
+				if bpfFilter.Name == "tc_nat_egress" {
+					filterFound = true
+					log.Printf("TC NAT: Verified eBPF filter 'tc_nat_egress' exists on interface %s egress", t.ifName)
+					break
 				}
 			}
 		}
+
+		if !filterFound {
+			return fmt.Errorf("eBPF filter 'tc_nat_egress' not found on interface %s egress", t.ifName)
+		}
+
+		return nil
 	}
+
+	return fmt.Errorf("TC program not attached (no link or clsactLink)")
 }
 
 // attachTCClsact attaches eBPF program to interface using traditional TC clsact qdisc
@@ -329,12 +592,14 @@ func attachTCClsact(ifName string, ifIndex int, prog *ebpf.Program) (*clsactLink
 	if err := netlink.QdiscAdd(qdisc); err != nil {
 		// Check if qdisc already exists
 		if os.IsExist(err) {
-			log.Printf("Clsact qdisc already exists on interface %s", ifName)
+			log.Printf("✅ Clsact qdisc already exists on interface %s", ifName)
 		} else {
+			log.Printf("ERROR: Failed to create clsact qdisc on interface %s: %v", ifName, err)
+			log.Printf("ERROR: LinkIndex=%d, Handle=%d, Parent=%d", ifIndex, netlink.MakeHandle(0xffff, 0), netlink.HANDLE_CLSACT)
 			return nil, fmt.Errorf("failed to create clsact qdisc: %w", err)
 		}
 	} else {
-		log.Printf("Created clsact qdisc on interface %s", ifName)
+		log.Printf("✅ Created clsact qdisc on interface %s", ifName)
 	}
 
 	// Create filter to attach eBPF program to egress hook
@@ -353,13 +618,47 @@ func attachTCClsact(ifName string, ifIndex int, prog *ebpf.Program) (*clsactLink
 	}
 
 	// Add filter (attach eBPF program)
+	log.Printf("Attempting to attach eBPF program to clsact qdisc on interface %s (FD=%d, LinkIndex=%d, Parent=%d)",
+		ifName, progFD, ifIndex, netlink.HANDLE_MIN_EGRESS)
 	if err := netlink.FilterAdd(filter); err != nil {
+		log.Printf("ERROR: Failed to attach eBPF program to clsact qdisc on interface %s: %v", ifName, err)
+		log.Printf("ERROR: Program FD: %d, LinkIndex: %d, Parent: %d", progFD, ifIndex, netlink.HANDLE_MIN_EGRESS)
+		log.Printf("ERROR: Filter details: Handle=%d, Protocol=%d, Priority=%d, Name=%s",
+			netlink.MakeHandle(0, 1), unix.ETH_P_ALL, 1, "tc_nat_egress")
 		// Clean up qdisc if filter add fails
-		netlink.QdiscDel(qdisc)
+		if delErr := netlink.QdiscDel(qdisc); delErr != nil {
+			log.Printf("WARNING: Failed to clean up qdisc after filter add failure: %v", delErr)
+		}
 		return nil, fmt.Errorf("failed to attach eBPF program to clsact qdisc: %w", err)
 	}
 
-	log.Printf("Attached eBPF program to clsact qdisc egress hook on interface %s", ifName)
+	log.Printf("✅ Attached eBPF program to clsact qdisc egress hook on interface %s", ifName)
+
+	// Verify attachment immediately
+	if link, err := netlink.LinkByName(ifName); err == nil {
+		filters, err := netlink.FilterList(link, netlink.HANDLE_MIN_EGRESS)
+		if err == nil {
+			found := false
+			for _, f := range filters {
+				if bpfFilter, ok := f.(*netlink.BpfFilter); ok && bpfFilter.Name == "tc_nat_egress" {
+					found = true
+					log.Printf("✅ Verified TC filter 'tc_nat_egress' is attached to %s egress", ifName)
+					break
+				}
+			}
+			if !found {
+				log.Printf("⚠️  WARNING: TC filter 'tc_nat_egress' not found on %s egress after attach!", ifName)
+				log.Printf("⚠️  Available filters on %s egress:", ifName)
+				for _, f := range filters {
+					log.Printf("    Filter: %+v", f)
+				}
+			}
+		} else {
+			log.Printf("⚠️  WARNING: Failed to verify TC filter attachment: %v", err)
+		}
+	} else {
+		log.Printf("⚠️  WARNING: Failed to get link %s for verification: %v", ifName, err)
+	}
 
 	// Create a custom link type to handle cleanup
 	return &clsactLink{

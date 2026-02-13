@@ -133,6 +133,14 @@ func (x *XDPProgram) SetPublicIP(publicIP net.IP) error {
 	return fmt.Errorf("eBPF not compiled. Run: go generate ./vpn/ebpf")
 }
 
+// SetVPNNetwork sets the VPN network configuration in XDP eBPF map
+func (x *XDPProgram) SetVPNNetwork(vpnNetwork string) error {
+	if x == nil {
+		return fmt.Errorf("eBPF program not loaded")
+	}
+	return fmt.Errorf("eBPF not compiled. Run: go generate ./vpn/ebpf")
+}
+
 // SetVPNGateway sets the VPN gateway IP for the XDP program
 func (x *XDPProgram) SetVPNGateway(gatewayIP net.IP) error {
 	if x == nil {
@@ -165,9 +173,15 @@ func (x *XDPProgram) IsIPBlocked(ip net.IP) (bool, uint64, error) {
 	return false, 0, fmt.Errorf("eBPF not compiled. Run: go generate ./vpn/ebpf")
 }
 
+// VerifySharedMapValues verifies that shared maps contain expected values
+// Stub implementation when eBPF is not compiled
+func VerifySharedMapValues() error {
+	return fmt.Errorf("eBPF not compiled. Run: go generate ./vpn/ebpf")
+}
+
 // RateLimitConfig represents the rate limit and DDoS protection configuration
 type RateLimitConfig struct {
-	EnableRateLimit      uint8  // 0 = disabled, 1 = enabled
+	EnableRateLimit      uint8 // 0 = disabled, 1 = enabled
 	_                    [7]byte
 	RateLimitPerIP       uint64 // Packets per second per IP
 	EnableDDoSProtection uint8  // 0 = disabled, 1 = enabled
@@ -207,3 +221,4 @@ type xdpObjects struct{}
 func (x *xdpObjects) Close() error {
 	return nil
 }
+

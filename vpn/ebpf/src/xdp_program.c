@@ -4,6 +4,7 @@
 #include <linux/in.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
+#include <linux/icmp.h>
 #include <linux/netdevice.h>
 
 // Include bpf helpers
@@ -22,6 +23,33 @@
 #ifndef __u8
 #define __u8 unsigned char
 #endif
+
+// Define __wsum type (checksum type used by kernel)
+#ifndef __wsum
+typedef __u32 __wsum;
+#endif
+
+#ifndef __sum16
+typedef __u16 __sum16;
+#endif
+
+static __always_inline __sum16 csum_fold(__wsum csum)
+{
+    csum = (csum & 0xffff) + (csum >> 16);
+    csum = (csum & 0xffff) + (csum >> 16);
+    return (__sum16)~csum;
+}
+
+static __always_inline __wsum csum_unfold(__sum16 csum)
+{
+    return (__wsum)csum;
+}
+
+static __always_inline __wsum csum_add(__wsum csum, __wsum addend)
+{
+    csum += addend;
+    return csum + (csum < addend);
+}
 
 // Define macro for compatibility
 #ifndef __uint
@@ -43,6 +71,24 @@
 #define HOOK_FORWARD         2
 #define HOOK_INPUT           3
 #define HOOK_OUTPUT          4
+
+// XDP stats keys
+#define XDP_STAT_TOTAL_PACKETS    0
+#define XDP_STAT_DROPPED_PACKETS  1
+#define XDP_STAT_RATE_LIMIT_DROP  2
+#define XDP_STAT_DDOS_DROP        3
+#define XDP_STAT_BLOCKED_IP_DROP  4
+#define XDP_STAT_DNAT_LOOKUP_HIT  5
+#define XDP_STAT_DNAT_LOOKUP_MISS 6
+#define XDP_STAT_DNAT_TARGET_EGRESS 7  // Packets targeting egress IP (potential DNAT candidates)
+#define XDP_STAT_VPN_NETWORK_DST 8     // Packets with VPN network destination (debug)
+#define XDP_STAT_VPN_CLIENT_SRC 9      // Packets from VPN client (debug)
+#define XDP_STAT_SERVER_VPN_IP_DST 10  // Packets to server VPN IP (debug)
+#define XDP_STAT_EARLY_TCP_CONTROL 11   // TCP control packets (SYN/FIN/RST) - early return
+#define XDP_STAT_EARLY_TCP_443 12       // TCP packets to port 443/8443 - early return
+#define XDP_STAT_EARLY_VPN_INTERNAL 13  // VPN internal traffic (both src and dst VPN) - early return
+#define XDP_STAT_DEBUG_DST_IP 14        // Debug: First few destination IPs (for diagnosis)
+#define XDP_STAT_DEBUG_EGRESS_IP 15     // Debug: Egress IP from map (for comparison)
 
 // Flags layout (2 bits per field to carry match type):
 // bits 0-1: src IP match type, 2-3: dst IP match type, 4-5: src port, 6-7: dst port
@@ -70,28 +116,39 @@ struct policy_entry {
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 1024);
-    __type(key, __u32);      // VPN IP
-    __type(value, __u32);    // Real client IP
+    __type(key, __u32);
+    __type(value, __u32);
 } vpn_clients SEC(".maps");
 
-// Map to store server egress IP for NAT masquerading
-// Key: 0 (single entry), Value: server egress IP in network byte order
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 1);
     __type(key, __u32);
-    __type(value, __u32);    // Server egress IP for NAT
+    __type(value, __u32);
 } server_egress_ip SEC(".maps");
 
-// Map to store VPN network configuration
-// key 0: VPN network address (e.g., 10.8.0.0)
-// key 1: VPN network mask (e.g., 0xFFFFFF00 for /24)
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 2);
     __type(key, __u32);
     __type(value, __u32);
 } vpn_network_config SEC(".maps");
+
+struct nat_conn_key {
+    __u32 src_ip;
+    __u32 dst_ip;
+    __u16 sport;
+    __u16 dport;
+    __u8  protocol;
+    __u8  pad[3];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct nat_conn_key);
+    __type(value, __u32);
+} nat_conn_track SEC(".maps");
 
 // Map to store policy chain status (optimization: check if chain is empty)
 // key: hook_point, value: 0 = empty/no policies, 1 = has policies
@@ -132,7 +189,7 @@ struct {
 // Statistics map (per-CPU)
 struct {
     __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-    __uint(max_entries, 10);
+    __uint(max_entries, 16);  // Increased to support debug stats (keys 0-15)
     __type(key, __u32);
     __type(value, __u64);
 } stats SEC(".maps");
@@ -291,8 +348,9 @@ static __always_inline int execute_policy_chain(__u32 hook_point, struct iphdr *
         return 0;  // No policy matched, allow by default
     }
     
-    // Iterate through policies in the chain (index from 0 to 63)
-    for (__u32 i = 0; i < 64; i++) {
+    // Iterate through policies in the chain (index from 0 to 15)
+    // Reduced from 64 to 15 to reduce program size
+    for (__u32 i = 0; i < 16; i++) {
         // Create composite key for the hash map
         struct {
             __u32 hook_point;
@@ -367,46 +425,10 @@ static __always_inline int execute_policy_chain(__u32 hook_point, struct iphdr *
         
         // If policy matches, execute action
         if (match) {
-            // Update statistics
-            __u64 *count = bpf_map_lookup_elem(&policy_stats, policy_id);
-            if (count) {
-                (*count)++;
-            }
-            
-            // Record policy event for audit logging (both ALLOW and DENY)
-            struct policy_event event = {
-                .policy_id = *policy_id,
-                .action = policy->action,
-                .src_ip = ip->saddr,
-                .dst_ip = ip->daddr,
-                .src_port = 0,
-                .dst_port = 0,
-                .protocol = ip->protocol,
-                .timestamp = bpf_ktime_get_ns() / 1000000, // Convert to milliseconds
-            };
-            
-            // Extract ports if TCP/UDP
-            if (ip->protocol == IPPROTO_TCP || ip->protocol == IPPROTO_UDP) {
-                if ((void *)(ip + 1) <= data_end) {
-                    if (ip->protocol == IPPROTO_TCP) {
-                        struct tcphdr *tcp = (struct tcphdr *)(ip + 1);
-                        if ((void *)(tcp + 1) <= data_end) {
-                            event.src_port = bpf_ntohs(tcp->source);
-                            event.dst_port = bpf_ntohs(tcp->dest);
-                        }
-                    } else if (ip->protocol == IPPROTO_UDP) {
-                        struct udphdr *udp = (struct udphdr *)(ip + 1);
-                        if ((void *)(udp + 1) <= data_end) {
-                            event.src_port = bpf_ntohs(udp->source);
-                            event.dst_port = bpf_ntohs(udp->dest);
-                        }
-                    }
-                }
-            }
-            
-            // Push to queue (non-blocking, may fail if queue is full)
-            // Use 0 (BPF_ANY) to push to tail
-            bpf_map_push_elem(&policy_events, &event, 0);
+            // OPTIMIZATION: Skip statistics update to reduce program size
+            // Statistics can be tracked in user space if needed
+            // __u64 *count = bpf_map_lookup_elem(&policy_stats, policy_id);
+            // if (count) (*count)++;
             
             *action = policy->action;
             return 1;  // Policy matched
@@ -691,6 +713,12 @@ int xdp_vpn_forward(struct xdp_md *ctx)
     __u64 *value;
     __u32 action = POLICY_ACTION_ALLOW;
     
+    // Update total packets counter (always count, even if we return early)
+    key = XDP_STAT_TOTAL_PACKETS;
+    value = bpf_map_lookup_elem(&stats, &key);
+    if (value)
+        (*value)++;
+    
     // Basic bounds checking - early exit for invalid packets
     if ((void *)(eth + 1) > data_end)
         return XDP_PASS;
@@ -727,6 +755,11 @@ int xdp_vpn_forward(struct xdp_md *ctx)
         // TCP flags: FIN (bit 0), SYN (bit 1), RST (bit 2)
         // These are critical control packets that must not be dropped
         if (tcp->fin || tcp->rst || tcp->syn) {
+            // Debug: Count TCP control packets
+            key = XDP_STAT_EARLY_TCP_CONTROL;
+            value = bpf_map_lookup_elem(&stats, &key);
+            if (value)
+                (*value)++;
             // TCP control packet - always pass to maintain connection state
             // This prevents connection state desynchronization that can cause RST storms
             return XDP_PASS;
@@ -780,59 +813,87 @@ int xdp_vpn_forward(struct xdp_md *ctx)
         //
         // Note: We use bpf_ntohs() to safely read port numbers without modifying packet data
         // This is a read-only operation that does not affect packet integrity
-        __u16 src_port = bpf_ntohs(tcp->source);
         __u16 dst_port = bpf_ntohs(tcp->dest);
-        if (src_port == 443 || dst_port == 443 || src_port == 8443 || dst_port == 8443) {
-            // TLS/HTTPS packet - bypass network-layer security checks (blocked IP, rate limit, DDoS)
-            // Policy checks for VPN client traffic are NOT affected (they happen in user space)
-            // This ensures VPN connections can be established reliably without interfering with TLS handshake
-            // Note: This is a read-only check, packet data is not modified
+        // IMPORTANT:
+        // Only bypass packets targeting local VPN service ports.
+        // Do NOT bypass packets with src_port=443/8443, otherwise return traffic
+        // from external HTTPS servers skips DNAT lookup and VPN clients can't access Internet.
+        // Packets targeting local VPN service ports are control-plane traffic.
+        // Return packets for SNAT sessions target client ephemeral ports, not 443/8443.
+        if (dst_port == 443 || dst_port == 8443) {
+            // Debug: Count TCP packets to port 443/8443
+            key = XDP_STAT_EARLY_TCP_443;
+            value = bpf_map_lookup_elem(&stats, &key);
+            if (value)
+                (*value)++;
+            // Traffic to local VPN control plane - bypass early network-layer checks.
             return XDP_PASS;
         }
     }
     
+    __u32 src_addr_host = bpf_ntohl(ip->saddr);
+    __u32 dst_addr_host = bpf_ntohl(ip->daddr);
+
     // Fast path: VPN网络内部流量不应该到达eth0，如果到达了，直接PASS让内核处理
-    if (is_vpn_network(ip->saddr) && is_vpn_network(ip->daddr)) {
+    if (is_vpn_network(src_addr_host) && is_vpn_network(dst_addr_host)) {
+        // Debug: Count VPN internal traffic
+        key = XDP_STAT_EARLY_VPN_INTERNAL;
+        value = bpf_map_lookup_elem(&stats, &key);
+        if (value)
+            (*value)++;
         // VPN内部流量，应该由zvpn0处理，不应该到达eth0
         // 如果到达了，可能是路由配置问题，直接PASS（不统计）
         return XDP_PASS;
     }
     
-    // Security checks: blocked IPs (bruteforce protection), rate limiting, and DDoS protection
-    // Check blocked IPs first (highest priority - kernel-level blocking)
-    // Note: TCP control packets are already handled above, so blocked IPs won't affect them
-    if (!check_blocked_ip(ip->saddr)) {
-        key = 4; // Blocked IP stat (bruteforce protection)
-        value = bpf_map_lookup_elem(&stats, &key);
-        if (value)
-            (*value)++;
-        return XDP_DROP;
-    }
-    
-    // Check rate limit for source IP
-    if (!check_rate_limit(ip->saddr)) {
-        key = 2; // Rate limit exceeded stat
-        value = bpf_map_lookup_elem(&stats, &key);
-        if (value)
-            (*value)++;
-        return XDP_DROP;
-    }
-    
-    // Check DDoS protection for source IP
-    if (!check_ddos_protection(ip->saddr)) {
-        key = 3; // DDoS blocked stat
-        value = bpf_map_lookup_elem(&stats, &key);
-        if (value)
-            (*value)++;
-        return XDP_DROP;
+ 
+    key = 0;
+    __u32 *server_public_ip_early = bpf_map_lookup_elem(&server_egress_ip, &key);
+    // Convert packet daddr to host byte order for map-key comparison.
+    __u32 pkt_daddr_early = bpf_ntohl(ip->daddr);
+    int is_potential_dnat_return = (server_public_ip_early &&
+                                    *server_public_ip_early != 0 &&
+                                    pkt_daddr_early == *server_public_ip_early);
+    if (!is_potential_dnat_return) {
+        // Check blocked IPs first (highest priority - kernel-level blocking)
+        if (!check_blocked_ip(src_addr_host)) {
+            key = 4; // Blocked IP stat (bruteforce protection)
+            value = bpf_map_lookup_elem(&stats, &key);
+            if (value)
+                (*value)++;
+            return XDP_DROP;
+        }
+
+        // Check rate limit for source IP
+        if (!check_rate_limit(src_addr_host)) {
+            key = 2; // Rate limit exceeded stat
+            value = bpf_map_lookup_elem(&stats, &key);
+            if (value)
+                (*value)++;
+            return XDP_DROP;
+        }
+
+        // Check DDoS protection for source IP
+        if (!check_ddos_protection(src_addr_host)) {
+            key = 3; // DDoS blocked stat
+            value = bpf_map_lookup_elem(&stats, &key);
+            if (value)
+                (*value)++;
+            return XDP_DROP;
+        }
     }
     
     // OPTIMIZATION: Check if this is a packet from a VPN client accessing external network
     // This check is done early to optimize VPN client traffic handling
-    __u32 vpn_ip = ip->saddr;
+    __u32 vpn_ip = src_addr_host;
     __u32 *client_ip = bpf_map_lookup_elem(&vpn_clients, &vpn_ip);
     
     if (client_ip) {
+        // Debug: Count packets from VPN client
+        key = XDP_STAT_VPN_CLIENT_SRC;
+        value = bpf_map_lookup_elem(&stats, &key);
+        if (value)
+            (*value)++;
         // VPN客户端访问外部网络 - 更新统计（只统计VPN相关流量）
         key = 0;
         value = bpf_map_lookup_elem(&stats, &key);
@@ -883,7 +944,13 @@ int xdp_vpn_forward(struct xdp_md *ctx)
     if (vpn_net) {
         server_vpn_ip = *vpn_net + 1; // First IP in VPN network
     }
-    if (ip->daddr == server_vpn_ip) {
+    if (dst_addr_host == server_vpn_ip) {
+        // Debug: Count packets to server VPN IP
+        key = XDP_STAT_SERVER_VPN_IP_DST;
+        value = bpf_map_lookup_elem(&stats, &key);
+        if (value)
+            (*value)++;
+        
         // 外部访问服务器VPN IP - 更新统计（只统计VPN相关流量）
         key = 0;
         value = bpf_map_lookup_elem(&stats, &key);
@@ -907,7 +974,12 @@ int xdp_vpn_forward(struct xdp_md *ctx)
     
     // OPTIMIZATION: Check if destination is VPN network (external -> VPN client)
     // This check is done early to optimize VPN network traffic handling
-    if (is_vpn_network(ip->daddr)) {
+    if (is_vpn_network(dst_addr_host)) {
+        // Debug: Count packets with VPN network destination
+        key = XDP_STAT_VPN_NETWORK_DST;
+        value = bpf_map_lookup_elem(&stats, &key);
+        if (value)
+            (*value)++;
         // 外部访问VPN网络 - 更新统计（只统计VPN相关流量）
         key = 0;
         value = bpf_map_lookup_elem(&stats, &key);
@@ -945,22 +1017,171 @@ int xdp_vpn_forward(struct xdp_md *ctx)
         return XDP_PASS;
     }
     
-    // CRITICAL: Check if destination is server's public IP (egress IP)
-    // External clients connect to server's public IP (e.g., 172.21.0.3) to establish VPN connections
-    // These connections should ALWAYS be allowed, regardless of policy rules
-    // This prevents eBPF from blocking VPN server connections
-    // OPTIMIZATION: Check server public IP early to avoid unnecessary policy checks
     key = 0;
     __u32 *server_public_ip = bpf_map_lookup_elem(&server_egress_ip, &key);
-    if (server_public_ip && *server_public_ip != 0 && ip->daddr == *server_public_ip) {
-        // External client connecting to server's public IP - always allow
-        // This is necessary for VPN clients to establish connections
-        // Update statistics
+    // Convert packet addresses to host byte order for map-key comparison.
+    // TC/XDP map keys are compared as __u32 integers in host representation.
+    __u32 pkt_saddr = bpf_ntohl(ip->saddr);
+    __u32 pkt_daddr = bpf_ntohl(ip->daddr);
+    
+    // Debug: Store destination IPs for comparison
+    // Always update to show the latest destination IP (helps diagnose routing issues)
+    key = XDP_STAT_DEBUG_DST_IP;
+    __u64 dst_ip_value = (__u64)pkt_daddr;
+    bpf_map_update_elem(&stats, &key, &dst_ip_value, BPF_ANY);
+    
+    // Store egress IP from map (if available and not set yet)
+    if (server_public_ip && *server_public_ip != 0) {
+        key = XDP_STAT_DEBUG_EGRESS_IP;
+        __u64 *existing_egress_ip = bpf_map_lookup_elem(&stats, &key);
+        if (!existing_egress_ip || *existing_egress_ip == 0) {
+            __u64 egress_ip_value = (__u64)(*server_public_ip);
+            bpf_map_update_elem(&stats, &key, &egress_ip_value, BPF_ANY);
+        }
+    }
+    
+    // Debug: Check if destination IP is VPN network (this might explain why targetEgressIP=0)
+    if (is_vpn_network(pkt_daddr)) {
+        // This is a packet targeting VPN network - it won't match egress IP
+        // This is expected for return traffic if routing sends it to VPN network
+        // But we should still check if it's a DNAT candidate
+    }
+    
+    // Debug: Count packets targeting egress IP (host-order integer compare)
+    if (server_public_ip && *server_public_ip != 0) {
+        // Debug: Log comparison result for first few packets
+        if (pkt_daddr == *server_public_ip) {
+            key = XDP_STAT_DNAT_TARGET_EGRESS;
+            value = bpf_map_lookup_elem(&stats, &key);
+            if (value)
+                (*value)++;
+            key = 0;  // Reset key for lookup
+        }
+    }
+    
+    if (server_public_ip && *server_public_ip != 0 && pkt_daddr == *server_public_ip) {
+        struct nat_conn_key conn_key = {0};
+        __u16 sport = 0;
+        __u16 dport = 0;
+        __u32 ip_hlen = (__u32)(ip->ihl * 4);
+        __u32 l4_off = sizeof(struct ethhdr) + ip_hlen;
+        int found_nat = 0;
+        
+        if (ip->protocol == IPPROTO_TCP || ip->protocol == IPPROTO_UDP) {
+            void *l4_hdr = (void *)ip + ip_hlen;
+            if ((void *)l4_hdr + sizeof(__u16) * 2 <= data_end) {
+                if (ip->protocol == IPPROTO_TCP) {
+                    struct tcphdr *tcp = (struct tcphdr *)l4_hdr;
+                    if ((void *)(tcp + 1) <= data_end && (void *)tcp + sizeof(struct tcphdr) <= data_end) {
+                        sport = bpf_ntohs(tcp->source);
+                        dport = bpf_ntohs(tcp->dest);
+                        found_nat = 1;
+                    }
+                } else {
+                    struct udphdr *udp = (struct udphdr *)l4_hdr;
+                    if ((void *)udp + sizeof(__u16) * 2 <= data_end) {
+                        sport = bpf_ntohs(udp->source);
+                        dport = bpf_ntohs(udp->dest);
+                        found_nat = 1;
+                    }
+                }
+                
+                if (found_nat) {
+                    // Skip VPN control-plane traffic to local service ports.
+                    // Return packets for SNAT sessions should target client ephemeral ports.
+                    if (dport == 443 || dport == 8443) {
+                        return XDP_PASS;
+                    }
+
+                    // CRITICAL: Use network byte order for IPs to match TC NAT connection tracking
+                    conn_key.src_ip = *server_public_ip;  // Network byte order (from map)
+                    conn_key.dst_ip = pkt_saddr;  // Network byte order (from packet)
+                    // Return packet: sport=external_server_port, dport=VPN_client_port
+                    // Lookup key should match record: sport=external_server_port, dport=VPN_client_port
+                    conn_key.sport = sport;  // External server port (return packet's sport)
+                    conn_key.dport = dport;  // VPN client port (return packet's dport)
+                    conn_key.protocol = ip->protocol;
+                    
+                    __u32 *vpn_client_ip = bpf_map_lookup_elem(&nat_conn_track, &conn_key);
+                    if (vpn_client_ip && *vpn_client_ip != 0) {
+                        key = XDP_STAT_DNAT_LOOKUP_HIT;
+                        value = bpf_map_lookup_elem(&stats, &key);
+                        if (value)
+                            (*value)++;
+                        // vpn_client_ip from map is host-order key representation.
+                        // Convert to network byte order before writing packet header.
+                        __be32 old_daddr_be = ip->daddr;
+                        __be32 new_daddr_be = bpf_htonl(*vpn_client_ip);
+
+                        ip->daddr = new_daddr_be;
+
+                        __wsum csum_diff = (__wsum)bpf_csum_diff((__be32 *)&old_daddr_be, 4, (__be32 *)&new_daddr_be, 4, 0);
+                        if ((void *)(ip + 1) <= data_end) {
+                            ip->check = csum_fold(csum_add(csum_diff, ~csum_unfold(ip->check)));
+                        }
+                        
+                        if (ip->protocol == IPPROTO_TCP || ip->protocol == IPPROTO_UDP) {
+                            void *l4_hdr = (void *)ip + ip_hlen;
+                            if (ip->protocol == IPPROTO_TCP) {
+                                struct tcphdr *tcp = (struct tcphdr *)l4_hdr;
+                                if ((void *)(tcp + 1) <= data_end && (void *)tcp + sizeof(struct tcphdr) <= data_end) {
+                                    tcp->check = csum_fold(csum_add(csum_diff, ~csum_unfold(tcp->check)));
+                                }
+                            } else {
+                                struct udphdr *udp = (struct udphdr *)l4_hdr;
+                                if ((void *)udp + offsetof(struct udphdr, check) + sizeof(__u16) <= data_end) {
+                                    if (udp->check != 0) {
+                                        udp->check = csum_fold(csum_add(csum_diff, ~csum_unfold(udp->check)));
+                                    }
+                                }
+                            }
+                        }
+                        
+                        return XDP_PASS;
+                    }
+                    key = XDP_STAT_DNAT_LOOKUP_MISS;
+                    value = bpf_map_lookup_elem(&stats, &key);
+                    if (value)
+                        (*value)++;
+                }
+            }
+        } else if (ip->protocol == IPPROTO_ICMP) {
+            // CRITICAL: Use network byte order for IPs to match TC NAT connection tracking
+            conn_key.src_ip = *server_public_ip;  // Network byte order (from map)
+            conn_key.dst_ip = pkt_saddr;  // Network byte order (from packet)
+            conn_key.sport = 0;
+            conn_key.dport = 0;
+            conn_key.protocol = IPPROTO_ICMP;
+            
+            __u32 *vpn_client_ip = bpf_map_lookup_elem(&nat_conn_track, &conn_key);
+            if (vpn_client_ip && *vpn_client_ip != 0) {
+                key = XDP_STAT_DNAT_LOOKUP_HIT;
+                value = bpf_map_lookup_elem(&stats, &key);
+                if (value)
+                    (*value)++;
+                // CRITICAL: vpn_client_ip from map is already in network byte order (stored by TC NAT)
+                // ip->daddr is __be32 (network byte order), so no conversion needed
+                __be32 old_daddr_be = ip->daddr;
+                __be32 new_daddr_be = *(__be32 *)vpn_client_ip;  // Cast to __be32, already network byte order
+
+                ip->daddr = new_daddr_be;
+
+                __wsum csum_diff = (__wsum)bpf_csum_diff((__be32 *)&old_daddr_be, 4, (__be32 *)&new_daddr_be, 4, 0);
+                if ((void *)(ip + 1) <= data_end) {
+                    ip->check = csum_fold(csum_add(csum_diff, ~csum_unfold(ip->check)));
+                }
+                return XDP_PASS;
+            }
+            key = XDP_STAT_DNAT_LOOKUP_MISS;
+            value = bpf_map_lookup_elem(&stats, &key);
+            if (value)
+                (*value)++;
+        }
+        
         key = 0;
         value = bpf_map_lookup_elem(&stats, &key);
         if (value)
             (*value)++;
-        // Directly PASS to kernel - no policy check needed (fast path)
         return XDP_PASS;
     }
     
@@ -997,4 +1218,5 @@ int xdp_vpn_forward(struct xdp_md *ctx)
 }
 
 char _license[] SEC("license") = "GPL";
+
 

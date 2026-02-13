@@ -4,37 +4,48 @@
 #include <linux/in.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
-#include <linux/netdevice.h>
+#include <linux/icmp.h>
 #include <linux/pkt_cls.h>
 
 // Include bpf helpers
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_endian.h>
 
-// Define types for compatibility
-#ifndef __u32
-#define __u32 unsigned int
+// Define __wsum type (checksum type used by kernel)
+#ifndef __wsum
+typedef __u32 __wsum;
 #endif
 
-#ifndef __u16
-#define __u16 unsigned short
-#endif
+// Constants
+#define TC_ACT_OK 0
+#define ETH_P_IP 0x0800
+#define STAT_KEY_TOTAL_PACKETS 4
+#define STAT_KEY_VPN_CHECK_PASSED 1
+#define STAT_KEY_CLIENT_FOUND 2
+#define STAT_KEY_EGRESS_IP_FOUND 3
+#define STAT_KEY_NAT_PERFORMED 0
+#define STAT_KEY_NAT_FAILED 5
+#define STAT_KEY_SKIP_ALREADY_EGRESS 6
+#define STAT_KEY_SHOULD_NOT_NAT 7
+#define STAT_KEY_NO_VPN_CONFIG 8
+#define STAT_KEY_NO_EGRESS_IP 9
+#define STAT_KEY_SRC_IS_VPN 10
+#define STAT_KEY_DST_IS_VPN 11
+#define STAT_KEY_SRC_IS_EGRESS 12
+#define STAT_KEY_DEBUG_SRC_IP 20
+#define STAT_KEY_DEBUG_VPN_NET 21
+#define STAT_KEY_DEBUG_VPN_MASK 22
+#define STAT_KEY_DEBUG_DST_IP 26
+#define STAT_KEY_DEBUG_COMPARE_RESULT 24
 
-#ifndef __u8
-#define __u8 unsigned char
-#endif
-
-// Map to store server egress IP for NAT masquerading
+// Maps
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 1);
     __type(key, __u32);
-    __type(value, __u32);    // Server egress IP for NAT
+    __type(value, __u32);
 } server_egress_ip SEC(".maps");
 
-// Map to store VPN network configuration
-// key 0: VPN network address (e.g., 10.8.0.0)
-// key 1: VPN network mask (e.g., 0xFFFFFF00 for /24)
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 2);
@@ -42,351 +53,499 @@ struct {
     __type(value, __u32);
 } vpn_network_config SEC(".maps");
 
-// Map to store VPN client IP to real IP mapping
 struct {
     __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 1024);
-    __type(key, __u32);      // VPN IP
-    __type(value, __u32);    // Real client IP (not used for NAT, but for reference)
+    __type(key, __u32);
+    __type(value, __u32);
 } vpn_clients SEC(".maps");
 
-// Statistics map to track NAT operations
-// key 0: NAT performed count
-// key 1: VPN network check passed count
-// key 2: VPN client found count
-// key 3: Egress IP found count
+struct nat_conn_key {
+    __u32 src_ip;
+    __u32 dst_ip;
+    __u16 sport;
+    __u16 dport;
+    __u8  protocol;
+    __u8  pad[3];
+};
+
+struct {
+    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(max_entries, 65536);
+    __type(key, struct nat_conn_key);
+    __type(value, __u32);
+} nat_conn_track SEC(".maps");
+
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
-    __uint(max_entries, 10);
+    __uint(max_entries, 30);
     __type(key, __u32);
     __type(value, __u64);
 } nat_stats SEC(".maps");
 
-// Helper function to recalculate IP checksum after modifying IP header
-// IP header fields are in network byte order, so we sum them directly
-static __always_inline void recalculate_ip_checksum(struct iphdr *ip, void *data_end) {
-    // Bounds check: ensure we can access the IP header
-    if ((void *)ip + sizeof(struct iphdr) > data_end) {
-        return; // Cannot access IP header
+// Helper structures for checksum update (similar to reference project)
+struct l3_fields {
+    __u32 saddr;
+    __u32 daddr;
+};
+
+struct l4_fields {
+    __u16 sport;
+    __u16 dport;
+};
+
+// Helper function to update statistics
+static __always_inline void update_stat(__u32 key) {
+    __u64 *value = bpf_map_lookup_elem(&nat_stats, &key);
+    if (value) {
+        (*value)++;
+    }
+}
+
+// Check if IP is in VPN network
+static __always_inline int is_ip_in_vpn_network(__u32 ip, __u32 vpn_net, __u32 vpn_mask) {
+    return (ip & vpn_mask) == vpn_net;
+}
+
+// Parse and validate packet headers
+static __always_inline int parse_packet_headers(struct __sk_buff *skb,
+                                                void **data_end,
+                                                struct ethhdr **eth,
+                                                struct iphdr **ip,
+                                                __u32 *ip_hlen) {
+    void *data = (void *)(long)skb->data;
+    *data_end = (void *)(long)skb->data_end;
+    
+    // Check minimum packet size for Ethernet header
+    if (data + sizeof(struct ethhdr) > *data_end) {
+        return -1;
+    }
+    
+    *eth = (struct ethhdr *)data;
+    
+    // Bounds check for Ethernet header
+    if ((void *)(*eth + 1) > *data_end) {
+        return -1;
+    }
+    
+    // Only process IPv4 packets
+    if ((*eth)->h_proto != bpf_htons(ETH_P_IP)) {
+        return -1;
+    }
+    
+    // Get IP header
+    *ip = (struct iphdr *)(*eth + 1);
+    
+    // Bounds check for IP header
+    if ((void *)(*ip + 1) > *data_end) {
+        return -1;
+    }
+    
+    // Validate IP version
+    if ((*ip)->version != 4) {
+        return -1;
     }
     
     // Validate IP header length
-    __u8 ihl = ip->ihl;
-    if (ihl < 5 || ihl > 15) {
-        return; // Invalid IP header length
+    if ((*ip)->ihl < 5 || (*ip)->ihl > 15) {
+        return -1;
     }
     
-    // Ensure we can access the full IP header (including options)
-    __u32 ip_header_len = ihl * 4;
-    if ((void *)ip + ip_header_len > data_end) {
-        return; // Cannot access full IP header
+    *ip_hlen = (__u32)((*ip)->ihl * 4);
+    
+    // Ensure full IP header is accessible
+    if ((void *)*ip + *ip_hlen > *data_end) {
+        return -1;
     }
     
-    ip->check = 0;
-    __u32 sum = 0;
-    
-    // Sum all 16-bit words in IP header (IP header length is in 4-byte units)
-    // Access fields directly to help verifier understand bounds
-    // NOTE: IP header fields are already in network byte order, so we sum them directly
-    // without byte order conversion. The checksum calculation works correctly with
-    // network byte order data.
-    __u16 *ptr = (__u16 *)ip;
-    __u16 num_words = ip_header_len / 2;
-    
-    // Bounded loop with explicit checks for each access
-    // Max 15 * 4 / 2 = 30 words, but we check bounds for each access
-    for (int i = 0; i < num_words && i < 30; i++) {
-        __u16 *word_ptr = ptr + i;
-        // Bounds check: ensure we can access this word
-        if ((void *)(word_ptr + 1) <= data_end) {
-            // Sum directly without byte order conversion - IP header is network byte order
-            sum += *word_ptr;
-        }
-    }
-    
-    // Fold 32-bit sum to 16-bit
-    while (sum >> 16) {
-        sum = (sum & 0xFFFF) + (sum >> 16);
-    }
-    
-    // Take one's complement and store in network byte order
-    ip->check = ~((__u16)sum);
+    return 0;
 }
 
-// Helper function to recalculate transport layer checksum
-// Note: For eth0, IP header is after Ethernet header
-static __always_inline void recalculate_transport_checksum(struct iphdr *ip, void *data_end) {
-    __u8 protocol = ip->protocol;
-    __u16 ip_header_len = ip->ihl * 4;
-    void *transport_start = (void *)ip + ip_header_len;
+// Update L3 and L4 checksums (similar to reference project approach)
+static __always_inline int update_checksums(struct __sk_buff *skb,
+                                             __u32 eth_hlen,
+                                             __u32 ip_hlen,
+                                             struct l3_fields *l3_original,
+                                             struct l3_fields *l3_new,
+                                             struct l4_fields *l4_original,
+                                             struct l4_fields *l4_new,
+                                             __u8 protocol) {
+    __u32 l3_off = eth_hlen;
+    __u32 l4_off = eth_hlen + ip_hlen;
     
-    if (transport_start + 8 > data_end) {
-        return; // Not enough data for transport header
+    // Calculate checksum differences
+    __u64 l3sum = bpf_csum_diff((__u32 *)l3_original, sizeof(*l3_original),
+                                 (__u32 *)l3_new, sizeof(*l3_new), 0);
+    
+    __u64 l4sum = bpf_csum_diff((__u32 *)l4_original, sizeof(*l4_original),
+                                 (__u32 *)l4_new, sizeof(*l4_new), l3sum);
+    
+    // Update L3 checksum
+    __u32 l3_check_off = l3_off + offsetof(struct iphdr, check);
+    if (bpf_l3_csum_replace(skb, l3_check_off, 0, (__u32)l3sum, 0) < 0) {
+        return -1;
     }
     
-    if (protocol == IPPROTO_TCP) {
-        struct tcphdr *tcp = (struct tcphdr *)transport_start;
-        if ((void *)tcp + sizeof(struct tcphdr) > data_end) {
-            return;
+    // Update L4 checksum (for TCP/UDP)
+    if (protocol == IPPROTO_TCP || protocol == IPPROTO_UDP) {
+        __u32 l4_check_off;
+        if (protocol == IPPROTO_TCP) {
+            l4_check_off = l4_off + offsetof(struct tcphdr, check);
+        } else {
+            l4_check_off = l4_off + offsetof(struct udphdr, check);
         }
-        tcp->check = 0; // Let kernel recalculate
-    } else if (protocol == IPPROTO_UDP) {
-        struct udphdr *udp = (struct udphdr *)transport_start;
-        if ((void *)udp + sizeof(struct udphdr) > data_end) {
-            return;
+        
+        // For UDP, check if checksum is 0 (optional checksum) before updating
+        if (protocol == IPPROTO_UDP) {
+            __u16 current_csum = 0;
+            if (bpf_skb_load_bytes(skb, l4_check_off, &current_csum, sizeof(__u16)) == 0) {
+                if (current_csum == 0) {
+                    return 0; // UDP with no checksum, skip L4 update
+                }
+            }
         }
-        udp->check = 0; // Let kernel recalculate (0 means kernel should calculate)
-    } else if (protocol == IPPROTO_ICMP) {
-        // ICMP checksum is at offset 2
-        __u16 *icmp_check = (__u16 *)((void *)transport_start + 2);
-        if ((void *)icmp_check + 2 > data_end) {
-            return;
+        
+        // Update L4 checksum (bpf_l4_csum_replace will check bounds internally)
+        if (bpf_l4_csum_replace(skb, l4_check_off, 0, (__u32)l4sum, BPF_F_PSEUDO_HDR) < 0) {
+            // Fallback: set checksum to 0 for UDP if update fails
+            if (protocol == IPPROTO_UDP) {
+                __u16 zero = 0;
+                bpf_skb_store_bytes(skb, l4_check_off, &zero, sizeof(__u16), 0);
+            } else {
+                return -1; // TCP checksum update failed
+            }
         }
-        *icmp_check = 0; // Let kernel recalculate
     }
+    
+    return 0;
 }
 
-// Check if IP is in VPN network (read from eBPF map)
-static __always_inline int is_vpn_network(__u32 ip) {
-    // Read VPN network address from map (key 0)
-    __u32 key = 0;
-    __u32 *vpn_net = bpf_map_lookup_elem(&vpn_network_config, &key);
-    if (!vpn_net) {
-        // Fallback to default 10.8.0.0/24 if map not configured
-    return (ip & 0xFFFFFF00) == 0x0A080000;
-    }
+// Record connection tracking entry
+// Key represents the RETURN packet characteristics for DNAT lookup
+// Return packet: src_ip=external_server, dst_ip=egress_ip, sport=external_port, dport=client_port
+// So key should be: src_ip=egress_ip, dst_ip=external_server, sport=client_port, dport=external_port
+static __always_inline void record_connection_tracking(__u32 new_src_ip,
+                                                       __u32 dst_ip,
+                                                       __u16 sport,
+                                                       __u16 dport,
+                                                       __u8 protocol,
+                                                       __u32 original_src_ip) {
+    struct nat_conn_key conn_key = {0};
+    // Key represents return packet: src_ip=egress_ip, dst_ip=external_server
+    conn_key.src_ip = new_src_ip;  // egress IP (return packet's dst_ip)
+    conn_key.dst_ip = dst_ip;      // external server IP (return packet's src_ip)
+    // Return packet ports: sport=external_port, dport=client_port
+    // Key should match return packet: sport=external_port, dport=client_port
+    // sport = External server port, dport = VPN client port
+    conn_key.sport = dport;  // External server port (original packet's dport)
+    conn_key.dport = sport;  // VPN client port (original packet's sport)
+    conn_key.protocol = protocol;
     
-    // Read VPN network mask from map (key 1)
-    key = 1;
-    __u32 *vpn_mask = bpf_map_lookup_elem(&vpn_network_config, &key);
-    if (!vpn_mask) {
-        // Fallback to default /24 mask if map not configured
-        return (ip & 0xFFFFFF00) == *vpn_net;
-    }
-    
-    // Check if IP is in VPN network
-    return (ip & *vpn_mask) == *vpn_net;
+    bpf_map_update_elem(&nat_conn_track, &conn_key, &original_src_ip, BPF_ANY);
 }
 
-// TC egress hook: Perform SNAT masquerading for packets from VPN clients to external networks
-// 
-// 架构说明：
-// TC 职责（eth0 egress）：
-// 1. SNAT MASQUERADE：将 VPN 客户端 IP 转换为服务器出口 IP
-// 2. 校验和重算：重新计算 IP 和传输层校验和
-// 3. 仅处理：VPN 客户端 → 外部网络的流量
-//
-// 为什么在 eth0 而不是 TUN 设备：
-// - TUN 设备是三层设备，数据包写入后内核会路由
-// - 如果目标是外部，内核会直接通过 eth0 发送
-// - TC hook 在 TUN egress 上可能无法拦截到这些数据包
-// - 在 eth0 egress 上可以拦截所有从 eth0 出去的流量
-//
-// TC 不处理：
-// - 策略检查（由 XDP eth0 ingress 处理）
-// - VPN 内部流量（不需要 NAT）
-// - 反向流量（由内核 conntrack 自动处理 DNAT）
-//
-// 注意：
-// - 使用 TCX_EGRESS attach type (kernel 5.19+)，回退到传统 TC clsact (kernel 4.1+)
-// - eth0 是物理网卡，数据包有以太网头
-// - 端口映射：当前实现只修改源 IP，不修改源端口（依赖客户端端口不同）
-// - 连接跟踪：依赖内核 conntrack 处理反向流量（确保 /proc/sys/net/netfilter/nf_conntrack_max > 0）
-SEC("tc")
-int tc_nat_egress(struct __sk_buff *skb) {
-    // Get interface index to verify we're on the right interface
-    __u32 ifindex = skb->ifindex;
-    
+// Main NAT processing function (similar to reference project approach)
+static __always_inline int perform_nat(struct __sk_buff *skb,
+                                       struct iphdr *ip,
+                                       __u32 ip_hlen,
+                                       __u32 eth_hlen,
+                                       __u32 new_saddr,
+                                       __u32 original_saddr,
+                                       __u8 protocol) {
     void *data = (void *)(long)skb->data;
     void *data_end = (void *)(long)skb->data_end;
+    __u32 l3_off = eth_hlen;
+    __u32 l4_off = eth_hlen + ip_hlen;
     
-    // Strict bounds checking - early exit for invalid packets
-    // Check minimum packet size (eth0 has Ethernet header)
-    if (data + sizeof(struct ethhdr) > data_end) {
-        return TC_ACT_OK; // Pass packet, too small for Ethernet header
+    // Load original L3 and L4 fields BEFORE modifying packet
+    struct l3_fields l3_original_fields = {0};
+    struct l3_fields l3_new_fields = {0};
+    struct l4_fields l4_original_fields = {0};
+    struct l4_fields l4_new_fields = {0};
+    
+    // Load original L3 fields (saddr and daddr)
+    if (bpf_skb_load_bytes(skb, l3_off + offsetof(struct iphdr, saddr),
+                           &l3_original_fields, sizeof(l3_original_fields)) < 0) {
+        return -1;
     }
     
-    // Skip Ethernet header (eth0 is Layer 2 device)
-    struct ethhdr *eth = (struct ethhdr *)data;
-    
-    // Bounds check: ensure we can access the entire Ethernet header
-    // This is required before accessing eth->h_proto (offset 12)
-    if ((void *)(eth + 1) > data_end) {
-        return TC_ACT_OK; // Cannot access Ethernet header fully
+    // Load original L4 fields (sport and dport) if TCP/UDP
+    if (protocol == IPPROTO_TCP || protocol == IPPROTO_UDP) {
+        // Use bpf_skb_load_bytes directly - it will check bounds internally
+        if (bpf_skb_load_bytes(skb, l4_off, &l4_original_fields,
+                               sizeof(l4_original_fields)) < 0) {
+            return -1;
+        }
     }
     
-    // Only process IPv4 packets - fast path for non-IP traffic
-    if (eth->h_proto != bpf_htons(ETH_P_IP)) {
-        return TC_ACT_OK; // Not IPv4, pass
+    // Prepare new fields (copy original, then modify)
+    l3_new_fields = l3_original_fields;
+    l3_new_fields.saddr = new_saddr;  // Update source IP for SNAT
+    
+    l4_new_fields = l4_original_fields;
+    // Note: We don't change ports here, only IP address
+    
+    // CRITICAL: Store IP address as bytes to ensure network byte order
+    // Convert __u32 (network byte order) to byte array for storage
+    __u8 new_saddr_bytes[4] = {
+        (new_saddr >> 24) & 0xFF,  // Most significant byte
+        (new_saddr >> 16) & 0xFF,
+        (new_saddr >> 8) & 0xFF,
+        new_saddr & 0xFF              // Least significant byte
+    };
+    
+    // Store updated source IP address as bytes (network byte order).
+    // IMPORTANT: Keep checksum update mode consistent.
+    // We do manual L3/L4 checksum updates below, so do NOT also request
+    // automatic recompute here, otherwise checksum may be adjusted twice.
+    if (bpf_skb_store_bytes(skb, l3_off + offsetof(struct iphdr, saddr),
+                           new_saddr_bytes, 4,
+                           0) < 0) {
+        return -1;
     }
     
-    // Get IP header (after Ethernet header)
-    struct iphdr *ip = (struct iphdr *)(eth + 1);
+    // Calculate checksum differences (must use saved original/new values)
+    __u64 l3sum = bpf_csum_diff((__u32 *)&l3_original_fields, sizeof(l3_original_fields),
+                                 (__u32 *)&l3_new_fields, sizeof(l3_new_fields), 0);
     
-    // Strict bounds check: ensure we can access at least the minimum IP header (20 bytes)
-    if ((void *)(ip + 1) > data_end || (void *)ip + sizeof(struct iphdr) > data_end) {
-        return TC_ACT_OK; // Cannot access IP header
+    __u64 l4sum = bpf_csum_diff((__u32 *)&l4_original_fields, sizeof(l4_original_fields),
+                                 (__u32 *)&l4_new_fields, sizeof(l4_new_fields), l3sum);
+    
+    // Update L3 checksum manually (even though we used BPF_F_RECOMPUTE_CSUM,
+    // manual update ensures correctness, similar to reference project)
+    __u32 l3_check_off = l3_off + offsetof(struct iphdr, check);
+    if (bpf_l3_csum_replace(skb, l3_check_off, 0, (__u32)l3sum, 0) < 0) {
+        return -1;
     }
     
-    // Only process IPv4
-    if (ip->version != 4) {
+    // Update L4 checksum (for TCP/UDP)
+    if (protocol == IPPROTO_TCP || protocol == IPPROTO_UDP) {
+        __u32 l4_check_off;
+        if (protocol == IPPROTO_TCP) {
+            l4_check_off = l4_off + offsetof(struct tcphdr, check);
+        } else {
+            l4_check_off = l4_off + offsetof(struct udphdr, check);
+        }
+        
+        // Check bounds before accessing checksum field
+        if (l4_check_off + sizeof(__u16) <= (__u32)((void *)data_end - data)) {
+            // For UDP, skip checksum update if checksum is 0 (optional checksum)
+            if (protocol == IPPROTO_UDP) {
+                __u16 current_csum = 0;
+                if (bpf_skb_load_bytes(skb, l4_check_off, &current_csum, sizeof(__u16)) == 0) {
+                    if (current_csum == 0) {
+                        return 0; // UDP with no checksum, skip L4 update
+                    }
+                }
+            }
+            
+            // Update L4 checksum with pseudo header
+            if (bpf_l4_csum_replace(skb, l4_check_off, 0, (__u32)l4sum,
+                                   BPF_F_PSEUDO_HDR) < 0) {
+                // Fallback: set checksum to 0 for UDP if update fails
+                if (protocol == IPPROTO_UDP) {
+                    __u16 zero = 0;
+                    bpf_skb_store_bytes(skb, l4_check_off, &zero, sizeof(__u16), 0);
+                } else {
+                    return -1; // TCP checksum update failed
+                }
+            }
+        }
+    }
+    
+    return 0;
+}
+
+// Main TC egress handler
+SEC("tc")
+int tc_nat_egress(struct __sk_buff *skb) {
+    struct ethhdr *eth = NULL;
+    struct iphdr *ip = NULL;
+    void *data_end = NULL;
+    __u32 ip_hlen = 0;
+    
+    // Parse packet headers
+    if (parse_packet_headers(skb, &data_end, &eth, &ip, &ip_hlen) < 0) {
         return TC_ACT_OK;
     }
     
-    // Additional check: ensure IP header length is valid
-    if (ip->ihl < 5 || ip->ihl > 15) {
-        return TC_ACT_OK; // Invalid IP header length
-    }
+    update_stat(STAT_KEY_TOTAL_PACKETS);
     
-    // Ensure we can access the full IP header (including options)
-    __u16 ip_header_len = ip->ihl * 4;
-    if ((void *)ip + ip_header_len > data_end) {
-        return TC_ACT_OK; // IP header extends beyond packet
-    }
-    
-    // Check if source IP is VPN client and destination is external
-    __u32 src_ip = ip->saddr;
-    __u32 dst_ip = ip->daddr;
-    
-    // Debug: Log first few packets with source IP (for debugging)
-    // Use bpf_printk to log directly from kernel
-    static __u32 packet_count = 0;
-    if (packet_count < 5) {
-        bpf_printk("TC NAT: Packet #%d: src_ip=0x%08X (%u.%u.%u.%u), dst_ip=0x%08X (%u.%u.%u.%u)",
-                   packet_count,
-                   src_ip,
-                   (src_ip >> 24) & 0xFF, (src_ip >> 16) & 0xFF, (src_ip >> 8) & 0xFF, src_ip & 0xFF,
-                   dst_ip,
-                   (dst_ip >> 24) & 0xFF, (dst_ip >> 16) & 0xFF, (dst_ip >> 8) & 0xFF, dst_ip & 0xFF);
-        packet_count++;
-    }
-    
-    // Update statistics: packets processed
-    __u32 stat_key = 4; // Total packets processed
-    __u64 *stat_value = bpf_map_lookup_elem(&nat_stats, &stat_key);
-    if (stat_value) {
-        (*stat_value)++;
-    }
-    
-    // Check VPN network configuration first
-    __u32 vpn_check_key = 0;
-    __u32 *vpn_net = bpf_map_lookup_elem(&vpn_network_config, &vpn_check_key);
+    // Get VPN network configuration
+    __u32 vpn_net_key = 0;
     __u32 vpn_mask_key = 1;
+    __u32 *vpn_net = bpf_map_lookup_elem(&vpn_network_config, &vpn_net_key);
     __u32 *vpn_mask = bpf_map_lookup_elem(&vpn_network_config, &vpn_mask_key);
     
-    // Debug: Check if VPN network is configured
     if (!vpn_net || !vpn_mask) {
-        // VPN network not configured - update stat key 5 for debugging
-        stat_key = 5;
-        stat_value = bpf_map_lookup_elem(&nat_stats, &stat_key);
-        if (stat_value) {
-            (*stat_value)++;
-        }
-        return TC_ACT_OK; // VPN network not configured, pass
+        update_stat(STAT_KEY_NO_VPN_CONFIG);
+        return TC_ACT_OK; // VPN network not configured
     }
     
-    // Debug: Store first few source IPs for debugging
-    // Use stat key 6 as counter, 7-11 to store IPs (we can store multiple IPs)
-    stat_key = 6;
-    stat_value = bpf_map_lookup_elem(&nat_stats, &stat_key);
-    if (stat_value && *stat_value < 5) {
-        // Store source IP (first 5 packets)
-        __u32 ip_key = 7 + (*stat_value); // Use keys 7-11
-        if (ip_key < 12) { // Make sure we don't overflow
-            __u64 ip_value = (__u64)src_ip;
-            bpf_map_update_elem(&nat_stats, &ip_key, &ip_value, BPF_ANY);
-            (*stat_value)++;
-        }
+    // Get source and destination IPs
+    // CRITICAL: Read IPs as bytes and manually convert to network byte order
+    // bpf_skb_load_bytes reads raw bytes, but storing to __u32 on little-endian systems
+    // may interpret them as little-endian. We need to ensure network byte order.
+    __u32 eth_hlen = sizeof(struct ethhdr);
+    __u32 ip_saddr_off = eth_hlen + offsetof(struct iphdr, saddr);
+    __u32 ip_daddr_off = eth_hlen + offsetof(struct iphdr, daddr);
+    
+    // Read IP addresses as bytes and convert to network byte order (big-endian)
+    __u8 src_ip_bytes[4] = {0};
+    __u8 dst_ip_bytes[4] = {0};
+    
+    if (bpf_skb_load_bytes(skb, ip_saddr_off, src_ip_bytes, 4) < 0) {
+        return TC_ACT_OK;
+    }
+    if (bpf_skb_load_bytes(skb, ip_daddr_off, dst_ip_bytes, 4) < 0) {
+        return TC_ACT_OK;
     }
     
-    // Check if source IP is in VPN network
-    // Note: src_ip and vpn_net are both in network byte order (big-endian)
-    // IP addresses in IP header are already in network byte order
-    // VPN network config stored in map is also in network byte order
-    __u32 src_network = src_ip & *vpn_mask;
-    __u32 dst_network = dst_ip & *vpn_mask;
-    int src_is_vpn = (src_network == *vpn_net);
-    int dst_is_vpn = (dst_network == *vpn_net);
+    // Convert bytes to network byte order (big-endian) __u32
+    // Packet bytes are already in network byte order, so we construct __u32 correctly
+    __u32 src_ip = (src_ip_bytes[0] << 24) | (src_ip_bytes[1] << 16) | 
+                   (src_ip_bytes[2] << 8) | src_ip_bytes[3];
+    __u32 dst_ip = (dst_ip_bytes[0] << 24) | (dst_ip_bytes[1] << 16) | 
+                   (dst_ip_bytes[2] << 8) | dst_ip_bytes[3];
     
-    // Debug: Store VPN network check details for first packet
-    if (stat_key == 6 && stat_value && *stat_value == 1) {
-        // Store VPN network and mask for comparison (keys 12-13)
-        __u32 debug_key = 12;
-        __u64 debug_value = (__u64)(*vpn_net);
-        bpf_map_update_elem(&nat_stats, &debug_key, &debug_value, BPF_ANY);
-        debug_key = 13;
-        debug_value = (__u64)(*vpn_mask);
-        bpf_map_update_elem(&nat_stats, &debug_key, &debug_value, BPF_ANY);
-        // Store source network (src_ip & mask) for comparison (key 14)
-        debug_key = 14;
-        debug_value = (__u64)src_network;
-        bpf_map_update_elem(&nat_stats, &debug_key, &debug_value, BPF_ANY);
-    }
+    __u8 protocol = ip->protocol;
     
-    if (!src_is_vpn || dst_is_vpn) {
-        return TC_ACT_OK; // Not VPN client to external, pass
-    }
+    // Check if source is VPN network or matches egress IP
+    __u32 egress_key = 0;
+    __u32 *egress_ip = bpf_map_lookup_elem(&server_egress_ip, &egress_key);
     
-    // Update statistics: VPN network check passed
-    stat_key = 1;
-    stat_value = bpf_map_lookup_elem(&nat_stats, &stat_key);
-    if (stat_value) {
-        (*stat_value)++;
-    }
-    
-    // Check if VPN client is registered
-    __u32 *client_real_ip = bpf_map_lookup_elem(&vpn_clients, &src_ip);
-    if (!client_real_ip) {
-        return TC_ACT_OK; // VPN client not registered, pass
-    }
-    
-    // Update statistics: VPN client found
-    stat_key = 2;
-    stat_value = bpf_map_lookup_elem(&nat_stats, &stat_key);
-    if (stat_value) {
-        (*stat_value)++;
-    }
-    
-    // Get egress IP for NAT
-    __u32 key = 0;
-    __u32 *egress_ip = bpf_map_lookup_elem(&server_egress_ip, &key);
     if (!egress_ip || *egress_ip == 0) {
-        return TC_ACT_OK; // No egress IP configured, pass
+        update_stat(STAT_KEY_NO_EGRESS_IP);
+        return TC_ACT_OK; // No egress IP configured
     }
     
-    // Update statistics: Egress IP found
-    stat_key = 3;
-    stat_value = bpf_map_lookup_elem(&nat_stats, &stat_key);
-    if (stat_value) {
-        (*stat_value)++;
+    // Debug: Store first few source IPs for diagnosis (only for first 5 packets)
+    __u32 debug_key = 25; // Use key 25 as counter
+    __u64 *debug_counter = bpf_map_lookup_elem(&nat_stats, &debug_key);
+    if (debug_counter && *debug_counter < 5) {
+        // Store source IP - ensure network byte order
+        // ip->saddr is __be32 (network byte order), but when cast to __u32 it should preserve byte order
+        __u32 src_ip_key = STAT_KEY_DEBUG_SRC_IP;
+        __u64 src_ip_value = (__u64)src_ip;
+        bpf_map_update_elem(&nat_stats, &src_ip_key, &src_ip_value, BPF_ANY);
+        
+        // Store VPN network config
+        __u32 vpn_net_key_debug = STAT_KEY_DEBUG_VPN_NET;
+        __u64 vpn_net_value = (__u64)(*vpn_net);
+        bpf_map_update_elem(&nat_stats, &vpn_net_key_debug, &vpn_net_value, BPF_ANY);
+        
+        __u32 vpn_mask_key_debug = STAT_KEY_DEBUG_VPN_MASK;
+        __u64 vpn_mask_value = (__u64)(*vpn_mask);
+        bpf_map_update_elem(&nat_stats, &vpn_mask_key_debug, &vpn_mask_value, BPF_ANY);
+        
+        // Store destination IP for debugging
+        __u32 dst_ip_key = STAT_KEY_DEBUG_DST_IP;
+        __u64 dst_ip_value = (__u64)dst_ip;
+        bpf_map_update_elem(&nat_stats, &dst_ip_key, &dst_ip_value, BPF_ANY);
+        
+        // Store egress IP for comparison
+        __u32 egress_ip_key = 23; // Use key 23 for egress IP debug
+        __u64 egress_ip_value = (__u64)(*egress_ip);
+        bpf_map_update_elem(&nat_stats, &egress_ip_key, &egress_ip_value, BPF_ANY);
+        
+        // Store comparison result for debugging
+        __u32 cmp_key = STAT_KEY_DEBUG_COMPARE_RESULT;
+        __u64 cmp_value = (src_ip == *egress_ip) ? 1 : 0;
+        bpf_map_update_elem(&nat_stats, &cmp_key, &cmp_value, BPF_ANY);
+        
+        (*debug_counter)++;
     }
     
-    // Perform NAT: change source IP to egress IP
-    // Bounds check: ensure we can modify saddr (offset 12, 4 bytes)
-    if ((void *)ip + 16 > data_end) {
-        return TC_ACT_OK; // Cannot access saddr field
+    // Check if source IP is in VPN network or matches egress IP
+    // All IPs are now in network byte order (read from packet bytes)
+    int src_is_vpn = is_ip_in_vpn_network(src_ip, *vpn_net, *vpn_mask);
+    int dst_is_vpn = is_ip_in_vpn_network(dst_ip, *vpn_net, *vpn_mask);
+    
+    // Compare source IP with egress IP (both should be in network byte order)
+    int src_is_egress = (src_ip == *egress_ip);
+    
+    // Debug: Update statistics for diagnosis
+    if (src_is_vpn) {
+        update_stat(STAT_KEY_SRC_IS_VPN);
+    }
+    if (dst_is_vpn) {
+        update_stat(STAT_KEY_DST_IS_VPN);
+    }
+    if (src_is_egress) {
+        update_stat(STAT_KEY_SRC_IS_EGRESS);
     }
     
-    __u32 old_saddr = ip->saddr;
-    ip->saddr = *egress_ip;
+    int should_nat = src_is_vpn;
     
-    // Update statistics: NAT performed
-    stat_key = 0; // NAT performed count
-    stat_value = bpf_map_lookup_elem(&nat_stats, &stat_key);
-    if (stat_value) {
-        (*stat_value)++;
+    if (!should_nat) {
+        update_stat(STAT_KEY_SHOULD_NOT_NAT);
+        return TC_ACT_OK;
     }
     
-    // Recalculate IP checksum (pass data_end for bounds checking)
-    recalculate_ip_checksum(ip, data_end);
+    update_stat(STAT_KEY_VPN_CHECK_PASSED);
     
-    // Recalculate transport layer checksum
-    recalculate_transport_checksum(ip, data_end);
+    // Verify VPN client if source is VPN network
+    // Note: We don't require VPN client registration for SNAT - we NAT all VPN network traffic
+    // VPN client map is used for other purposes (like connection tracking)
+    if (src_is_vpn) {
+        __u32 *client_real_ip = bpf_map_lookup_elem(&vpn_clients, &src_ip);
+        if (client_real_ip) {
+            update_stat(STAT_KEY_CLIENT_FOUND);
+        }
+        // Continue even if client not registered - we still do SNAT
+    }
     
-    // Return TC_ACT_OK to pass packet to kernel (kernel will handle routing)
+    update_stat(STAT_KEY_EGRESS_IP_FOUND);
+    
+    // Save original source IP
+    __u32 original_saddr = src_ip;
+    __u32 new_saddr = *egress_ip;
+    // eth_hlen already defined above when reading IP addresses
+    
+    // Read and save original port numbers BEFORE SNAT (to ensure we use original packet ports)
+    __u16 original_sport = 0;
+    __u16 original_dport = 0;
+    if (protocol == IPPROTO_TCP || protocol == IPPROTO_UDP) {
+        __u32 l4_off = eth_hlen + ip_hlen;
+        __u16 sport_raw = 0;
+        __u16 dport_raw = 0;
+        
+        // Read ports from original packet BEFORE any modifications
+        if (bpf_skb_load_bytes(skb, l4_off, &sport_raw, sizeof(__u16)) == 0 &&
+            bpf_skb_load_bytes(skb, l4_off + sizeof(__u16), &dport_raw, sizeof(__u16)) == 0) {
+            original_sport = bpf_ntohs(sport_raw);  // VPN client port
+            original_dport = bpf_ntohs(dport_raw);  // External server port
+        }
+    }
+    
+    // Skip IP modification if already correct
+    if (original_saddr == new_saddr) {
+        // Still need to track connection and update stats
+        update_stat(STAT_KEY_SKIP_ALREADY_EGRESS);
+        goto track_connection;
+    }
+    
+    // Perform NAT
+    if (perform_nat(skb, ip, ip_hlen, eth_hlen, new_saddr, original_saddr, protocol) < 0) {
+        update_stat(STAT_KEY_NAT_FAILED);
+        return TC_ACT_OK;
+    }
+    
+track_connection:
+    // Record connection tracking for TCP/UDP/ICMP
+    // Use original port numbers saved before SNAT
+    if (protocol == IPPROTO_TCP || protocol == IPPROTO_UDP) {
+        // original_sport = VPN client port (return packet's dport)
+        // original_dport = External server port (return packet's sport)
+        record_connection_tracking(new_saddr, dst_ip, original_sport, original_dport,
+                                  protocol, original_saddr);
+    } else if (protocol == IPPROTO_ICMP) {
+        record_connection_tracking(new_saddr, dst_ip, 0, 0, IPPROTO_ICMP, original_saddr);
+    }
+    
+    update_stat(STAT_KEY_NAT_PERFORMED);
     return TC_ACT_OK;
 }
 
 char _license[] SEC("license") = "GPL";
-
 
