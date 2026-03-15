@@ -17,6 +17,7 @@ ARG TARGETARCH
 ENV DNF_FRONTEND=noninteractive
 
 # 启用 CRB 仓库并安装基础依赖（包括 Go）
+# `glibc-devel.i686` 仅在 x86_64 上可能可用，单独安装避免影响主事务。
 RUN dnf install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
         dnf-plugins-core && \
     dnf config-manager --set-enabled crb && \
@@ -27,8 +28,11 @@ RUN dnf install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs \
         kernel-headers kernel-devel \
         zlib-devel \
         gcc gcc-c++ make git \
-        golang \
-        glibc-devel.i686 || echo "32-bit glibc-devel not available, continuing..." && \
+        golang && \
+    if [ "${TARGETARCH}" = "amd64" ]; then \
+        dnf install -y --setopt=install_weak_deps=False --setopt=tsflags=nodocs glibc-devel.i686 || \
+        echo "32-bit glibc-devel not available, continuing..."; \
+    fi && \
     update-ca-trust extract && \
     go version && \
     dnf clean all && \
@@ -124,4 +128,5 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
 
 ENTRYPOINT ["/app/docker-entrypoint.sh"]
 CMD ["/app/zvpn"]
+
 
